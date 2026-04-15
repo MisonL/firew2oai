@@ -17,7 +17,9 @@ Fireworks.ai Chat API → OpenAI Compatible API 转换代理
 - **优雅关停** — SIGINT/SIGTERM 信号处理，等待进行中的请求完成
 - **健康检查** — `/health` 端点，适合 K8s/Docker 健康探针
 - **CORS 支持** — 可配置允许的跨域来源（默认 `*`，生产环境建议限定）
-- **Rate Limiting** — 基于 IP 的令牌桶限流，标准 `X-RateLimit-*` 响应头，429 返回
+- **多 Key 认证** — 支持多 API Key，每个 Key 可独立配置额度和速率限制
+- **Per-Key 额度限制** — 限制每个 Key 的总请求数，耗尽返回 403 + `X-Quota-*` 响应头
+- **Per-Key 速率限制** — 令牌桶限流，标准 `X-RateLimit-*` 响应头，超出返回 429
 - **IP 白名单** — 默认仅允许 `127.0.0.1, ::1` 环回地址访问，支持 CIDR 段，空值放行全部
 - **Panic 恢复** — 内置 Recovery 中间件，不会因 panic 崩溃
 - **恒定时间认证** — API Key 比较使用 `crypto/subtle.ConstantTimeCompare`，防止 timing attack
@@ -51,13 +53,60 @@ make build
 |---|---|---|---|
 | `-port` | `PORT` | `39527` | 监听端口 |
 | `-host` | `HOST` | `""` (所有接口) | 监听地址 |
-| `-api-key` | `API_KEY` | `sk-admin` | 访问密钥 |
+| `-api-key` | `API_KEY` | `sk-admin` | API Key（支持多 Key、JSON 文件，详见下方） |
 | `-timeout` | `TIMEOUT` | `120` | 上游请求超时（秒） |
 | `-log-level` | `LOG_LEVEL` | `info` | 日志级别 (debug/info/warn/error) |
 | `-show-thinking` | `SHOW_THINKING` | `false` | 显示 thinking 模型的思考过程 |
 | `-cors-origins` | `CORS_ORIGINS` | `*` | 允许的跨域来源（逗号分隔，`*` 表示全部） |
-| `-rate-limit` | `RATE_LIMIT` | `0`（禁用） | 每 IP 每分钟最大请求数（0 禁用） |
+| `-rate-limit` | `RATE_LIMIT` | `0`（禁用） | 全局每 Key 每分钟最大请求数（0 禁用，per-key 配置可覆盖） |
 | `-ip-whitelist` | `IP_WHITELIST` | `127.0.0.1,::1` | 允许的 IP/CIDR（逗号分隔，空值放行全部） |
+
+### 多 Key 与额度/速率配置
+
+`-api-key` 支持四种格式：
+
+**1. 单 Key（默认，向后兼容）：**
+```bash
+./bin/firew2oai -api-key sk-admin
+```
+
+**2. 多 Key（逗号分隔）：**
+```bash
+./bin/firew2oai -api-key "sk-admin,sk-user1,sk-user2"
+```
+
+**3. JSON 文件路径（推荐，支持 per-key 额度和速率）：**
+
+```json
+// tokens.json
+[
+  {"key": "sk-admin", "quota": 0, "rate_limit": 0},
+  {"key": "sk-user1", "quota": 1000, "rate_limit": 60},
+  {"key": "sk-user2", "quota": 100, "rate_limit": 10}
+]
+```
+
+```bash
+./bin/firew2oai -api-key /path/to/tokens.json -rate-limit 30
+```
+
+**4. 内联 JSON：**
+```bash
+./bin/firew2oai -api-key '[{"key":"sk-admin"},{"key":"sk-user","quota":500,"rate_limit":20}]'
+```
+
+**参数说明：**
+| 字段 | 说明 |
+|---|---|
+| `key` | API Key 字符串 |
+| `quota` | 总请求额度（0 = 无限） |
+| `rate_limit` | 每分钟最大请求数（0 = 使用全局 `-rate-limit` 值） |
+
+**响应头：**
+- `X-Quota-Limit` / `X-Quota-Remaining` — 额度信息（有 quota 时）
+- `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset` — 速率信息（有 rate_limit 时）
+- 额度耗尽 → 403 Forbidden
+- 速率超限 → 429 Too Many Requests
 
 ### Docker 部署
 
@@ -182,17 +231,18 @@ curl -X POST http://localhost:39527/v1/chat/completions \
 
 ```
 firew2oai/
-├── cmd/server/main.go        # 入口：服务器启动、优雅关停、信号处理
+├── cmd/server/main.go          # 入口：服务器启动、优雅关停、信号处理
 ├── internal/
-│   ├── config/config.go      # 配置：环境变量 + 命令行参数
-│   ├── proxy/proxy.go        # 核心：协议转换、路由、中间件
-│   ├── ratelimit/ratelimit.go # 限流：基于 IP 的令牌桶限流
-│   └── transport/transport.go # 传输：Chrome TLS 指纹、HTTP 伪装
-├── Dockerfile                # 多阶段构建（alpine 最终镜像）
-├── docker-compose.yml        # Docker Compose 配置
-├── Makefile                  # 构建、测试、多平台编译
+│   ├── config/config.go        # 配置：环境变量 + 命令行参数
+│   ├── proxy/proxy.go          # 核心：协议转换、路由、中间件
+│   ├── tokenauth/tokenauth.go  # 认证：多 Key 管理、per-Key 额度和速率限制
+│   ├── whitelist/whitelist.go  # 安全：IP 白名单（CIDR 支持）
+│   └── transport/transport.go  # 传输：Chrome TLS 指纹、HTTP 伪装
+├── Dockerfile                  # 多阶段构建（alpine 最终镜像）
+├── docker-compose.yml          # Docker Compose 配置
+├── Makefile                    # 构建、测试、多平台编译
 ├── go.mod / go.sum
-├── docs/                     # 审计文档
+├── docs/                       # 审计文档
 └── README.md
 ```
 

@@ -14,7 +14,7 @@ import (
 
 	"github.com/mison/firew2oai/internal/config"
 	"github.com/mison/firew2oai/internal/proxy"
-	"github.com/mison/firew2oai/internal/ratelimit"
+	"github.com/mison/firew2oai/internal/tokenauth"
 	"github.com/mison/firew2oai/internal/transport"
 	"github.com/mison/firew2oai/internal/whitelist"
 )
@@ -45,11 +45,23 @@ func main() {
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	tp := transport.New(timeout)
 
-	// Create proxy handler
-	p := proxy.New(tp, cfg.APIKey, timeout, Version)
-	handler := proxy.NewMux(p, cfg.CORSOrigins)
+	// Create token auth manager
+	tm, err := tokenauth.New(cfg.APIKey, cfg.RateLimit)
+	if err != nil {
+		slog.Error("invalid token configuration", "error", err)
+		os.Exit(1)
+	}
 
-	// Wrap with IP whitelist (applied first, before rate limiting)
+	slog.Info("token auth configured",
+		"tokens", tm.TokenCount(),
+		"global_rate_limit", cfg.RateLimit,
+	)
+
+	// Create proxy handler
+	p := proxy.New(tp, timeout, Version)
+	handler := proxy.NewMux(p, cfg.CORSOrigins, cfg.APIKey, tm)
+
+	// Wrap with IP whitelist (applied first)
 	if cfg.IPWhitelist != "" {
 		wl, err := whitelist.New(cfg.IPWhitelist)
 		if err != nil {
@@ -63,24 +75,6 @@ func main() {
 			}).ServeHTTP(w, r)
 		})
 		slog.Info("IP whitelist enabled", "whitelist", cfg.IPWhitelist)
-	}
-
-	// Wrap with rate limiter if enabled.
-	// Health check and root endpoints bypass rate limiting
-	// so Docker healthcheck and reverse proxies are never blocked.
-	var rl *ratelimit.Limiter
-	if cfg.RateLimit > 0 {
-		rl = ratelimit.New(cfg.RateLimit, time.Minute)
-		inner := handler // capture before wrapping to prevent infinite recursion
-		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == "/" || r.URL.Path == "/health" {
-				inner.ServeHTTP(w, r)
-				return
-			}
-			rl.Middleware(func(w2 http.ResponseWriter, r2 *http.Request) {
-				inner.ServeHTTP(w2, r2)
-			}).ServeHTTP(w, r)
-		})
 	}
 
 	// Create HTTP server with timeouts
@@ -123,10 +117,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Stop rate limiter cleanup goroutine
-	if rl != nil {
-		rl.Stop()
-	}
+	// Stop token auth rate limiters
+	tm.Stop()
 
 	slog.Info("server stopped")
 }

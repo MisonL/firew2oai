@@ -13,12 +13,12 @@ import (
 type Config struct {
 	Port         int
 	Host         string
-	APIKey       string
-	Timeout      int // seconds
+	APIKey       string // comma-separated keys, JSON file path, or inline JSON
+	Timeout      int    // seconds
 	LogLevel     string
-	ShowThinking bool // default: show thinking process for thinking models
+	ShowThinking bool   // default: show thinking process for thinking models
 	CORSOrigins  string
-	RateLimit    int // max requests per minute per IP (0 = disabled)
+	RateLimit    int    // global rate limit: max requests per minute per key (0 = disabled)
 	IPWhitelist  string // comma-separated IPs/CIDRs (empty = allow all)
 }
 

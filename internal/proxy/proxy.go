@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/mison/firew2oai/internal/config"
+	"github.com/mison/firew2oai/internal/tokenauth"
 	"github.com/mison/firew2oai/internal/transport"
 )
 
@@ -121,16 +122,14 @@ type FireworksRequest struct {
 // Proxy handles OpenAI-to-Fireworks protocol conversion.
 type Proxy struct {
 	transport *transport.FireworksTransport
-	apiKey    string
 	timeout   time.Duration
 	version   string
 }
 
 // New creates a new Proxy instance.
-func New(transport *transport.FireworksTransport, apiKey string, timeout time.Duration, version string) *Proxy {
+func New(transport *transport.FireworksTransport, timeout time.Duration, version string) *Proxy {
 	return &Proxy{
 		transport: transport,
-		apiKey:    apiKey,
 		timeout:   timeout,
 		version:   version,
 	}
@@ -537,6 +536,9 @@ func writeError(w http.ResponseWriter, status int, errType string, errCode strin
 
 // AuthMiddleware validates the Bearer token using constant-time comparison.
 // Returns a middleware function compatible with the chain() helper.
+//
+// Deprecated: Use tokenauth.Manager.Middleware() instead for multi-key support
+// with per-key quota and rate limiting. This is kept for backward compatibility.
 func AuthMiddleware(apiKey string) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
@@ -672,7 +674,9 @@ func chain(handlers ...func(http.HandlerFunc) http.HandlerFunc) func(http.Handle
 // ─── Router ───────────────────────────────────────────────────────────────
 
 // NewMux creates the HTTP handler with all routes registered.
-func NewMux(p *Proxy, corsOrigins string) http.Handler {
+// If tm is non-nil, its middleware handles auth + quota + rate limiting.
+// If tm is nil, the legacy single-key AuthMiddleware is used with apiKey.
+func NewMux(p *Proxy, corsOrigins string, apiKey string, tm *tokenauth.Manager) http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no auth required)
@@ -680,7 +684,14 @@ func NewMux(p *Proxy, corsOrigins string) http.Handler {
 	mux.HandleFunc("/health", CORSMiddleware(corsOrigins)(RecoveryMiddleware(p.handleHealth)))
 
 	// Protected routes (require auth)
-	commonMW := chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, AuthMiddleware(p.apiKey), LoggingMiddleware)
+	var commonMW func(http.HandlerFunc) http.HandlerFunc
+	if tm != nil && tm.TokenCount() > 0 {
+		// Use tokenauth for multi-key auth + quota + rate limiting
+		commonMW = chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, tm.Middleware(), LoggingMiddleware)
+	} else {
+		// Legacy fallback: single key auth
+		commonMW = chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, AuthMiddleware(apiKey), LoggingMiddleware)
+	}
 
 	mux.HandleFunc("/v1/models", commonMW(p.handleModels))
 	mux.HandleFunc("/v1/chat/completions", commonMW(p.handleChatCompletions))

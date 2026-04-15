@@ -12,12 +12,17 @@ import (
 )
 
 func newTestProxy() *Proxy {
-	return New(transport.New(30 * time.Second), "test-key", 30*time.Second, "test")
+	return New(transport.New(30 * time.Second), 30*time.Second, "test")
+}
+
+// newTestMux creates a mux with legacy single-key auth for tests.
+func newTestMux(p *Proxy, corsOrigins string) http.Handler {
+	return NewMux(p, corsOrigins, "test-key", nil)
 }
 
 func TestHandleRoot(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -39,7 +44,7 @@ func TestHandleRoot(t *testing.T) {
 
 func TestHandleHealth(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -58,7 +63,7 @@ func TestHandleHealth(t *testing.T) {
 
 func TestHandleModels_NoAuth(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, req)
@@ -70,7 +75,7 @@ func TestHandleModels_NoAuth(t *testing.T) {
 
 func TestHandleModels_WithAuth(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
 	rec := httptest.NewRecorder()
@@ -93,7 +98,7 @@ func TestHandleModels_WithAuth(t *testing.T) {
 
 func TestHandleModels_WrongKey(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer wrong-key")
 	rec := httptest.NewRecorder()
@@ -106,7 +111,7 @@ func TestHandleModels_WrongKey(t *testing.T) {
 
 func TestHandleModels_InvalidAuthFormat(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Basic dGVzdA==")
 	rec := httptest.NewRecorder()
@@ -119,7 +124,7 @@ func TestHandleModels_InvalidAuthFormat(t *testing.T) {
 
 func TestHandleChatCompletions_MethodNotAllowed(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
 	rec := httptest.NewRecorder()
@@ -132,7 +137,7 @@ func TestHandleChatCompletions_MethodNotAllowed(t *testing.T) {
 
 func TestHandleChatCompletions_EmptyBody(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
@@ -146,7 +151,7 @@ func TestHandleChatCompletions_EmptyBody(t *testing.T) {
 
 func TestHandleChatCompletions_EmptyMessages(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	body := `{"model":"deepseek-v3p2","messages":[]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -161,7 +166,7 @@ func TestHandleChatCompletions_EmptyMessages(t *testing.T) {
 
 func TestHandleChatCompletions_InvalidModel(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	body := `{"model":"nonexistent","messages":[{"role":"user","content":"hi"}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
@@ -218,7 +223,7 @@ func TestMessagesToPrompt(t *testing.T) {
 
 func TestCORSMiddleware_Wildcard(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "*")
+	mux := newTestMux(p, "*")
 	req := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
 	req.Header.Set("Origin", "https://evil.com")
 	rec := httptest.NewRecorder()
@@ -231,7 +236,7 @@ func TestCORSMiddleware_Wildcard(t *testing.T) {
 
 func TestCORSMiddleware_SpecificOrigin(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "https://example.com,https://trusted.com")
+	mux := newTestMux(p, "https://example.com,https://trusted.com")
 	req := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
 	req.Header.Set("Origin", "https://trusted.com")
 	rec := httptest.NewRecorder()
@@ -247,7 +252,7 @@ func TestCORSMiddleware_SpecificOrigin(t *testing.T) {
 
 func TestCORSMiddleware_RejectedOrigin(t *testing.T) {
 	p := newTestProxy()
-	mux := NewMux(p, "https://example.com")
+	mux := newTestMux(p, "https://example.com")
 	req := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
 	req.Header.Set("Origin", "https://evil.com")
 	rec := httptest.NewRecorder()
