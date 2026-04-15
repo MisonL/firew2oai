@@ -6,12 +6,13 @@ RUN apk add --no-cache git ca-certificates tzdata
 WORKDIR /src
 
 # Cache dependencies
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 
-# Copy source and build
+# Copy source and build (VERSION is set via --build-arg)
+ARG VERSION=dev
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=1.0.0" -o /bin/firew2oai ./cmd/server/
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.Version=${VERSION}" -o /bin/firew2oai ./cmd/server/
 
 # ── Stage 2: Runtime ───────────────────────────────────────────────────────
 FROM alpine:3.21

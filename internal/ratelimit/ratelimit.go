@@ -1,7 +1,10 @@
 package ratelimit
 
 import (
+	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -14,6 +17,8 @@ type Limiter struct {
 	rate     int           // tokens per window
 	window   time.Duration // window duration
 	cleanup  time.Duration
+	stopCh   chan struct{}
+	stopped  bool
 }
 
 type bucket struct {
@@ -30,10 +35,22 @@ func New(rate int, window time.Duration) *Limiter {
 		rate:    rate,
 		window:  window,
 		cleanup: window * 2,
+		stopCh:  make(chan struct{}),
 	}
-	// Periodic cleanup of stale buckets
 	go rl.cleanupLoop()
 	return rl
+}
+
+// Stop gracefully stops the cleanup goroutine.
+func (rl *Limiter) Stop() {
+	rl.mu.Lock()
+	if rl.stopped {
+		rl.mu.Unlock()
+		return
+	}
+	rl.stopped = true
+	rl.mu.Unlock()
+	close(rl.stopCh)
 }
 
 // Middleware returns an HTTP middleware that enforces rate limits per client IP.
@@ -63,23 +80,28 @@ func (rl *Limiter) Middleware(next http.HandlerFunc) http.HandlerFunc {
 		if b.tokens > 0 {
 			b.tokens--
 			remaining = b.tokens
+		} else {
+			// No tokens available — rate limit exceeded
+			resetTime := b.lastTime.Add(rl.window).Unix()
+			rl.mu.Unlock()
+
+			w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.rate))
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(resetTime)))
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Retry-After", strconv.Itoa(int(rl.window.Seconds())))
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
+			return
 		}
 		resetTime := b.lastTime.Add(rl.window).Unix()
 
 		rl.mu.Unlock()
 
 		// Set rate limit headers
-		w.Header().Set("X-RateLimit-Limit", intToStr(rl.rate))
-		w.Header().Set("X-RateLimit-Remaining", intToStr(remaining))
-		w.Header().Set("X-RateLimit-Reset", intToStr(int(resetTime)))
-
-		if remaining == 0 {
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			w.Header().Set("Retry-After", intToStr(int(rl.window.Seconds())))
-			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error":{"message":"rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}`))
-			return
-		}
+		w.Header().Set("X-RateLimit-Limit", strconv.Itoa(rl.rate))
+		w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
+		w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(resetTime)))
 
 		next(w, r)
 	}
@@ -88,64 +110,46 @@ func (rl *Limiter) Middleware(next http.HandlerFunc) http.HandlerFunc {
 func (rl *Limiter) cleanupLoop() {
 	ticker := time.NewTicker(rl.cleanup)
 	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for ip, b := range rl.buckets {
-			if now.Sub(b.lastTime) > rl.cleanup {
-				delete(rl.buckets, ip)
+	for {
+		select {
+		case <-rl.stopCh:
+			return
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for ip, b := range rl.buckets {
+				if now.Sub(b.lastTime) > rl.cleanup {
+					delete(rl.buckets, ip)
+				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }
 
+// extractIP extracts the client IP from the request.
+// Priority: X-Real-IP > X-Forwarded-For (first IP) > RemoteAddr.
+//
+// SECURITY NOTE: X-Forwarded-For and X-Real-IP are set by reverse proxies.
+// If firew2oai is deployed without a trusted reverse proxy, these headers
+// can be spoofed by clients to bypass rate limiting.
+// Always deploy behind a trusted proxy (nginx, Caddy, etc.) that overwrites these headers.
 func extractIP(r *http.Request) string {
-	// Check X-Forwarded-For first (for reverse proxy setups)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Take the first IP in the chain
-		if idx := len(xff); idx > 0 {
-			for i, c := range xff {
-				if c == ',' {
-					return xff[:i]
-				}
-				if i == idx-1 {
-					return xff
-				}
-			}
-		}
-	}
+	// Prefer X-Real-IP (set by nginx/Caddy to the real client IP)
 	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return xri
+		// Validate it looks like an IP to prevent header injection
+		if net.ParseIP(xri) != nil {
+			return xri
+		}
+		slog.Warn("invalid X-Real-IP header, falling back to RemoteAddr", "value", xri)
 	}
+
 	// Fallback to RemoteAddr (strip port)
 	addr := r.RemoteAddr
-	for i := len(addr) - 1; i >= 0; i-- {
-		if addr[i] == ':' {
-			return addr[:i]
-		}
+	// Try splitting on last colon to handle IPv6:port
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
 	}
-	return addr
-}
-
-func intToStr(n int) string {
-	return fastFormat(n)
-}
-
-// fastFormat avoids strconv import for this hot path.
-func fastFormat(n int) string {
-	if n == 0 {
-		return "0"
-	}
-	if n < 0 {
-		return "-" + fastFormat(-n)
-	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(buf[i:])
+	return host
 }

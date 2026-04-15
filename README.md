@@ -13,7 +13,7 @@ Fireworks.ai Chat API → OpenAI Compatible API 转换代理
 - **Chrome TLS 指纹** — 模拟 Chrome 的 JA3 指纹，包括 TLS 1.3 密码套件顺序、曲线偏好
 - **完整 HTTP 伪装** — `sec-ch-ua` Client Hints、`sec-fetch-*`、`Accept-Language`、`Origin`/`Referer` 等全量 Chrome 浏览器请求头
 - **三大平台** — 支持 macOS (amd64/arm64)、Linux (amd64/arm64)、Windows (amd64) 命令行启动
-- **Docker 部署** — 多阶段构建，最终镜像基于 `scratch`，体积仅约 7MB
+- **Docker 部署** — 多阶段构建，最终镜像基于 `alpine`，体积约 15MB
 - **优雅关停** — SIGINT/SIGTERM 信号处理，等待进行中的请求完成
 - **健康检查** — `/health` 端点，适合 K8s/Docker 健康探针
 - **CORS 支持** — 可配置允许的跨域来源（默认 `*`，生产环境建议限定）
@@ -184,10 +184,11 @@ firew2oai/
 │   ├── proxy/proxy.go        # 核心：协议转换、路由、中间件
 │   ├── ratelimit/ratelimit.go # 限流：基于 IP 的令牌桶限流
 │   └── transport/transport.go # 传输：Chrome TLS 指纹、HTTP 伪装
-├── Dockerfile                # 多阶段构建（scratch 最终镜像）
+├── Dockerfile                # 多阶段构建（alpine 最终镜像）
 ├── docker-compose.yml        # Docker Compose 配置
 ├── Makefile                  # 构建、测试、多平台编译
 ├── go.mod / go.sum
+├── docs/                     # 审计文档
 └── README.md
 ```
 

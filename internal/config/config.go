@@ -3,6 +3,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -80,6 +81,8 @@ func Load() *Config {
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Port = n
+		} else {
+			slog.Warn("invalid PORT value, using default", "value", v)
 		}
 	}
 	if v := os.Getenv("HOST"); v != "" {
@@ -91,6 +94,8 @@ func Load() *Config {
 	if v := os.Getenv("TIMEOUT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.Timeout = n
+		} else {
+			slog.Warn("invalid TIMEOUT value, using default", "value", v)
 		}
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
@@ -105,19 +110,22 @@ func Load() *Config {
 	if v := os.Getenv("RATE_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			cfg.RateLimit = n
+		} else {
+			slog.Warn("invalid RATE_LIMIT value, using default", "value", v)
 		}
 	}
 
 	// Command-line flags (override env)
-	flag.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
-	flag.StringVar(&cfg.Host, "host", cfg.Host, "listen host (default: all interfaces)")
-	flag.StringVar(&cfg.APIKey, "api-key", cfg.APIKey, "API key for authentication")
-	flag.IntVar(&cfg.Timeout, "timeout", cfg.Timeout, "upstream request timeout in seconds")
-	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug, info, warn, error")
-	flag.BoolVar(&cfg.ShowThinking, "show-thinking", cfg.ShowThinking, "show thinking process for thinking models")
-	flag.StringVar(&cfg.CORSOrigins, "cors-origins", cfg.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
-	flag.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "max requests per minute per IP (0 to disable)")
-	flag.Parse()
+	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
+	fs.StringVar(&cfg.Host, "host", cfg.Host, "listen host (default: all interfaces)")
+	fs.StringVar(&cfg.APIKey, "api-key", cfg.APIKey, "API key for authentication")
+	fs.IntVar(&cfg.Timeout, "timeout", cfg.Timeout, "upstream request timeout in seconds")
+	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug, info, warn, error")
+	fs.BoolVar(&cfg.ShowThinking, "show-thinking", cfg.ShowThinking, "show thinking process for thinking models")
+	fs.StringVar(&cfg.CORSOrigins, "cors-origins", cfg.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
+	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "max requests per minute per IP (0 to disable)")
+	_ = fs.Parse(os.Args[1:])
 
 	return cfg
 }

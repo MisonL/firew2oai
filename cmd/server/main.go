@@ -48,8 +48,9 @@ func main() {
 	handler := proxy.NewMux(p, cfg.CORSOrigins)
 
 	// Wrap with rate limiter if enabled
+	var rl *ratelimit.Limiter
 	if cfg.RateLimit > 0 {
-		rl := ratelimit.New(cfg.RateLimit, time.Minute)
+		rl = ratelimit.New(cfg.RateLimit, time.Minute)
 		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			rl.Middleware(func(w2 http.ResponseWriter, r2 *http.Request) {
 				handler.ServeHTTP(w2, r2)
@@ -95,6 +96,11 @@ func main() {
 	if err := srv.Shutdown(ctx); err != nil {
 		slog.Error("shutdown error", "error", err)
 		os.Exit(1)
+	}
+
+	// Stop rate limiter cleanup goroutine
+	if rl != nil {
+		rl.Stop()
 	}
 
 	slog.Info("server stopped")

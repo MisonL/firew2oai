@@ -163,7 +163,11 @@ func messagesToPrompt(messages []ChatMessage) string {
 // generateRequestID creates an OpenAI-style chatcmpl- request ID.
 func generateRequestID() string {
 	b := make([]byte, 12)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		// Extremely unlikely with crypto/rand, but log and use timestamp fallback
+		slog.Error("crypto/rand.Read failed, using timestamp fallback", "error", err)
+		b = []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	}
 	return fmt.Sprintf("chatcmpl-%x", b)
 }
 
@@ -251,7 +255,12 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		FunctionDefinitions: []interface{}{},
 	}
 
-	bodyBytes, _ := json.Marshal(fwReq)
+	bodyBytes, err := json.Marshal(fwReq)
+	if err != nil {
+		slog.Error("failed to marshal fireworks request", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "marshal_failed", "failed to build upstream request")
+		return
+	}
 
 	if req.Stream {
 		p.handleStream(w, r, requestID, req.Model, bodyBytes, showThinking)
@@ -454,9 +463,10 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 		result.WriteString(content)
 	}
 
+	// On scanner error, return whatever content we've accumulated so far
+	// rather than discarding it. This prevents data loss on partial reads.
 	if err := scanner.Err(); err != nil {
-		writeError(w, http.StatusBadGateway, "upstream_error", "stream_read_error", "stream read error: %v", err)
-		return
+		slog.Error("stream read error (returning partial result)", "request_id", requestID, "error", err)
 	}
 
 	content := result.String()
@@ -483,28 +493,42 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 // ─── JSON / SSE Helpers ──────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("json.Marshal failed", "error", err)
+		http.Error(w, `{"error":{"message":"internal JSON error","type":"server_error","code":"marshal_error"}}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	data, _ := json.Marshal(v)
 	w.Write(data)
 	w.Write([]byte("\n"))
 }
 
 func sseChunk(v interface{}) []byte {
-	data, _ := json.Marshal(v)
+	data, err := json.Marshal(v)
+	if err != nil {
+		slog.Error("json.Marshal failed for SSE chunk", "error", err)
+		return []byte("data: {}\n\n")
+	}
 	return []byte(fmt.Sprintf("data: %s\n\n", data))
 }
 
 func writeError(w http.ResponseWriter, status int, errType string, errCode string, format string, args ...interface{}) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
-	data, _ := json.Marshal(map[string]interface{}{
+	data, err := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": fmt.Sprintf(format, args...),
 			"type":    errType,
 			"code":    errCode,
 		},
 	})
+	if err != nil {
+		slog.Error("json.Marshal failed for error response", "error", err)
+		http.Error(w, `{"error":{"message":"internal error","type":"server_error","code":"internal_error"}}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
 	w.Write(data)
 	w.Write([]byte("\n"))
 }
@@ -553,6 +577,8 @@ func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// responseWriter wraps http.ResponseWriter to capture status codes while
+// preserving Flusher and Hijacker interfaces for SSE streaming.
 type responseWriter struct {
 	http.ResponseWriter
 	statusCode int
@@ -561,6 +587,12 @@ type responseWriter struct {
 func (rw *responseWriter) WriteHeader(code int) {
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
+}
+
+// Unwrap returns the underlying ResponseWriter.
+// This enables middleware chaining that checks for optional interfaces (Flusher, Hijacker).
+func (rw *responseWriter) Unwrap() http.ResponseWriter {
+	return rw.ResponseWriter
 }
 
 // ─── Middleware: CORS ─────────────────────────────────────────────────────
@@ -579,7 +611,7 @@ func CORSMiddleware(origins string) func(http.HandlerFunc) http.HandlerFunc {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
 			} else if origin != "" && allowedSet[origin] {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
+				w.Header().Add("Vary", "Origin")
 			}
 
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -655,4 +687,3 @@ func NewMux(p *Proxy, corsOrigins string) http.Handler {
 
 	return mux
 }
-

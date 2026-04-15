@@ -13,3 +13,10 @@ Thumbs.db
 
 # Docker
 .docker/
+
+# Test
+coverage.out
+*.test
+
+# Vendor (if ever used)
+vendor/

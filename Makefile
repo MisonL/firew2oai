@@ -29,7 +29,7 @@ lint:
 
 ## docker-build: Build Docker image
 docker-build:
-	docker build -t $(BINARY_NAME):$(VERSION) -t $(BINARY_NAME):latest .
+	docker build --build-arg VERSION=$(VERSION) -t $(BINARY_NAME):$(VERSION) -t $(BINARY_NAME):latest .
 
 ## docker-up: Start with docker compose
 docker-up:
