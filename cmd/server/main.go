@@ -14,6 +14,7 @@ import (
 
 	"github.com/mison/firew2oai/internal/config"
 	"github.com/mison/firew2oai/internal/proxy"
+	"github.com/mison/firew2oai/internal/ratelimit"
 	"github.com/mison/firew2oai/internal/transport"
 )
 
@@ -34,6 +35,7 @@ func main() {
 		"version", Version,
 		"port", cfg.Port,
 		"timeout", cfg.Timeout,
+		"rate_limit", cfg.RateLimit,
 		"models", len(config.AvailableModels),
 	)
 
@@ -43,7 +45,17 @@ func main() {
 
 	// Create proxy handler
 	p := proxy.New(tp, cfg.APIKey, timeout, Version)
-	handler := proxy.NewMux(p)
+	handler := proxy.NewMux(p, cfg.CORSOrigins)
+
+	// Wrap with rate limiter if enabled
+	if cfg.RateLimit > 0 {
+		rl := ratelimit.New(cfg.RateLimit, time.Minute)
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			rl.Middleware(func(w2 http.ResponseWriter, r2 *http.Request) {
+				handler.ServeHTTP(w2, r2)
+			}).ServeHTTP(w, r)
+		})
+	}
 
 	// Create HTTP server with timeouts
 	srv := &http.Server{

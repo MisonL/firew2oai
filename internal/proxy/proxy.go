@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -207,24 +208,24 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	// Only accept POST
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "method not allowed, use POST")
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed, use POST")
 		return
 	}
 
 	var req ChatCompletionRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<20) // 4MB max
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body: %v", err)
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_body", "invalid request body: %v", err)
 		return
 	}
 
 	if len(req.Messages) == 0 {
-		writeError(w, http.StatusBadRequest, "messages array is required and must not be empty")
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "empty_messages", "messages array is required and must not be empty")
 		return
 	}
 
 	if !config.ValidModel(req.Model) {
-		writeError(w, http.StatusBadRequest, "model %q is not supported. Use /v1/models to list available models", req.Model)
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "model_not_found", "model %q is not supported. Use /v1/models to list available models", req.Model)
 		return
 	}
 
@@ -268,7 +269,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	reader, err := p.transport.StreamPost(ctx, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("upstream stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream error: %v", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %v", err)
 		return
 	}
 	defer reader.Close()
@@ -399,7 +400,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 	reader, err := p.transport.StreamPost(ctx, upstreamURL, bytes.NewReader(body))
 	if err != nil {
 		slog.Error("upstream non-stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream error: %v", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %v", err)
 		return
 	}
 	defer reader.Close()
@@ -454,7 +455,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 	}
 
 	if err := scanner.Err(); err != nil {
-		writeError(w, http.StatusBadGateway, "stream read error: %v", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "stream_read_error", "stream read error: %v", err)
 		return
 	}
 
@@ -494,14 +495,14 @@ func sseChunk(v interface{}) []byte {
 	return []byte(fmt.Sprintf("data: %s\n\n", data))
 }
 
-func writeError(w http.ResponseWriter, status int, format string, args ...interface{}) {
+func writeError(w http.ResponseWriter, status int, errType string, errCode string, format string, args ...interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	data, _ := json.Marshal(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": fmt.Sprintf(format, args...),
-			"type":    "invalid_request_error",
-			"code":    status,
+			"type":    errType,
+			"code":    errCode,
 		},
 	})
 	w.Write(data)
@@ -510,23 +511,23 @@ func writeError(w http.ResponseWriter, status int, format string, args ...interf
 
 // ─── Middleware: Auth ─────────────────────────────────────────────────────
 
-// AuthMiddleware validates the Bearer token.
+// AuthMiddleware validates the Bearer token using constant-time comparison.
 // Returns a middleware function compatible with the chain() helper.
 func AuthMiddleware(apiKey string) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			auth := r.Header.Get("Authorization")
 			if auth == "" {
-				writeError(w, http.StatusUnauthorized, "missing Authorization header")
+				writeError(w, http.StatusUnauthorized, "authentication_error", "missing_api_key", "missing Authorization header")
 				return
 			}
 			if !strings.HasPrefix(auth, "Bearer ") {
-				writeError(w, http.StatusUnauthorized, "invalid Authorization format, expected 'Bearer <key>'")
+				writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_auth_format", "invalid Authorization format, expected 'Bearer <key>'")
 				return
 			}
 			token := auth[7:]
-			if token != apiKey {
-				writeError(w, http.StatusUnauthorized, "invalid API key")
+			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
+				writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid API key")
 				return
 			}
 			next(w, r)
@@ -564,21 +565,46 @@ func (rw *responseWriter) WriteHeader(code int) {
 
 // ─── Middleware: CORS ─────────────────────────────────────────────────────
 
-// CORSMiddleware adds permissive CORS headers for cross-origin API access.
-func CORSMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Max-Age", "86400")
+// CORSMiddleware adds CORS headers for cross-origin API access.
+// origins is a comma-separated list; "*" allows all origins.
+func CORSMiddleware(origins string) func(http.HandlerFunc) http.HandlerFunc {
+	allowedSet := parseOrigins(origins)
+	isWildcard := origins == "*" || len(allowedSet) == 0
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
+	return func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			if isWildcard {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+			} else if origin != "" && allowedSet[origin] {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			}
+
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next(w, r)
 		}
-
-		next(w, r)
 	}
+}
+
+func parseOrigins(origins string) map[string]bool {
+	m := make(map[string]bool)
+	for _, o := range strings.Split(origins, ",") {
+		o = strings.TrimSpace(o)
+		if o != "" {
+			m[o] = true
+		}
+	}
+	return m
 }
 
 // ─── Middleware: Recovery ─────────────────────────────────────────────────
@@ -592,7 +618,7 @@ func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 					"path", r.URL.Path,
 					"error", fmt.Sprintf("%v", rec),
 				)
-				writeError(w, http.StatusInternalServerError, "internal server error")
+				writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "internal server error")
 			}
 		}()
 		next(w, r)
@@ -614,15 +640,15 @@ func chain(handlers ...func(http.HandlerFunc) http.HandlerFunc) func(http.Handle
 // ─── Router ───────────────────────────────────────────────────────────────
 
 // NewMux creates the HTTP handler with all routes registered.
-func NewMux(p *Proxy) http.Handler {
+func NewMux(p *Proxy, corsOrigins string) http.Handler {
 	mux := http.NewServeMux()
 
 	// Public routes (no auth required)
-	mux.HandleFunc("/", CORSMiddleware(RecoveryMiddleware(p.handleRoot)))
-	mux.HandleFunc("/health", CORSMiddleware(RecoveryMiddleware(p.handleHealth)))
+	mux.HandleFunc("/", CORSMiddleware(corsOrigins)(RecoveryMiddleware(p.handleRoot)))
+	mux.HandleFunc("/health", CORSMiddleware(corsOrigins)(RecoveryMiddleware(p.handleHealth)))
 
 	// Protected routes (require auth)
-	commonMW := chain(CORSMiddleware, RecoveryMiddleware, AuthMiddleware(p.apiKey), LoggingMiddleware)
+	commonMW := chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, AuthMiddleware(p.apiKey), LoggingMiddleware)
 
 	mux.HandleFunc("/v1/models", commonMW(p.handleModels))
 	mux.HandleFunc("/v1/chat/completions", commonMW(p.handleChatCompletions))

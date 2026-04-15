@@ -16,8 +16,10 @@ Fireworks.ai Chat API → OpenAI Compatible API 转换代理
 - **Docker 部署** — 多阶段构建，最终镜像基于 `scratch`，体积仅约 7MB
 - **优雅关停** — SIGINT/SIGTERM 信号处理，等待进行中的请求完成
 - **健康检查** — `/health` 端点，适合 K8s/Docker 健康探针
-- **CORS 支持** — 跨域请求支持
+- **CORS 支持** — 可配置允许的跨域来源（默认 `*`，生产环境建议限定）
+- **Rate Limiting** — 基于 IP 的令牌桶限流，标准 `X-RateLimit-*` 响应头，429 返回
 - **Panic 恢复** — 内置 Recovery 中间件，不会因 panic 崩溃
+- **恒定时间认证** — API Key 比较使用 `crypto/subtle.ConstantTimeCompare`，防止 timing attack
 
 ## 快速开始
 
@@ -52,6 +54,8 @@ make build
 | `-timeout` | `TIMEOUT` | `120` | 上游请求超时（秒） |
 | `-log-level` | `LOG_LEVEL` | `info` | 日志级别 (debug/info/warn/error) |
 | `-show-thinking` | `SHOW_THINKING` | `false` | 显示 thinking 模型的思考过程 |
+| `-cors-origins` | `CORS_ORIGINS` | `*` | 允许的跨域来源（逗号分隔，`*` 表示全部） |
+| `-rate-limit` | `RATE_LIMIT` | `60` | 每 IP 每分钟最大请求数（0 禁用） |
 
 ### Docker 部署
 
@@ -178,6 +182,7 @@ firew2oai/
 ├── internal/
 │   ├── config/config.go      # 配置：环境变量 + 命令行参数
 │   ├── proxy/proxy.go        # 核心：协议转换、路由、中间件
+│   ├── ratelimit/ratelimit.go # 限流：基于 IP 的令牌桶限流
 │   └── transport/transport.go # 传输：Chrome TLS 指纹、HTTP 伪装
 ├── Dockerfile                # 多阶段构建（scratch 最终镜像）
 ├── docker-compose.yml        # Docker Compose 配置

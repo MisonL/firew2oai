@@ -16,6 +16,8 @@ type Config struct {
 	Timeout      int // seconds
 	LogLevel     string
 	ShowThinking bool // default: show thinking process for thinking models
+	CORSOrigins  string
+	RateLimit    int // max requests per minute per IP (0 = disabled)
 }
 
 var AvailableModels = []string{
@@ -71,6 +73,8 @@ func Load() *Config {
 	cfg.Timeout = 120
 	cfg.LogLevel = "info"
 	cfg.ShowThinking = false
+	cfg.CORSOrigins = "*"
+	cfg.RateLimit = 60 // 60 req/min per IP
 
 	// Environment variables
 	if v := os.Getenv("PORT"); v != "" {
@@ -95,6 +99,14 @@ func Load() *Config {
 	if v := os.Getenv("SHOW_THINKING"); v != "" {
 		cfg.ShowThinking = strings.ToLower(v) == "true" || v == "1"
 	}
+	if v := os.Getenv("CORS_ORIGINS"); v != "" {
+		cfg.CORSOrigins = v
+	}
+	if v := os.Getenv("RATE_LIMIT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			cfg.RateLimit = n
+		}
+	}
 
 	// Command-line flags (override env)
 	flag.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
@@ -103,6 +115,8 @@ func Load() *Config {
 	flag.IntVar(&cfg.Timeout, "timeout", cfg.Timeout, "upstream request timeout in seconds")
 	flag.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug, info, warn, error")
 	flag.BoolVar(&cfg.ShowThinking, "show-thinking", cfg.ShowThinking, "show thinking process for thinking models")
+	flag.StringVar(&cfg.CORSOrigins, "cors-origins", cfg.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
+	flag.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "max requests per minute per IP (0 to disable)")
 	flag.Parse()
 
 	return cfg

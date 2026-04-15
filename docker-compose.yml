@@ -11,6 +11,7 @@ services:
       - PORT=39527
       - API_KEY=${API_KEY:-sk-admin}
       - TIMEOUT=${TIMEOUT:-120}
+      - RATE_LIMIT=${RATE_LIMIT:-60}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:39527/health || exit 1"]
