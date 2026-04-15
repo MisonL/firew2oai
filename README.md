@@ -18,6 +18,7 @@ Fireworks.ai Chat API → OpenAI Compatible API 转换代理
 - **健康检查** — `/health` 端点，适合 K8s/Docker 健康探针
 - **CORS 支持** — 可配置允许的跨域来源（默认 `*`，生产环境建议限定）
 - **Rate Limiting** — 基于 IP 的令牌桶限流，标准 `X-RateLimit-*` 响应头，429 返回
+- **IP 白名单** — 默认仅允许 `127.0.0.1, ::1` 环回地址访问，支持 CIDR 段，空值放行全部
 - **Panic 恢复** — 内置 Recovery 中间件，不会因 panic 崩溃
 - **恒定时间认证** — API Key 比较使用 `crypto/subtle.ConstantTimeCompare`，防止 timing attack
 
@@ -56,6 +57,7 @@ make build
 | `-show-thinking` | `SHOW_THINKING` | `false` | 显示 thinking 模型的思考过程 |
 | `-cors-origins` | `CORS_ORIGINS` | `*` | 允许的跨域来源（逗号分隔，`*` 表示全部） |
 | `-rate-limit` | `RATE_LIMIT` | `0`（禁用） | 每 IP 每分钟最大请求数（0 禁用） |
+| `-ip-whitelist` | `IP_WHITELIST` | `127.0.0.1,::1` | 允许的 IP/CIDR（逗号分隔，空值放行全部） |
 
 ### Docker 部署
 

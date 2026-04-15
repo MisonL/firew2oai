@@ -19,6 +19,7 @@ type Config struct {
 	ShowThinking bool // default: show thinking process for thinking models
 	CORSOrigins  string
 	RateLimit    int // max requests per minute per IP (0 = disabled)
+	IPWhitelist  string // comma-separated IPs/CIDRs (empty = allow all)
 }
 
 var AvailableModels = []string{
@@ -76,6 +77,7 @@ func Load() *Config {
 	cfg.ShowThinking = false
 	cfg.CORSOrigins = "*"
 	cfg.RateLimit = 0 // disabled by default; set >0 to enable
+	cfg.IPWhitelist = "127.0.0.1,::1" // default: loopback only
 
 	// Environment variables
 	if v := os.Getenv("PORT"); v != "" {
@@ -114,6 +116,9 @@ func Load() *Config {
 			slog.Warn("invalid RATE_LIMIT value, using default", "value", v)
 		}
 	}
+	if v := os.Getenv("IP_WHITELIST"); v != "" {
+		cfg.IPWhitelist = v
+	}
 
 	// Command-line flags (override env)
 	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
@@ -125,6 +130,7 @@ func Load() *Config {
 	fs.BoolVar(&cfg.ShowThinking, "show-thinking", cfg.ShowThinking, "show thinking process for thinking models")
 	fs.StringVar(&cfg.CORSOrigins, "cors-origins", cfg.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
 	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "max requests per minute per IP (0 to disable)")
+	fs.StringVar(&cfg.IPWhitelist, "ip-whitelist", cfg.IPWhitelist, "allowed IPs/CIDRs (comma-separated, empty to allow all)")
 	_ = fs.Parse(os.Args[1:])
 
 	return cfg

@@ -58,6 +58,7 @@ func TestLoad_Defaults(t *testing.T) {
 	os.Unsetenv("SHOW_THINKING")
 	os.Unsetenv("CORS_ORIGINS")
 	os.Unsetenv("RATE_LIMIT")
+	os.Unsetenv("IP_WHITELIST")
 
 	cfg := Load()
 	if cfg.Port != 39527 {
@@ -78,8 +79,11 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.CORSOrigins != "*" {
 		t.Errorf("default CORSOrigins = %q, want *", cfg.CORSOrigins)
 	}
-	if cfg.RateLimit != 60 {
-		t.Errorf("default RateLimit = %d, want 60", cfg.RateLimit)
+	if cfg.RateLimit != 0 {
+		t.Errorf("default RateLimit = %d, want 0", cfg.RateLimit)
+	}
+	if cfg.IPWhitelist != "127.0.0.1,::1" {
+		t.Errorf("default IPWhitelist = %q, want 127.0.0.1,::1", cfg.IPWhitelist)
 	}
 }
 
@@ -91,6 +95,7 @@ func TestLoad_EnvOverride(t *testing.T) {
 	t.Setenv("SHOW_THINKING", "true")
 	t.Setenv("CORS_ORIGINS", "https://example.com")
 	t.Setenv("RATE_LIMIT", "100")
+	t.Setenv("IP_WHITELIST", "10.0.0.0/8,192.168.0.0/16")
 
 	cfg := Load()
 	if cfg.Port != 9999 {
@@ -110,6 +115,9 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.RateLimit != 100 {
 		t.Errorf("RateLimit = %d, want 100", cfg.RateLimit)
+	}
+	if cfg.IPWhitelist != "10.0.0.0/8,192.168.0.0/16" {
+		t.Errorf("IPWhitelist = %q, want 10.0.0.0/8,192.168.0.0/16", cfg.IPWhitelist)
 	}
 }
 

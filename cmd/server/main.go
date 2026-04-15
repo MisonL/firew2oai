@@ -16,6 +16,7 @@ import (
 	"github.com/mison/firew2oai/internal/proxy"
 	"github.com/mison/firew2oai/internal/ratelimit"
 	"github.com/mison/firew2oai/internal/transport"
+	"github.com/mison/firew2oai/internal/whitelist"
 )
 
 // Version is injected at build time via -ldflags "-X main.Version=x.y.z"
@@ -36,6 +37,7 @@ func main() {
 		"port", cfg.Port,
 		"timeout", cfg.Timeout,
 		"rate_limit", cfg.RateLimit,
+		"ip_whitelist", cfg.IPWhitelist,
 		"models", len(config.AvailableModels),
 	)
 
@@ -46,6 +48,22 @@ func main() {
 	// Create proxy handler
 	p := proxy.New(tp, cfg.APIKey, timeout, Version)
 	handler := proxy.NewMux(p, cfg.CORSOrigins)
+
+	// Wrap with IP whitelist (applied first, before rate limiting)
+	if cfg.IPWhitelist != "" {
+		wl, err := whitelist.New(cfg.IPWhitelist)
+		if err != nil {
+			slog.Error("invalid IP whitelist configuration", "whitelist", cfg.IPWhitelist, "error", err)
+			os.Exit(1)
+		}
+		inner := handler
+		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			wl.Middleware()(func(w2 http.ResponseWriter, r2 *http.Request) {
+				inner.ServeHTTP(w2, r2)
+			}).ServeHTTP(w, r)
+		})
+		slog.Info("IP whitelist enabled", "whitelist", cfg.IPWhitelist)
+	}
 
 	// Wrap with rate limiter if enabled.
 	// Health check and root endpoints bypass rate limiting

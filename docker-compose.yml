@@ -13,7 +13,8 @@ services:
       - PORT=39527
       - API_KEY=${API_KEY:-sk-admin}
       - TIMEOUT=${TIMEOUT:-120}
-      - RATE_LIMIT=${RATE_LIMIT:-60}
+      - RATE_LIMIT=${RATE_LIMIT:-0}
+      - IP_WHITELIST=${IP_WHITELIST:-}
       - SHOW_THINKING=${SHOW_THINKING:-false}
       - CORS_ORIGINS=${CORS_ORIGINS:-*}
       - LOG_LEVEL=${LOG_LEVEL:-info}
