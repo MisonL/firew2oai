@@ -224,7 +224,7 @@ curl -X POST http://localhost:39527/v1/responses \
 
 ## 支持模型
 
-> **可用性检测时间**: 2026-04-17 — 逐模型对接 Fireworks 上游 API 实测，12/12 通过。
+> **可用性检测时间**: 2026-04-17 — Fireworks 上游模型可用性会动态变化，建议通过 `/v1/models` 获取当前可用列表。
 >
 > 说明：视觉模型标记为可用，表示其**可作为上游 `model` 选择**；当前代理仍按文本消息子集转发，尚未实现 OpenAI 视觉输入格式兼容。
 
@@ -234,18 +234,20 @@ curl -X POST http://localhost:39527/v1/responses \
 | qwen3-vl-30b-a3b-instruct | 视觉 | ✅ | |
 | qwen3-8b | 通用 | ✅ | |
 | minimax-m2p5 | 通用 | ✅ | |
-| minimax-m2p1 | 通用 | ✅ | |
 | llama-v3p3-70b-instruct | 通用 | ✅ | |
+| kimi-k2p5 | 通用 | ✅ | 间歇性可用 |
 | gpt-oss-20b | 通用 | ✅ | |
 | gpt-oss-120b | 通用 | ✅ | |
 | glm-5 | 通用 | ✅ | |
 | glm-4p7 | 通用 | ✅ | |
 | deepseek-v3p2 | 通用 | ✅ | |
 | deepseek-v3p1 | 通用 | ✅ | |
-| ~~kimi-k2p5~~ | 通用 | ❌ | Fireworks 平台已下架（404） |
+| ~~minimax-m2p1~~ | 通用 | ❌ | Fireworks 平台已下架（404） |
 | ~~kimi-k2-thinking~~ | Thinking | ❌ | Fireworks 平台已下架（404） |
 | ~~kimi-k2-instruct-0905~~ | 通用 | ❌ | Fireworks 平台已下架（404） |
 | ~~cogito-671b-v2-p1~~ | 通用 | ❌ | Fireworks 平台已下架（404） |
+
+**注意**：Fireworks 平台模型可用性可能随时变化。如果遇到 502 错误，请检查上游是否返回 404。
 
 ## 指纹伪装策略
 

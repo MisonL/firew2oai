@@ -64,9 +64,19 @@
 ## 2026-04-17 修复记录
 
 ### 问题发现
-- **kimi 模型 502 错误**: Fireworks 上游对 kimi-k2p5/kimi-k2-thinking/kimi-k2-instruct-0905 返回 404
-- **原因**: Fireworks 平台已下架 kimi 系列模型
-- **状态**: 已从 AvailableModels 移除，README 已更新
+- **kimi 模型 502 错误**: Fireworks 上游对部分 kimi 模型返回 404
+- **原因**: Fireworks 平台已下架 kimi-k2-thinking、kimi-k2-instruct-0905
+- **状态**: kimi-k2p5 间歇性恢复可用，minimax-m2p1 新发现不可用
+- **更新**: README 已更新可用模型列表
+
+### 当前可用模型（11个）
+✅ qwen3-vl-30b-a3b-thinking, qwen3-vl-30b-a3b-instruct, qwen3-8b  
+✅ minimax-m2p5, llama-v3p3-70b-instruct, kimi-k2p5（间歇性）  
+✅ gpt-oss-20b, gpt-oss-120b, glm-5, glm-4p7  
+✅ deepseek-v3p2, deepseek-v3p1  
+
+### 不可用模型（4个）
+❌ minimax-m2p1, kimi-k2-thinking, kimi-k2-instruct-0905, cogito-671b-v2-p1
 
 ### 架构优化（CSE 弹性设计）
 - **Authorization 转发**: transport 层现在正确转发客户端 Authorization header 到上游
@@ -77,4 +87,4 @@
 - ✅ 直连模式（Codex / OpenAI 客户端）
 - ✅ 中转模式（New API / One API）
 - ✅ 流式 + 非流式响应
-- ✅ 12 个可用模型全部通过测试
+- ✅ 11 个可用模型通过测试
