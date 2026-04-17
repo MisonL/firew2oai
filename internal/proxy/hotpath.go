@@ -152,6 +152,8 @@ func rolePrefix(role string) string {
 	switch role {
 	case "system":
 		return "System: "
+	case "developer":
+		return "Developer: "
 	case "user":
 		return "User: "
 	case "assistant":

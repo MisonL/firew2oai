@@ -21,6 +21,7 @@ type ResponsesRequest struct {
 	Input              json.RawMessage `json:"input"`
 	Instructions       string          `json:"instructions,omitempty"`
 	PreviousResponseID string          `json:"previous_response_id,omitempty"`
+	Tools              json.RawMessage `json:"tools,omitempty"`
 	Stream             bool            `json:"stream,omitempty"`
 	Temperature        *float64        `json:"temperature,omitempty"`
 	MaxOutputTokens    *int            `json:"max_output_tokens,omitempty"`
@@ -41,12 +42,17 @@ type ResponseOutputMessage struct {
 }
 
 type ResponsesResponse struct {
-	ID        string                  `json:"id"`
-	Object    string                  `json:"object"`
-	CreatedAt int64                   `json:"created_at"`
-	Status    string                  `json:"status"`
-	Model     string                  `json:"model"`
-	Output    []ResponseOutputMessage `json:"output"`
+	ID        string            `json:"id"`
+	Object    string            `json:"object"`
+	CreatedAt int64             `json:"created_at"`
+	Status    string            `json:"status"`
+	Model     string            `json:"model"`
+	Output    []json.RawMessage `json:"output,omitempty"`
+}
+
+type ResponseLifecycleEvent struct {
+	Type     string            `json:"type"`
+	Response ResponsesResponse `json:"response"`
 }
 
 type ResponseOutputTextDeltaEvent struct {
@@ -68,10 +74,10 @@ type ResponseOutputTextDoneEvent struct {
 }
 
 type ResponseOutputItemAddedEvent struct {
-	Type        string                `json:"type"`
-	ResponseID  string                `json:"response_id"`
-	OutputIndex int                   `json:"output_index"`
-	Item        ResponseOutputMessage `json:"item"`
+	Type        string          `json:"type"`
+	ResponseID  string          `json:"response_id"`
+	OutputIndex int             `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
 }
 
 type ResponseContentPartAddedEvent struct {
@@ -84,10 +90,10 @@ type ResponseContentPartAddedEvent struct {
 }
 
 type ResponseOutputItemDoneEvent struct {
-	Type        string                `json:"type"`
-	ResponseID  string                `json:"response_id"`
-	OutputIndex int                   `json:"output_index"`
-	Item        ResponseOutputMessage `json:"item"`
+	Type        string          `json:"type"`
+	ResponseID  string          `json:"response_id"`
+	OutputIndex int             `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
 }
 
 type ResponseInputTextPart struct {
@@ -152,11 +158,27 @@ func buildResponsesMessage(messageID, text string) ResponseOutputMessage {
 	}
 }
 
-func buildResponsesOutput(messageID, text string) []ResponseOutputMessage {
-	return []ResponseOutputMessage{buildResponsesMessage(messageID, text)}
+func mustMarshalRawJSON(v any) json.RawMessage {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return json.RawMessage(data)
+}
+
+func buildResponsesMessageItem(messageID, text string) json.RawMessage {
+	return mustMarshalRawJSON(buildResponsesMessage(messageID, text))
+}
+
+func buildResponsesOutput(messageID, text string) []json.RawMessage {
+	return []json.RawMessage{buildResponsesMessageItem(messageID, text)}
 }
 
 func newResponsesResponse(responseID, messageID, model string, createdAt int64, status, text string) ResponsesResponse {
+	return newResponsesResponseWithOutput(responseID, model, createdAt, status, buildResponsesOutput(messageID, text))
+}
+
+func newResponsesResponseWithOutput(responseID, model string, createdAt int64, status string, output []json.RawMessage) ResponsesResponse {
 	resp := ResponsesResponse{
 		ID:        responseID,
 		Object:    "response",
@@ -164,10 +186,17 @@ func newResponsesResponse(responseID, messageID, model string, createdAt int64, 
 		Status:    status,
 		Model:     model,
 	}
-	if status == "completed" {
-		resp.Output = buildResponsesOutput(messageID, text)
+	if len(output) > 0 {
+		resp.Output = output
 	}
 	return resp
+}
+
+func newResponseLifecycleEvent(eventType string, response ResponsesResponse) ResponseLifecycleEvent {
+	return ResponseLifecycleEvent{
+		Type:     eventType,
+		Response: response,
+	}
 }
 
 func writeSSEEvent(w io.Writer, event string, v any) error {
@@ -236,18 +265,26 @@ func responseInputToMessages(input json.RawMessage) ([]ChatMessage, error) {
 	return filtered, nil
 }
 
-func responsesPromptMessages(base []ChatMessage, instructions string, current []ChatMessage) []ChatMessage {
-	total := len(base) + len(current)
-	if strings.TrimSpace(instructions) != "" {
-		total++
+func splitCurrentTurnMessages(current []ChatMessage) ([]ChatMessage, string) {
+	lastUser := -1
+	for i := len(current) - 1; i >= 0; i-- {
+		if current[i].Role == "user" && strings.TrimSpace(current[i].Content) != "" {
+			lastUser = i
+			break
+		}
 	}
-	messages := make([]ChatMessage, 0, total)
-	if instructions = strings.TrimSpace(instructions); instructions != "" {
-		messages = append(messages, ChatMessage{Role: "system", Content: instructions})
+	if lastUser < 0 {
+		return cloneMessages(current), ""
 	}
-	messages = append(messages, base...)
-	messages = append(messages, current...)
-	return messages
+
+	context := make([]ChatMessage, 0, len(current)-1)
+	for i, msg := range current {
+		if i == lastUser {
+			continue
+		}
+		context = append(context, msg)
+	}
+	return context, current[lastUser].Content
 }
 
 func extractInputMessages(v any) []ChatMessage {
@@ -255,6 +292,9 @@ func extractInputMessages(v any) []ChatMessage {
 	case string:
 		return []ChatMessage{{Role: "user", Content: item}}
 	case map[string]any:
+		if messages := extractToolInputMessages(item); len(messages) > 0 {
+			return messages
+		}
 		if text, ok := extractDirectInputText(item); ok {
 			return []ChatMessage{{Role: "user", Content: text}}
 		}
@@ -275,6 +315,37 @@ func extractInputMessages(v any) []ChatMessage {
 		}
 	}
 	return nil
+}
+
+func extractToolInputMessages(item map[string]any) []ChatMessage {
+	typ, _ := item["type"].(string)
+	callID, _ := item["call_id"].(string)
+
+	switch typ {
+	case "function_call", "custom_tool_call":
+		name, _ := item["name"].(string)
+		payload := ""
+		if typ == "function_call" {
+			if args, ok := item["arguments"].(string); ok {
+				payload = args
+			}
+		} else if input, ok := item["input"].(string); ok {
+			payload = input
+		}
+		return []ChatMessage{{
+			Role:    "assistant",
+			Content: formatToolCallSummary(name, callID, payload),
+		}}
+	case "function_call_output", "custom_tool_call_output":
+		text, success := extractToolOutputText(item["output"])
+		content := formatToolOutputSummary(callID, success, text)
+		if content == "" {
+			return nil
+		}
+		return []ChatMessage{{Role: "user", Content: content}}
+	default:
+		return nil
+	}
 }
 
 func extractDirectInputText(item map[string]any) (string, bool) {
@@ -306,6 +377,357 @@ func extractTextParts(parts []any) string {
 		}
 	}
 	return strings.Join(texts, "")
+}
+
+func extractToolOutputText(v any) (string, *bool) {
+	switch value := v.(type) {
+	case string:
+		return value, nil
+	case map[string]any:
+		var text string
+		if content, ok := value["content"].(string); ok {
+			text = content
+		}
+		if text == "" {
+			if items, ok := value["content_items"].([]any); ok {
+				text = extractTextParts(items)
+			}
+		}
+		var success *bool
+		if raw, ok := value["success"].(bool); ok {
+			flag := raw
+			success = &flag
+		}
+		return text, success
+	default:
+		return "", nil
+	}
+}
+
+func formatToolCallSummary(name, callID, payload string) string {
+	var builder strings.Builder
+	builder.WriteString("Assistant requested tool")
+	if name != "" {
+		builder.WriteString(": ")
+		builder.WriteString(name)
+	}
+	if callID != "" {
+		builder.WriteString(" (call_id=")
+		builder.WriteString(callID)
+		builder.WriteByte(')')
+	}
+	if strings.TrimSpace(payload) != "" {
+		builder.WriteString("\nTool payload:\n")
+		builder.WriteString(payload)
+	}
+	return builder.String()
+}
+
+func formatToolOutputSummary(callID string, success *bool, text string) string {
+	text = strings.TrimSpace(text)
+	if callID == "" && success == nil && text == "" {
+		return ""
+	}
+
+	var builder strings.Builder
+	builder.WriteString("Tool result")
+	if callID != "" {
+		builder.WriteString(" (call_id=")
+		builder.WriteString(callID)
+		builder.WriteByte(')')
+	}
+	if success != nil {
+		builder.WriteString("\nSuccess: ")
+		if *success {
+			builder.WriteString("true")
+		} else {
+			builder.WriteString("false")
+		}
+	}
+	if text != "" {
+		builder.WriteString("\nOutput:\n")
+		builder.WriteString(text)
+	}
+	return builder.String()
+}
+
+func buildResponsesPrompt(base []ChatMessage, instructions string, current []ChatMessage, tools json.RawMessage) string {
+	contextMessages, currentTask := splitCurrentTurnMessages(current)
+	toolInstructions := summarizeResponsesTools(tools)
+
+	var builder strings.Builder
+	builder.Grow(4096)
+	builder.WriteString("You are serving an OpenAI Responses API request through a text-only upstream model.\n")
+	builder.WriteString("Follow the base instructions and developer context, but do not reply to them directly.\n")
+	builder.WriteString("Treat CURRENT_USER_TASK as the active task for this turn.\n")
+	builder.WriteString("Execute the current task immediately. Do not say you are ready, waiting, or asking for a task.\n")
+	builder.WriteString("If the current task is a simple text request, answer with the exact result and do not inspect the workspace.\n")
+	if currentTask != "" {
+		builder.WriteString("\n<CURRENT_USER_TASK>\n")
+		builder.WriteString(currentTask)
+		builder.WriteString("\n</CURRENT_USER_TASK>\n")
+	}
+	if toolInstructions != "" {
+		builder.WriteString("When a tool is required, reply with exactly one JSON object and no markdown fences or extra prose.\n")
+		builder.WriteString("Use only tool names listed in AVAILABLE_TOOLS. Never invent or rename a tool.\n")
+		builder.WriteString("Use this format for structured tools:\n")
+		builder.WriteString("{\"type\":\"function_call\",\"name\":\"<tool_name>\",\"arguments\":{...}}\n")
+		builder.WriteString("Use this format for freeform tools:\n")
+		builder.WriteString("{\"type\":\"custom_tool_call\",\"name\":\"<tool_name>\",\"input\":\"<raw input>\"}\n")
+	}
+
+	if instructions = strings.TrimSpace(instructions); instructions != "" {
+		builder.WriteString("\n<BASE_INSTRUCTIONS>\n")
+		builder.WriteString(instructions)
+		builder.WriteString("\n</BASE_INSTRUCTIONS>\n")
+	}
+	if len(base) > 0 {
+		builder.WriteString("\n<PREVIOUS_CONVERSATION>\n")
+		builder.WriteString(messagesToPrompt(base))
+		builder.WriteString("\n</PREVIOUS_CONVERSATION>\n")
+	}
+	if len(contextMessages) > 0 {
+		builder.WriteString("\n<CURRENT_TURN_CONTEXT>\n")
+		builder.WriteString(messagesToPrompt(contextMessages))
+		builder.WriteString("\n</CURRENT_TURN_CONTEXT>\n")
+	}
+	if toolInstructions != "" {
+		builder.WriteString("\n<AVAILABLE_TOOLS>\n")
+		builder.WriteString(toolInstructions)
+		builder.WriteString("\n</AVAILABLE_TOOLS>\n")
+	}
+	return builder.String()
+}
+
+func summarizeResponsesTools(raw json.RawMessage) string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) || bytes.Equal(trimmed, []byte("[]")) {
+		return ""
+	}
+
+	var tools []map[string]any
+	if err := json.Unmarshal(trimmed, &tools); err != nil {
+		return ""
+	}
+
+	lines := make([]string, 0, len(tools))
+	for _, tool := range tools {
+		lines = append(lines, summarizeResponseTool(tool)...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func summarizeResponseTool(tool map[string]any) []string {
+	toolType, _ := tool["type"].(string)
+	switch toolType {
+	case "namespace":
+		namespaceName, _ := tool["name"].(string)
+		rawTools, _ := tool["tools"].([]any)
+		lines := make([]string, 0, len(rawTools))
+		for _, rawTool := range rawTools {
+			child, ok := rawTool.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := child["name"].(string)
+			if namespaceName != "" && name != "" {
+				child = cloneMap(child)
+				child["name"] = namespaceName + "." + name
+			}
+			lines = append(lines, summarizeResponseTool(child)...)
+		}
+		return lines
+	case "web_search":
+		return []string{"- web_search: use for internet search when current information is required."}
+	default:
+		name, _ := tool["name"].(string)
+		if name == "" {
+			return nil
+		}
+		desc, _ := tool["description"].(string)
+		desc = truncateString(strings.TrimSpace(desc), 180)
+		params := summarizeToolParameters(tool["parameters"])
+		line := "- " + name + " [" + toolType + "]"
+		if desc != "" {
+			line += ": " + desc
+		}
+		if params != "" {
+			line += " Params: " + params
+		}
+		return []string{line}
+	}
+}
+
+func summarizeToolParameters(v any) string {
+	paramMap, ok := v.(map[string]any)
+	if !ok {
+		return ""
+	}
+	props, ok := paramMap["properties"].(map[string]any)
+	if !ok || len(props) == 0 {
+		return ""
+	}
+
+	keys := make([]string, 0, len(props))
+	for key := range props {
+		keys = append(keys, key)
+	}
+	if len(keys) > 8 {
+		keys = keys[:8]
+	}
+	return strings.Join(keys, ", ")
+}
+
+func cloneMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
+}
+
+type parsedToolCall struct {
+	item         json.RawMessage
+	conversation ChatMessage
+}
+
+func parseToolCallOutput(text string) (*parsedToolCall, bool) {
+	candidate := strings.TrimSpace(stripMarkdownCodeFence(text))
+	if extracted, ok := extractJSONObject(candidate); ok {
+		candidate = extracted
+	}
+	if candidate == "" || !strings.HasPrefix(candidate, "{") {
+		return nil, false
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(candidate), &raw); err != nil {
+		return nil, false
+	}
+
+	callType, _ := raw["type"].(string)
+	name, _ := raw["name"].(string)
+	name = normalizeToolName(name)
+	if name == "" {
+		return nil, false
+	}
+
+	callID := "call_" + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
+	switch callType {
+	case "function_call":
+		args := raw["arguments"]
+		argsText := "{}"
+		switch value := args.(type) {
+		case string:
+			argsText = value
+		case nil:
+		default:
+			data, err := json.Marshal(value)
+			if err != nil {
+				return nil, false
+			}
+			argsText = string(data)
+		}
+		item := mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      name,
+			"arguments": argsText,
+			"call_id":   callID,
+		})
+		return &parsedToolCall{
+			item:         item,
+			conversation: ChatMessage{Role: "assistant", Content: formatToolCallSummary(name, callID, argsText)},
+		}, true
+	case "custom_tool_call":
+		input := ""
+		if value, ok := raw["input"].(string); ok {
+			input = value
+		}
+		item := mustMarshalRawJSON(map[string]any{
+			"type":    "custom_tool_call",
+			"name":    name,
+			"input":   input,
+			"call_id": callID,
+		})
+		return &parsedToolCall{
+			item:         item,
+			conversation: ChatMessage{Role: "assistant", Content: formatToolCallSummary(name, callID, input)},
+		}, true
+	default:
+		return nil, false
+	}
+}
+
+func stripMarkdownCodeFence(text string) string {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "```") {
+		return text
+	}
+
+	lines := strings.Split(text, "\n")
+	if len(lines) < 2 {
+		return text
+	}
+	if strings.HasPrefix(strings.TrimSpace(lines[0]), "```") {
+		lines = lines[1:]
+	}
+	if len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "```" {
+		lines = lines[:len(lines)-1]
+	}
+	return strings.Join(lines, "\n")
+}
+
+func extractJSONObject(text string) (string, bool) {
+	start := strings.IndexByte(text, '{')
+	if start < 0 {
+		return "", false
+	}
+
+	depth := 0
+	inString := false
+	escaped := false
+	end := -1
+	for i := start; i < len(text); i++ {
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				end = i
+			}
+		}
+	}
+	if end < start {
+		return "", false
+	}
+	return text[start : end+1], true
+}
+
+func normalizeToolName(name string) string {
+	switch name {
+	case "run_terminal", "shell", "shell_command":
+		return "exec_command"
+	default:
+		return name
+	}
 }
 
 func buildResponseInputItemList(messages []ChatMessage) ResponseInputItemList {
@@ -372,8 +794,9 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	responseID := generateResponsesID()
 	messageID := generateResponseMessageID()
 	showThinking := resolveShowThinking(p.defaultShowThinking, req.ShowThinking)
-	promptMessages := responsesPromptMessages(baseMessages, req.Instructions, currentMessages)
-	prompt := messagesToPrompt(promptMessages)
+	promptMessages := append(cloneMessages(baseMessages), currentMessages...)
+	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, req.Tools)
+	bufferForToolCalls := len(strings.TrimSpace(string(req.Tools))) > 0
 
 	bodyBytes, err := buildFireworksRequestBody(req.Model, prompt, req.Temperature, req.MaxOutputTokens)
 	if err != nil {
@@ -389,13 +812,14 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"messages", len(promptMessages),
 		"previous_response_id", req.PreviousResponseID,
 		"thinking", showThinking,
+		"tools_present", bufferForToolCalls,
 	)
 
 	if req.Stream {
-		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, append(cloneMessages(baseMessages), currentMessages...))
+		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, append(cloneMessages(baseMessages), currentMessages...), bufferForToolCalls)
 		return
 	}
-	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, append(cloneMessages(baseMessages), currentMessages...))
+	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, append(cloneMessages(baseMessages), currentMessages...), bufferForToolCalls)
 }
 
 func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
@@ -431,7 +855,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry.response)
 }
 
-func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, conversationInput []ChatMessage) {
+func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, conversationInput []ChatMessage, bufferForToolCalls bool) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -471,18 +895,19 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	}
 
 	createdAt := time.Now().Unix()
-	if !writeAndFlushEvent("response.created", newResponsesResponse(responseID, messageID, model, createdAt, "in_progress", "")) {
+	created := newResponsesResponse(responseID, messageID, model, createdAt, "in_progress", "")
+	if !writeAndFlushEvent("response.created", newResponseLifecycleEvent("response.created", created)) {
 		return
 	}
-	if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+	if !bufferForToolCalls && !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
 		Type:        "response.output_item.added",
 		ResponseID:  responseID,
 		OutputIndex: 0,
-		Item:        buildResponsesMessage(messageID, ""),
+		Item:        buildResponsesMessageItem(messageID, ""),
 	}) {
 		return
 	}
-	if !writeAndFlushEvent("response.content_part.added", ResponseContentPartAddedEvent{
+	if !bufferForToolCalls && !writeAndFlushEvent("response.content_part.added", ResponseContentPartAddedEvent{
 		Type:         "response.content_part.added",
 		ResponseID:   responseID,
 		ItemID:       messageID,
@@ -501,6 +926,38 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		case "done":
 			doneReceived = true
 			finalText := result.String()
+			if bufferForToolCalls {
+				if toolCall, ok := parseToolCallOutput(finalText); ok {
+					completed := newResponsesResponseWithOutput(responseID, model, createdAt, "completed", []json.RawMessage{toolCall.item})
+					if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+						Type:        "response.output_item.done",
+						ResponseID:  responseID,
+						OutputIndex: 0,
+						Item:        toolCall.item,
+					}) {
+						return false
+					}
+					if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+						return false
+					}
+					p.responses.put(completed, conversationInput, append(cloneMessages(conversationInput), toolCall.conversation))
+					return true
+				}
+				if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+					Type:        "response.output_item.done",
+					ResponseID:  responseID,
+					OutputIndex: 0,
+					Item:        buildResponsesMessageItem(messageID, finalText),
+				}) {
+					return false
+				}
+				completed := newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)
+				if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+					return false
+				}
+				p.responses.put(completed, conversationInput, responseConversation(conversationInput, finalText))
+				return true
+			}
 			if !writeAndFlushEvent("response.output_text.done", ResponseOutputTextDoneEvent{
 				Type:         "response.output_text.done",
 				ResponseID:   responseID,
@@ -515,14 +972,15 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				Type:        "response.output_item.done",
 				ResponseID:  responseID,
 				OutputIndex: 0,
-				Item:        buildResponsesMessage(messageID, finalText),
+				Item:        buildResponsesMessageItem(messageID, finalText),
 			}) {
 				return false
 			}
-			if !writeAndFlushEvent("response.completed", newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)) {
+			completed := newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)
+			if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 				return false
 			}
-			p.responses.put(newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText), conversationInput, responseConversation(conversationInput, finalText))
+			p.responses.put(completed, conversationInput, responseConversation(conversationInput, finalText))
 			return true
 		case "thinking_separator":
 			fallthrough
@@ -532,6 +990,9 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				delta = "\n\n--- Answer ---\n\n"
 			}
 			result.WriteString(delta)
+			if bufferForToolCalls {
+				return true
+			}
 			return writeAndFlushEvent("response.output_text.delta", ResponseOutputTextDeltaEvent{
 				Type:         "response.output_text.delta",
 				ResponseID:   responseID,
@@ -548,6 +1009,30 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	if !doneReceived && (contentEmitted || result.Len() > 0) {
 		slog.Debug("responses stream ended without done event but content available", "response_id", responseID, "result_len", result.Len())
 		finalText := result.String()
+		if bufferForToolCalls {
+			if toolCall, ok := parseToolCallOutput(finalText); ok {
+				completed := newResponsesResponseWithOutput(responseID, model, createdAt, "completed", []json.RawMessage{toolCall.item})
+				writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+					Type:        "response.output_item.done",
+					ResponseID:  responseID,
+					OutputIndex: 0,
+					Item:        toolCall.item,
+				})
+				writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
+				p.responses.put(completed, conversationInput, append(cloneMessages(conversationInput), toolCall.conversation))
+				return
+			}
+			completed := newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)
+			writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+				Type:        "response.output_item.done",
+				ResponseID:  responseID,
+				OutputIndex: 0,
+				Item:        buildResponsesMessageItem(messageID, finalText),
+			})
+			writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
+			p.responses.put(completed, conversationInput, responseConversation(conversationInput, finalText))
+			return
+		}
 		writeAndFlushEvent("response.output_text.done", ResponseOutputTextDoneEvent{
 			Type:         "response.output_text.done",
 			ResponseID:   responseID,
@@ -560,10 +1045,10 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			Type:        "response.output_item.done",
 			ResponseID:  responseID,
 			OutputIndex: 0,
-			Item:        buildResponsesMessage(messageID, finalText),
+			Item:        buildResponsesMessageItem(messageID, finalText),
 		})
 		completed := newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)
-		writeAndFlushEvent("response.completed", completed)
+		writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
 		p.responses.put(completed, conversationInput, responseConversation(conversationInput, finalText))
 	}
 
@@ -572,7 +1057,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, conversationInput []ChatMessage) {
+func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, conversationInput []ChatMessage, bufferForToolCalls bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.transport.Timeout())
 	defer cancel()
 
@@ -628,7 +1113,18 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		slog.Debug("responses stream ended without done event but content available, treating as success", "response_id", responseID, "result_len", result.Len())
 	}
 
-	completed := newResponsesResponse(responseID, messageID, model, time.Now().Unix(), "completed", result.String())
-	p.responses.put(completed, conversationInput, responseConversation(conversationInput, result.String()))
+	finalText := result.String()
+	createdAt := time.Now().Unix()
+	if bufferForToolCalls {
+		if toolCall, ok := parseToolCallOutput(finalText); ok {
+			completed := newResponsesResponseWithOutput(responseID, model, createdAt, "completed", []json.RawMessage{toolCall.item})
+			p.responses.put(completed, conversationInput, append(cloneMessages(conversationInput), toolCall.conversation))
+			writeJSON(w, http.StatusOK, completed)
+			return
+		}
+	}
+
+	completed := newResponsesResponse(responseID, messageID, model, createdAt, "completed", finalText)
+	p.responses.put(completed, conversationInput, responseConversation(conversationInput, finalText))
 	writeJSON(w, http.StatusOK, completed)
 }
