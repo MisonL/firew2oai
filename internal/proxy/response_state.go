@@ -1,13 +1,16 @@
 package proxy
 
-import "sync"
+import (
+	"encoding/json"
+	"sync"
+)
 
 const defaultResponseStoreEntries = 1024
 
 type storedResponse struct {
 	response     ResponsesResponse
-	inputItems   []ChatMessage
-	conversation []ChatMessage
+	requestItems []json.RawMessage
+	historyItems []json.RawMessage
 }
 
 type responseStore struct {
@@ -28,7 +31,7 @@ func newResponseStore(maxEntries int) *responseStore {
 	}
 }
 
-func (s *responseStore) put(response ResponsesResponse, inputItems []ChatMessage, conversation []ChatMessage) {
+func (s *responseStore) put(response ResponsesResponse, requestItems []json.RawMessage, historyItems []json.RawMessage) {
 	if s == nil || response.ID == "" {
 		return
 	}
@@ -41,8 +44,8 @@ func (s *responseStore) put(response ResponsesResponse, inputItems []ChatMessage
 	}
 	s.entries[response.ID] = storedResponse{
 		response:     response,
-		inputItems:   cloneMessages(inputItems),
-		conversation: cloneMessages(conversation),
+		requestItems: cloneRawItems(requestItems),
+		historyItems: cloneRawItems(historyItems),
 	}
 	s.evictLocked()
 }
@@ -59,8 +62,8 @@ func (s *responseStore) get(id string) (storedResponse, bool) {
 	if !ok {
 		return storedResponse{}, false
 	}
-	entry.inputItems = cloneMessages(entry.inputItems)
-	entry.conversation = cloneMessages(entry.conversation)
+	entry.requestItems = cloneRawItems(entry.requestItems)
+	entry.historyItems = cloneRawItems(entry.historyItems)
 	return entry, true
 }
 
@@ -88,4 +91,18 @@ func responseConversation(input []ChatMessage, assistantText string) []ChatMessa
 		conversation = append(conversation, ChatMessage{Role: "assistant", Content: assistantText})
 	}
 	return conversation
+}
+
+func cloneRawItems(items []json.RawMessage) []json.RawMessage {
+	if len(items) == 0 {
+		return nil
+	}
+	cloned := make([]json.RawMessage, len(items))
+	for i, item := range items {
+		if len(item) == 0 {
+			continue
+		}
+		cloned[i] = append(json.RawMessage(nil), item...)
+	}
+	return cloned
 }

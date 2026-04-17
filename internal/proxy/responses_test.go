@@ -102,28 +102,62 @@ func TestResponseInputToMessages_ToolOutput(t *testing.T) {
 }
 
 func TestParseToolCallOutput_Function(t *testing.T) {
-	call, ok := parseToolCallOutput("```json\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}}\n```")
-	if !ok {
+	result := parseToolCallOutput(
+		"```json\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}}\n```",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if result.call == nil {
 		t.Fatal("expected function tool call")
 	}
-	if !strings.Contains(call.conversation.Content, "exec_command") {
-		t.Fatalf("conversation = %+v", call.conversation)
+	if !strings.Contains(result.call.conversation.Content, "exec_command") {
+		t.Fatalf("conversation = %+v", result.call.conversation)
 	}
-	if !strings.Contains(string(call.item), `"type":"function_call"`) || !strings.Contains(string(call.item), `"name":"exec_command"`) {
-		t.Fatalf("item = %s", string(call.item))
+	if !strings.Contains(string(result.call.item), `"type":"function_call"`) || !strings.Contains(string(result.call.item), `"name":"exec_command"`) {
+		t.Fatalf("item = %s", string(result.call.item))
 	}
-	if !strings.Contains(string(call.item), `\"cmd\":\"pwd\"`) {
-		t.Fatalf("item arguments missing cmd: %s", string(call.item))
+	if !strings.Contains(string(result.call.item), `\"cmd\":\"pwd\"`) {
+		t.Fatalf("item arguments missing cmd: %s", string(result.call.item))
 	}
 }
 
 func TestParseToolCallOutput_ExtractsMixedTextAndNormalizesAlias(t *testing.T) {
-	call, ok := parseToolCallOutput("I will inspect first.\n{\"type\":\"function_call\",\"name\":\"run_terminal\",\"arguments\":{\"cmd\":\"pwd\"}}")
-	if !ok {
+	result := parseToolCallOutput(
+		"I will inspect first.\n{\"type\":\"function_call\",\"name\":\"run_terminal\",\"arguments\":{\"cmd\":\"pwd\"}}",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if result.call == nil {
 		t.Fatal("expected function tool call from mixed text")
 	}
-	if !strings.Contains(string(call.item), `"name":"exec_command"`) {
-		t.Fatalf("item did not normalize tool name: %s", string(call.item))
+	if !strings.Contains(string(result.call.item), `"name":"exec_command"`) {
+		t.Fatalf("item did not normalize tool name: %s", string(result.call.item))
+	}
+}
+
+func TestParseToolCallOutput_RejectsUndeclaredTool(t *testing.T) {
+	result := parseToolCallOutput(
+		"{\"type\":\"function_call\",\"name\":\"unknown_tool\",\"arguments\":{\"cmd\":\"pwd\"}}",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+	if result.call != nil {
+		t.Fatalf("expected no parsed tool call, got %+v", result.call)
+	}
+	if result.err == nil || !strings.Contains(result.err.Error(), "not declared") {
+		t.Fatalf("expected undeclared tool error, got %v", result.err)
 	}
 }
 
@@ -334,6 +368,12 @@ func TestHandleResponses_NonStream(t *testing.T) {
 	if len(resp.Output) != 1 {
 		t.Fatalf("output = %+v, want one assistant text item", resp.Output)
 	}
+	if resp.Usage == nil {
+		t.Fatal("usage is nil")
+	}
+	if resp.Usage.InputTokens <= 0 || resp.Usage.OutputTokens <= 0 || resp.Usage.TotalTokens <= 0 {
+		t.Fatalf("usage = %+v, want positive token counts", resp.Usage)
+	}
 	var item ResponseOutputMessage
 	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
 		t.Fatalf("decode output item: %v", err)
@@ -394,6 +434,8 @@ func TestHandleResponses_Stream(t *testing.T) {
 		"event: response.completed",
 		`"type":"response.completed"`,
 		`"status":"completed"`,
+		`"usage":{"input_tokens":`,
+		`"output_tokens":`,
 	} {
 		if !strings.Contains(bodyText, want) {
 			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
@@ -438,5 +480,78 @@ func TestHandleResponses_StreamFunctionToolCall(t *testing.T) {
 	}
 	if strings.Contains(bodyText, "response.output_text.delta") {
 		t.Fatalf("tool-call stream should not emit text deltas:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_PreviousResponseIDWithToolOutput(t *testing.T) {
+	requests := make([]FireworksRequest, 0, 2)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var fwReq FireworksRequest
+		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		requests = append(requests, fwReq)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		if len(requests) == 1 {
+			_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"{\\\"type\\\":\\\"function_call\\\",\\\"name\\\":\\\"exec_command\\\",\\\"arguments\\\":{\\\"cmd\\\":\\\"pwd\\\"}}\"}\n\n"))
+		} else {
+			_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"工作目录已确认\"}\n\n"))
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	firstBody := `{"model":"deepseek-v3p2","input":"读取当前目录","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	firstReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(firstBody))
+	firstReq.Header.Set("Authorization", "Bearer test-key")
+	firstReq.Header.Set("Content-Type", "application/json")
+	firstRec := httptest.NewRecorder()
+	mux.ServeHTTP(firstRec, firstReq)
+	if firstRec.Code != http.StatusOK {
+		t.Fatalf("first status = %d, body=%s", firstRec.Code, firstRec.Body.String())
+	}
+
+	var firstResp ResponsesResponse
+	if err := json.Unmarshal(firstRec.Body.Bytes(), &firstResp); err != nil {
+		t.Fatalf("decode first response: %v", err)
+	}
+	if len(firstResp.Output) != 1 {
+		t.Fatalf("first output len = %d, want 1", len(firstResp.Output))
+	}
+	var firstOutput map[string]any
+	if err := json.Unmarshal(firstResp.Output[0], &firstOutput); err != nil {
+		t.Fatalf("decode first output item: %v", err)
+	}
+	callID, _ := firstOutput["call_id"].(string)
+	if callID == "" {
+		t.Fatalf("missing call_id in first output: %s", string(firstResp.Output[0]))
+	}
+
+	secondBody := `{"model":"deepseek-v3p2","previous_response_id":"` + firstResp.ID + `","input":[{"type":"function_call_output","call_id":"` + callID + `","output":"` + "`/Volumes/Work/code/firew2oai`" + `"}]}`
+	secondReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(secondBody))
+	secondReq.Header.Set("Authorization", "Bearer test-key")
+	secondReq.Header.Set("Content-Type", "application/json")
+	secondRec := httptest.NewRecorder()
+	mux.ServeHTTP(secondRec, secondReq)
+	if secondRec.Code != http.StatusOK {
+		t.Fatalf("second status = %d, body=%s", secondRec.Code, secondRec.Body.String())
+	}
+
+	if len(requests) != 2 {
+		t.Fatalf("upstream requests = %d, want 2", len(requests))
+	}
+	prompt := requests[1].Messages[0].Content
+	for _, want := range []string{
+		"Assistant requested tool: exec_command",
+		"Tool result",
+		"/Volumes/Work/code/firew2oai",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("second prompt missing %q:\n%s", want, prompt)
+		}
 	}
 }
