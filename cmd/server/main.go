@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +25,7 @@ var Version = "dev"
 
 func main() {
 	cfg := config.Load()
+	cfg.ApplyFlags(os.Args)
 
 	// Setup structured logger
 	level := parseLogLevel(cfg.LogLevel)
@@ -37,8 +39,11 @@ func main() {
 		"port", cfg.Port,
 		"timeout", cfg.Timeout,
 		"rate_limit", cfg.RateLimit,
+		"cors_origins", cfg.CORSOrigins,
 		"ip_whitelist", cfg.IPWhitelist,
 		"models", len(config.AvailableModels),
+		"gomaxprocs", runtime.GOMAXPROCS(0),
+		"num_cpu", runtime.NumCPU(),
 	)
 
 	// Create transport with Chrome TLS fingerprint
@@ -57,32 +62,46 @@ func main() {
 		"global_rate_limit", cfg.RateLimit,
 	)
 
-	// Create proxy handler
-	p := proxy.New(tp, timeout, Version)
-	handler := proxy.NewMux(p, cfg.CORSOrigins, cfg.APIKey, tm)
+	// Security warnings for overly permissive defaults
+	if cfg.CORSOrigins == "*" {
+		slog.Warn("CORS is set to wildcard (*) — any origin can access the API; restrict CORS_ORIGINS for production")
+	}
+	if cfg.IPWhitelist == "" {
+		slog.Warn("IP whitelist is empty — all IPs are allowed; set IP_WHITELIST for production")
+	}
 
-	// Wrap with IP whitelist (applied first)
+	// Create proxy handler
+	p := proxy.New(tp, Version, cfg.ShowThinking)
+	handler := proxy.NewMux(p, cfg.CORSOrigins, tm)
+
+	// Wrap with IP whitelist (applied first, constructed once at startup)
 	if cfg.IPWhitelist != "" {
 		wl, err := whitelist.New(cfg.IPWhitelist)
 		if err != nil {
 			slog.Error("invalid IP whitelist configuration", "whitelist", cfg.IPWhitelist, "error", err)
 			os.Exit(1)
 		}
-		inner := handler
-		handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			wl.Middleware()(func(w2 http.ResponseWriter, r2 *http.Request) {
-				inner.ServeHTTP(w2, r2)
-			}).ServeHTTP(w, r)
+		// Pre-construct the whitelist middleware handler once at startup
+		// instead of re-creating closures on every request.
+		// CRITICAL: capture the original handler before re-assignment to avoid
+		// the closure capturing the reassigned variable (infinite recursion).
+		originalHandler := handler
+		handler = wl.Middleware(cfg.TrustedProxyCount)(func(w http.ResponseWriter, r *http.Request) {
+			originalHandler.ServeHTTP(w, r)
 		})
-		slog.Info("IP whitelist enabled", "whitelist", cfg.IPWhitelist)
+		slog.Info("IP whitelist enabled", "whitelist", cfg.IPWhitelist, "trusted_proxy_count", cfg.TrustedProxyCount)
 	}
 
-	// Create HTTP server with timeouts
+	// Create HTTP server with timeouts.
+	// WriteTimeout is set to 0 (disabled) because SSE streaming responses
+	// can last longer than any fixed timeout (especially for thinking models).
+	// Actual timeout is enforced by the transport client and request context.
 	srv := &http.Server{
 		Addr:              cfg.Addr(),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      0,
 		IdleTimeout:       120 * time.Second,
 	}
 
@@ -99,6 +118,7 @@ func main() {
 	// Graceful shutdown on SIGINT/SIGTERM
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(quit)
 
 	select {
 	case err := <-errCh:

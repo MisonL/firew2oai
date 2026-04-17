@@ -124,7 +124,7 @@ func TestAllowedIPv6Loopback(t *testing.T) {
 
 func TestExtractClientIP_RemoteAddr(t *testing.T) {
 	r := &http.Request{RemoteAddr: "192.168.1.100:12345"}
-	ip, err := ExtractClientIP(r)
+	ip, err := ExtractClientIP(r, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestExtractClientIP_XRealIP(t *testing.T) {
 		RemoteAddr: "10.0.0.1:12345",
 		Header:     map[string][]string{"X-Real-Ip": {"192.168.1.50"}},
 	}
-	ip, err := ExtractClientIP(r)
+	ip, err := ExtractClientIP(r, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -152,7 +152,8 @@ func TestExtractClientIP_XForwardedFor(t *testing.T) {
 		RemoteAddr: "10.0.0.1:12345",
 		Header:     map[string][]string{"X-Forwarded-For": {"203.0.113.50, 10.0.0.2"}},
 	}
-	ip, err := ExtractClientIP(r)
+	// With 1 trusted proxy: rightmost 1 entry (10.0.0.2) is trusted, so client is 203.0.113.50
+	ip, err := ExtractClientIP(r, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -165,11 +166,11 @@ func TestExtractClientIP_XRealIPPriority(t *testing.T) {
 	r := &http.Request{
 		RemoteAddr: "10.0.0.1:12345",
 		Header: map[string][]string{
-			"X-Real-Ip":        {"192.168.1.50"},
+			"X-Real-Ip":       {"192.168.1.50"},
 			"X-Forwarded-For": {"203.0.113.50"},
 		},
 	}
-	ip, err := ExtractClientIP(r)
+	ip, err := ExtractClientIP(r, 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -180,11 +181,136 @@ func TestExtractClientIP_XRealIPPriority(t *testing.T) {
 
 func TestExtractClientIP_NoPort(t *testing.T) {
 	r := &http.Request{RemoteAddr: "127.0.0.1"}
-	ip, err := ExtractClientIP(r)
+	ip, err := ExtractClientIP(r, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !ip.Equal(net.ParseIP("127.0.0.1")) {
 		t.Errorf("expected 127.0.0.1, got %v", ip)
+	}
+}
+
+func TestExtractClientIP_ZeroTrust(t *testing.T) {
+	// With trustedProxyCount=0, XFF headers should be ignored
+	r := &http.Request{
+		RemoteAddr: "192.168.1.100:12345",
+		Header: map[string][]string{
+			"X-Real-Ip":       {"10.0.0.1"},
+			"X-Forwarded-For": {"10.0.0.1"},
+		},
+	}
+	ip, err := ExtractClientIP(r, 0)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ip.Equal(net.ParseIP("192.168.1.100")) {
+		t.Errorf("expected 192.168.1.100 (RemoteAddr), got %v", ip)
+	}
+}
+
+// TestExtractClientIP_XRealIPIgnoredMultiProxy verifies that X-Real-IP
+// is NOT trusted when trustedProxyCount > 1 (P2 regression: multi-layer proxy bypass).
+func TestExtractClientIP_XRealIPIgnoredMultiProxy(t *testing.T) {
+	// With 2 trusted proxies, an attacker could set X-Real-IP to bypass
+	// the whitelist. Only X-Forwarded-For should be used for >1 proxy hops.
+	r := &http.Request{
+		RemoteAddr: "10.0.0.3:12345",
+		Header: map[string][]string{
+			"X-Real-Ip":       {"1.2.3.4"}, // attacker-spoofed
+			"X-Forwarded-For": {"203.0.113.50, 10.0.0.1, 10.0.0.2"},
+		},
+	}
+	ip, err := ExtractClientIP(r, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should NOT be 1.2.3.4 (spoofed X-Real-IP)
+	if ip.Equal(net.ParseIP("1.2.3.4")) {
+		t.Errorf("X-Real-IP should be ignored for trustedProxyCount=2, got %v", ip)
+	}
+	// Should be 203.0.113.50 (from XFF: skip rightmost 2 entries)
+	if !ip.Equal(net.ParseIP("203.0.113.50")) {
+		t.Errorf("expected 203.0.113.50 from X-Forwarded-For, got %v", ip)
+	}
+}
+
+// TestExtractClientIP_XRealIPAllowedSingleProxy verifies that X-Real-IP
+// IS trusted when trustedProxyCount == 1 (single reverse proxy scenario).
+func TestExtractClientIP_XRealIPAllowedSingleProxy(t *testing.T) {
+	r := &http.Request{
+		RemoteAddr: "10.0.0.2:12345",
+		Header: map[string][]string{
+			"X-Real-Ip":       {"203.0.113.50"},
+			"X-Forwarded-For": {"1.2.3.4, 10.0.0.2"},
+		},
+	}
+	ip, err := ExtractClientIP(r, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// X-Real-IP should be used for single proxy
+	if !ip.Equal(net.ParseIP("203.0.113.50")) {
+		t.Errorf("expected 203.0.113.50 from X-Real-IP, got %v", ip)
+	}
+}
+
+// TestExtractClientIP_MultiProxyXFFOnly verifies XFF hop counting for
+// trustedProxyCount > 1 without X-Real-IP.
+func TestExtractClientIP_MultiProxyXFFOnly(t *testing.T) {
+	r := &http.Request{
+		RemoteAddr: "10.0.0.3:12345",
+		Header: map[string][]string{
+			"X-Forwarded-For": {"203.0.113.50, 10.0.0.1, 10.0.0.2"},
+		},
+	}
+	ip, err := ExtractClientIP(r, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ip.Equal(net.ParseIP("203.0.113.50")) {
+		t.Errorf("expected 203.0.113.50, got %v", ip)
+	}
+}
+
+// TestExtractClientIP_InsufficientXFFHops verifies that when XFF has fewer hops
+// than trustedProxyCount, the system falls back to RemoteAddr instead of
+// trusting potentially spoofed XFF values.
+func TestExtractClientIP_InsufficientXFFHops(t *testing.T) {
+	// Client sends a fake XFF with only 1 entry, but server trusts 2 proxies.
+	// Without the fix, clientIdx would be clamped to 0, trusting the attacker's IP.
+	r := &http.Request{
+		RemoteAddr: "10.0.0.2:12345",
+		Header: map[string][]string{
+			"X-Forwarded-For": {"1.2.3.4"}, // attacker-injected, only 1 hop
+		},
+	}
+	ip, err := ExtractClientIP(r, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Should fall back to RemoteAddr (10.0.0.2), NOT trust 1.2.3.4
+	if ip.Equal(net.ParseIP("1.2.3.4")) {
+		t.Errorf("should NOT trust spoofed XFF when hops < trustedProxyCount, got %v", ip)
+	}
+	if !ip.Equal(net.ParseIP("10.0.0.2")) {
+		t.Errorf("expected 10.0.0.2 (RemoteAddr fallback), got %v", ip)
+	}
+}
+
+// TestExtractClientIP_EmptyXFFMultiProxy verifies that an empty XFF header
+// falls back to RemoteAddr when trustedProxyCount > 1.
+func TestExtractClientIP_EmptyXFFMultiProxy(t *testing.T) {
+	r := &http.Request{
+		RemoteAddr: "10.0.0.5:12345",
+		Header: map[string][]string{
+			"X-Forwarded-For": {""},
+		},
+	}
+	ip, err := ExtractClientIP(r, 2)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ip.Equal(net.ParseIP("10.0.0.5")) {
+		t.Errorf("expected 10.0.0.5 (RemoteAddr fallback for empty XFF), got %v", ip)
 	}
 }

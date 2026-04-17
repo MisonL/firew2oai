@@ -3,14 +3,22 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
-	"crypto/subtle"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mison/firew2oai/internal/config"
@@ -32,6 +40,7 @@ const (
 type SSEEvent struct {
 	Type    string `json:"type"`
 	Content string `json:"content,omitempty"`
+	Error   string `json:"error,omitempty"`
 }
 
 // ─── OpenAI Request / Response Types ──────────────────────────────────────
@@ -111,53 +120,53 @@ type FireworksMessage struct {
 }
 
 type FireworksRequest struct {
-	Messages           []FireworksMessage `json:"messages"`
-	ModelKey           string             `json:"model_key"`
-	ConversationID     string             `json:"conversation_id"`
+	Messages            []FireworksMessage `json:"messages"`
+	ModelKey            string             `json:"model_key"`
+	ConversationID      string             `json:"conversation_id"`
 	FunctionDefinitions []interface{}      `json:"function_definitions"`
+	Temperature         *float64           `json:"temperature,omitempty"`
+	MaxTokens           *int               `json:"max_tokens,omitempty"`
 }
 
 // ─── Proxy ────────────────────────────────────────────────────────────────
 
 // Proxy handles OpenAI-to-Fireworks protocol conversion.
 type Proxy struct {
-	transport *transport.FireworksTransport
-	timeout   time.Duration
-	version   string
+	transport           *transport.FireworksTransport
+	version             string
+	defaultShowThinking bool
+	upstreamURL         string
+	metrics             *metricsCollector
+	responses           *responseStore
 }
 
 // New creates a new Proxy instance.
-func New(transport *transport.FireworksTransport, timeout time.Duration, version string) *Proxy {
+// defaultShowThinking controls whether thinking models show their thinking process
+// when the request does not explicitly set show_thinking.
+func New(transport *transport.FireworksTransport, version string, defaultShowThinking bool) *Proxy {
 	return &Proxy{
-		transport: transport,
-		timeout:   timeout,
-		version:   version,
+		transport:           transport,
+		version:             version,
+		defaultShowThinking: defaultShowThinking,
+		upstreamURL:         upstreamURL,
+		metrics:             newMetricsCollector(time.Now),
+		responses:           newResponseStore(defaultResponseStoreEntries),
+	}
+}
+
+// NewWithUpstream creates a Proxy with a custom upstream URL (for testing).
+func NewWithUpstream(transport *transport.FireworksTransport, version string, defaultShowThinking bool, upstreamURL string) *Proxy {
+	return &Proxy{
+		transport:           transport,
+		version:             version,
+		defaultShowThinking: defaultShowThinking,
+		upstreamURL:         upstreamURL,
+		metrics:             newMetricsCollector(time.Now),
+		responses:           newResponseStore(defaultResponseStoreEntries),
 	}
 }
 
 // ─── Core Logic ───────────────────────────────────────────────────────────
-
-// messagesToPrompt converts OpenAI multi-turn messages into a single prompt
-// string since Fireworks chat/single processes a flat message list.
-//
-// We preserve the conversational structure by prepending role labels
-// so the model can still understand context.
-func messagesToPrompt(messages []ChatMessage) string {
-	var parts []string
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			parts = append(parts, "System: "+msg.Content)
-		case "user":
-			parts = append(parts, "User: "+msg.Content)
-		case "assistant":
-			parts = append(parts, "Assistant: "+msg.Content)
-		default:
-			parts = append(parts, msg.Content)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
 
 // generateRequestID creates an OpenAI-style chatcmpl- request ID.
 func generateRequestID() string {
@@ -165,7 +174,7 @@ func generateRequestID() string {
 	if _, err := rand.Read(b); err != nil {
 		// Extremely unlikely with crypto/rand, but log and use timestamp fallback
 		slog.Error("crypto/rand.Read failed, using timestamp fallback", "error", err)
-		b = []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 	}
 	return fmt.Sprintf("chatcmpl-%x", b)
 }
@@ -175,9 +184,14 @@ func generateRequestID() string {
 // handleRoot returns service info and available endpoints.
 func (p *Proxy) handleRoot(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"message":   "firew2oai - Fireworks to OpenAI API Proxy",
-		"version":   p.version,
-		"endpoints": map[string]string{"models": "GET /v1/models", "chat": "POST /v1/chat/completions", "health": "GET /health"},
+		"message": "firew2oai - Fireworks to OpenAI API Proxy",
+		"version": p.version,
+		"endpoints": map[string]string{
+			"models":  "GET /v1/models",
+			"chat":    "POST /v1/chat/completions",
+			"health":  "GET /health",
+			"metrics": "GET /metrics",
+		},
 	})
 }
 
@@ -188,8 +202,31 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleMetrics returns Prometheus-style runtime and HTTP metrics.
+func (p *Proxy) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed, use GET")
+		return
+	}
+	if p.metrics == nil {
+		writeError(w, http.StatusInternalServerError, "server_error", "metrics_not_initialized", "metrics collector not initialized")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	if _, err := w.Write([]byte(p.metrics.Render())); err != nil {
+		slog.Debug("failed to write metrics response", "error", err)
+	}
+}
+
 // handleModels returns the list of available models in OpenAI format.
 func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed, use GET")
+		return
+	}
+
 	models := make([]ModelObject, len(config.AvailableModels))
 	now := time.Now().Unix()
 	for i, m := range config.AvailableModels {
@@ -218,7 +255,8 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	var req ChatCompletionRequest
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<20) // 4MB max
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_body", "invalid request body: %v", err)
+		slog.Debug("invalid request body", "error", err)
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_body", "invalid request body")
 		return
 	}
 
@@ -233,7 +271,10 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestID := generateRequestID()
-	showThinking := req.ShowThinking != nil && *req.ShowThinking
+	showThinking := p.defaultShowThinking
+	if req.ShowThinking != nil {
+		showThinking = *req.ShowThinking
+	}
 	prompt := messagesToPrompt(req.Messages)
 
 	slog.Info("chat completion request",
@@ -249,9 +290,11 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Messages: []FireworksMessage{
 			{Role: "user", Content: prompt},
 		},
-		ModelKey:           req.Model,
-		ConversationID:     fmt.Sprintf("session_%d_%d", time.Now().UnixMilli(), time.Now().UnixNano()%10000),
+		ModelKey:            req.Model,
+		ConversationID:      fmt.Sprintf("session_%d_%d", time.Now().UnixMilli(), time.Now().UnixNano()%10000),
 		FunctionDefinitions: []interface{}{},
+		Temperature:         req.Temperature,
+		MaxTokens:           req.MaxTokens,
 	}
 
 	bodyBytes, err := json.Marshal(fwReq)
@@ -274,10 +317,16 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool) {
 	ctx := r.Context()
 
-	reader, err := p.transport.StreamPost(ctx, upstreamURL, bytes.NewReader(body))
+	// Extract Authorization token from client request to forward to Fireworks
+	authToken := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		authToken = auth[7:]
+	}
+
+	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
 	if err != nil {
 		slog.Error("upstream stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %v", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
 		return
 	}
 	defer reader.Close()
@@ -289,112 +338,127 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	w.Header().Set("X-Accel-Buffering", "no")
 
 	flusher, canFlush := w.(http.Flusher)
-	isThinking := config.IsThinkingModel(model)
-	inThinking := isThinking // thinking models start in thinking phase
 
-	var mu sync.Mutex
-	writeAndFlush := func(data []byte) {
-		mu.Lock()
-		defer mu.Unlock()
-		w.Write(data)
+	var clientGone bool
+	writeAndFlushBytes := func(data []byte) bool {
+		if clientGone {
+			return false
+		}
+		if _, err := w.Write(data); err != nil {
+			clientGone = true
+			slog.Debug("client disconnected, stopping stream", "request_id", requestID, "error", err)
+			return false
+		}
 		if canFlush {
 			flusher.Flush()
 		}
+		return true
 	}
+
+	writeAndFlushChunk := func(chunk StreamChunk) bool {
+		if clientGone {
+			return false
+		}
+		if err := writeSSEChunk(w, chunk); err != nil {
+			clientGone = true
+			slog.Debug("client disconnected, stopping stream", "request_id", requestID, "error", err)
+			return false
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		return true
+	}
+
+	// Pre-allocate timestamp once — reused for all chunks in this stream.
+	// Sub-second precision is not required by the OpenAI SSE spec.
+	created := time.Now().Unix()
 
 	// Send initial role chunk (OpenAI spec: first chunk contains the role)
 	roleChunk := StreamChunk{
 		ID:      requestID,
 		Object:  "chat.completion.chunk",
-		Created: time.Now().Unix(),
+		Created: created,
 		Model:   model,
 		Choices: []StreamChoice{
 			{Index: 0, Delta: StreamDelta{Role: "assistant"}, FinishReason: nil},
 		},
 	}
-	writeAndFlush(sseChunk(roleChunk))
+	if !writeAndFlushChunk(roleChunk) {
+		return
+	}
 
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-
-		jsonStr := strings.TrimSpace(line[5:])
-		if jsonStr == "" {
-			continue
-		}
-
-		var evt SSEEvent
-		if err := json.Unmarshal([]byte(jsonStr), &evt); err != nil {
-			slog.Debug("failed to parse SSE event", "raw", jsonStr, "error", err)
-			continue
-		}
-
-		if evt.Type == "done" {
+	isThinking := config.IsThinkingModel(model)
+	doneReceived := false
+	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+		switch evt.Type {
+		case "done":
+			doneReceived = true
 			stop := "stop"
 			chunk := StreamChunk{
 				ID:      requestID,
 				Object:  "chat.completion.chunk",
-				Created: time.Now().Unix(),
+				Created: created,
 				Model:   model,
 				Choices: []StreamChoice{
 					{Index: 0, Delta: StreamDelta{}, FinishReason: &stop},
 				},
 			}
-			writeAndFlush(sseChunk(chunk))
-			writeAndFlush([]byte("data: [DONE]\n\n"))
-			slog.Debug("stream completed", "request_id", requestID)
-			break
-		}
-
-		content := evt.Content
-		if content == "" {
-			continue
-		}
-
-		// Handle thinking separator 💯
-		if content == thinkingSeparator {
-			if isThinking {
-				inThinking = false
-				if showThinking {
-					chunk := StreamChunk{
-						ID:      requestID,
-						Object:  "chat.completion.chunk",
-						Created: time.Now().Unix(),
-						Model:   model,
-						Choices: []StreamChoice{
-							{Index: 0, Delta: StreamDelta{Content: "\n\n--- Answer ---\n\n"}, FinishReason: nil},
-						},
-					}
-					writeAndFlush(sseChunk(chunk))
-				}
+			if !writeAndFlushChunk(chunk) {
+				return false
 			}
-			continue
-		}
+			if !writeAndFlushBytes([]byte("data: [DONE]\n\n")) {
+				return false
+			}
+			slog.Debug("stream completed", "request_id", requestID)
+			return true
 
-		// Skip thinking content if not showing
-		if isThinking && inThinking && !showThinking {
-			continue
-		}
+		case "thinking_separator":
+			chunk := StreamChunk{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []StreamChoice{
+					{Index: 0, Delta: StreamDelta{Content: "\n\n--- Answer ---\n\n"}, FinishReason: nil},
+				},
+			}
+			return writeAndFlushChunk(chunk)
 
+		case "content":
+			chunk := StreamChunk{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []StreamChoice{
+					{Index: 0, Delta: StreamDelta{Content: evt.Content}, FinishReason: nil},
+				},
+			}
+			return writeAndFlushChunk(chunk)
+		}
+		return true
+	})
+
+	// If no done event but content was emitted, send completion markers
+	if !doneReceived && contentEmitted {
+		slog.Debug("stream ended without done event but content available, sending completion markers", "request_id", requestID)
+		stop := "stop"
 		chunk := StreamChunk{
 			ID:      requestID,
 			Object:  "chat.completion.chunk",
-			Created: time.Now().Unix(),
+			Created: created,
 			Model:   model,
 			Choices: []StreamChoice{
-				{Index: 0, Delta: StreamDelta{Content: content}, FinishReason: nil},
+				{Index: 0, Delta: StreamDelta{}, FinishReason: &stop},
 			},
 		}
-		writeAndFlush(sseChunk(chunk))
+		writeAndFlushChunk(chunk)
+		writeAndFlushBytes([]byte("data: [DONE]\n\n"))
 	}
 
-	if err := scanner.Err(); err != nil {
-		slog.Error("stream read error", "request_id", requestID, "error", err)
+	if scanErr != nil && !errors.Is(scanErr, context.Canceled) {
+		slog.Error("stream read error", "request_id", requestID, "error", scanErr)
 	}
 }
 
@@ -405,70 +469,78 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool) {
 	ctx := r.Context()
 
-	reader, err := p.transport.StreamPost(ctx, upstreamURL, bytes.NewReader(body))
+	// For non-streaming requests, apply an overall timeout to prevent
+	// the request from hanging indefinitely if upstream sends headers but
+	// then stalls. The transport's ResponseHeaderTimeout only covers the
+	// initial header wait; this covers the full request lifecycle.
+	ctx, cancel := context.WithTimeout(ctx, p.transport.Timeout())
+	defer cancel()
+
+	// Extract Authorization token from client request to forward to Fireworks
+	authToken := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		authToken = auth[7:]
+	}
+
+	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
 	if err != nil {
 		slog.Error("upstream non-stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %v", err)
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
 		return
 	}
 	defer reader.Close()
 
 	var result strings.Builder
 	isThinking := config.IsThinkingModel(model)
-	inThinking := isThinking
+	doneReceived := false
 
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
+	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+		switch evt.Type {
+		case "done":
+			doneReceived = true
+			// handled by scanSSEEvents breaking the loop
+		case "thinking_separator":
+			result.WriteString("\n\n--- Answer ---\n\n")
+		case "content":
+			result.WriteString(evt.Content)
 		}
+		return true
+	})
 
-		jsonStr := strings.TrimSpace(line[5:])
-		if jsonStr == "" {
-			continue
+	slog.Debug("non-stream scan complete", "request_id", requestID, "scanErr", scanErr, "doneReceived", doneReceived, "contentEmitted", contentEmitted, "result_len", result.Len())
+
+	// On scanner error, return 502 so the client
+	// can distinguish "complete response" from "truncated/corrupted response".
+	if scanErr != nil {
+		if errors.Is(scanErr, context.Canceled) {
+			// Client disconnected — don't write a response that nobody will read.
+			slog.Debug("non-stream client disconnected", "request_id", requestID)
+			return
 		}
-
-		var evt SSEEvent
-		if err := json.Unmarshal([]byte(jsonStr), &evt); err != nil {
-			continue
+		// If we have content, return it even if there was a scanner error
+		// (some models may not send a proper done event)
+		if contentEmitted || result.Len() > 0 {
+			slog.Warn("stream read error but content available, returning partial response", "request_id", requestID, "error", scanErr)
+		} else {
+			slog.Error("stream read error (upstream incomplete)", "request_id", requestID, "error", scanErr)
+			writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "%s", scanErr.Error())
+			return
 		}
-
-		if evt.Type == "done" {
-			break
-		}
-
-		content := evt.Content
-		if content == "" {
-			continue
-		}
-
-		if content == thinkingSeparator {
-			if isThinking {
-				inThinking = false
-				if showThinking {
-					result.WriteString("\n\n--- Answer ---\n\n")
-				}
-			}
-			continue
-		}
-
-		if isThinking && inThinking && !showThinking {
-			continue
-		}
-
-		result.WriteString(content)
 	}
 
-	// On scanner error, return whatever content we've accumulated so far
-	// rather than discarding it. This prevents data loss on partial reads.
-	if err := scanner.Err(); err != nil {
-		slog.Error("stream read error (returning partial result)", "request_id", requestID, "error", err)
+	// If we didn't receive a done event but the stream ended cleanly
+	// and we have content, treat it as a successful response.
+	// Some models (e.g., kimi) may not send a done event.
+	if !doneReceived && !contentEmitted && result.Len() == 0 {
+		slog.Error("stream ended without done event and no content", "request_id", requestID)
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete",
+			"upstream response ended without a completion signal")
+		return
 	}
 
-	content := result.String()
+	if !doneReceived {
+		slog.Debug("stream ended without done event but content available, treating as success", "request_id", requestID, "result_len", result.Len())
+	}
 
 	resp := ChatCompletionResponse{
 		ID:      requestID,
@@ -478,7 +550,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 		Choices: []ChatCompletionChoice{
 			{
 				Index:        0,
-				Message:      ChatMessage{Role: "assistant", Content: content},
+				Message:      ChatMessage{Role: "assistant", Content: result.String()},
 				FinishReason: "stop",
 			},
 		},
@@ -492,11 +564,20 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 // ─── JSON / SSE Helpers ──────────────────────────────────────────────────
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
-	data, err := json.Marshal(v)
-	if err != nil {
+	buf := getPooledJSONBuffer()
+	defer putPooledJSONBuffer(buf)
+
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
 		slog.Error("json.Marshal failed", "error", err)
 		http.Error(w, `{"error":{"message":"internal JSON error","type":"server_error","code":"marshal_error"}}`, http.StatusInternalServerError)
 		return
+	}
+	// json.Encoder.Encode appends a newline; trim it and add our own
+	data := buf.Bytes()
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -504,27 +585,26 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Write([]byte("\n"))
 }
 
-func sseChunk(v interface{}) []byte {
-	data, err := json.Marshal(v)
-	if err != nil {
-		slog.Error("json.Marshal failed for SSE chunk", "error", err)
-		return []byte("data: {}\n\n")
-	}
-	return []byte(fmt.Sprintf("data: %s\n\n", data))
-}
-
 func writeError(w http.ResponseWriter, status int, errType string, errCode string, format string, args ...interface{}) {
-	data, err := json.Marshal(map[string]interface{}{
+	buf := getPooledJSONBuffer()
+	defer putPooledJSONBuffer(buf)
+
+	enc := json.NewEncoder(buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(map[string]interface{}{
 		"error": map[string]interface{}{
 			"message": fmt.Sprintf(format, args...),
 			"type":    errType,
 			"code":    errCode,
 		},
-	})
-	if err != nil {
+	}); err != nil {
 		slog.Error("json.Marshal failed for error response", "error", err)
 		http.Error(w, `{"error":{"message":"internal error","type":"server_error","code":"internal_error"}}`, http.StatusInternalServerError)
 		return
+	}
+	data := buf.Bytes()
+	if len(data) > 0 && data[len(data)-1] == '\n' {
+		data = data[:len(data)-1]
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -532,31 +612,227 @@ func writeError(w http.ResponseWriter, status int, errType string, errCode strin
 	w.Write([]byte("\n"))
 }
 
-// ─── Middleware: Auth ─────────────────────────────────────────────────────
+type routeDurationMetrics struct {
+	count      atomic.Int64
+	durationNS atomic.Int64
+}
 
-// AuthMiddleware validates the Bearer token using constant-time comparison.
-// Returns a middleware function compatible with the chain() helper.
-//
-// Deprecated: Use tokenauth.Manager.Middleware() instead for multi-key support
-// with per-key quota and rate limiting. This is kept for backward compatibility.
-func AuthMiddleware(apiKey string) func(http.HandlerFunc) http.HandlerFunc {
+type metricsCollector struct {
+	now             func() time.Time
+	startedAt       time.Time
+	inFlight        atomic.Int64
+	requestTotal    atomic.Int64
+	durationTotalNS atomic.Int64
+	durationCount   atomic.Int64
+
+	statusCounters sync.Map // key: method\x1fpath\x1fstatus, value: *atomic.Int64
+	routeDurations sync.Map // key: method\x1fpath, value: *routeDurationMetrics
+}
+
+func newMetricsCollector(now func() time.Time) *metricsCollector {
+	if now == nil {
+		now = time.Now
+	}
+	started := now()
+	return &metricsCollector{
+		now:       now,
+		startedAt: started,
+	}
+}
+
+func statusCounterKey(method, path string, status int) string {
+	return method + "\x1f" + path + "\x1f" + strconv.Itoa(status)
+}
+
+func routeDurationKey(method, path string) string {
+	return method + "\x1f" + path
+}
+
+func (m *metricsCollector) observe(method, path string, status int, duration time.Duration) {
+	m.requestTotal.Add(1)
+	m.durationTotalNS.Add(duration.Nanoseconds())
+	m.durationCount.Add(1)
+
+	sk := statusCounterKey(method, path, status)
+	sv, _ := m.statusCounters.LoadOrStore(sk, &atomic.Int64{})
+	sv.(*atomic.Int64).Add(1)
+
+	rk := routeDurationKey(method, path)
+	rv, _ := m.routeDurations.LoadOrStore(rk, &routeDurationMetrics{})
+	rm := rv.(*routeDurationMetrics)
+	rm.count.Add(1)
+	rm.durationNS.Add(duration.Nanoseconds())
+}
+
+func escapeLabelValue(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
+func (m *metricsCollector) Render() string {
+	now := m.now()
+	uptime := int64(now.Sub(m.startedAt).Seconds())
+	if uptime < 0 {
+		uptime = 0
+	}
+
+	type statusRow struct {
+		Method string
+		Path   string
+		Status string
+		Count  int64
+	}
+	statusRows := make([]statusRow, 0, 32)
+	m.statusCounters.Range(func(k, v any) bool {
+		parts := strings.SplitN(k.(string), "\x1f", 3)
+		if len(parts) != 3 {
+			return true
+		}
+		statusRows = append(statusRows, statusRow{
+			Method: parts[0],
+			Path:   parts[1],
+			Status: parts[2],
+			Count:  v.(*atomic.Int64).Load(),
+		})
+		return true
+	})
+	sort.Slice(statusRows, func(i, j int) bool {
+		if statusRows[i].Method != statusRows[j].Method {
+			return statusRows[i].Method < statusRows[j].Method
+		}
+		if statusRows[i].Path != statusRows[j].Path {
+			return statusRows[i].Path < statusRows[j].Path
+		}
+		return statusRows[i].Status < statusRows[j].Status
+	})
+
+	type durationRow struct {
+		Method     string
+		Path       string
+		Count      int64
+		DurationNS int64
+	}
+	durationRows := make([]durationRow, 0, 16)
+	m.routeDurations.Range(func(k, v any) bool {
+		parts := strings.SplitN(k.(string), "\x1f", 2)
+		if len(parts) != 2 {
+			return true
+		}
+		rm := v.(*routeDurationMetrics)
+		durationRows = append(durationRows, durationRow{
+			Method:     parts[0],
+			Path:       parts[1],
+			Count:      rm.count.Load(),
+			DurationNS: rm.durationNS.Load(),
+		})
+		return true
+	})
+	sort.Slice(durationRows, func(i, j int) bool {
+		if durationRows[i].Method != durationRows[j].Method {
+			return durationRows[i].Method < durationRows[j].Method
+		}
+		return durationRows[i].Path < durationRows[j].Path
+	})
+
+	var b strings.Builder
+	b.Grow(4096)
+
+	b.WriteString("# HELP firew2oai_uptime_seconds Process uptime in seconds\n")
+	b.WriteString("# TYPE firew2oai_uptime_seconds gauge\n")
+	b.WriteString("firew2oai_uptime_seconds ")
+	b.WriteString(strconv.FormatInt(uptime, 10))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_go_goroutines Number of live goroutines\n")
+	b.WriteString("# TYPE firew2oai_go_goroutines gauge\n")
+	b.WriteString("firew2oai_go_goroutines ")
+	b.WriteString(strconv.Itoa(runtime.NumGoroutine()))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_http_requests_in_flight Number of in-flight HTTP requests\n")
+	b.WriteString("# TYPE firew2oai_http_requests_in_flight gauge\n")
+	b.WriteString("firew2oai_http_requests_in_flight ")
+	b.WriteString(strconv.FormatInt(m.inFlight.Load(), 10))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_http_requests_total Total HTTP requests handled\n")
+	b.WriteString("# TYPE firew2oai_http_requests_total counter\n")
+	b.WriteString("firew2oai_http_requests_total ")
+	b.WriteString(strconv.FormatInt(m.requestTotal.Load(), 10))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_http_request_duration_seconds_sum Total request duration in seconds\n")
+	b.WriteString("# TYPE firew2oai_http_request_duration_seconds_sum counter\n")
+	b.WriteString("firew2oai_http_request_duration_seconds_sum ")
+	b.WriteString(strconv.FormatFloat(float64(m.durationTotalNS.Load())/float64(time.Second), 'f', 6, 64))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_http_request_duration_seconds_count Number of requests in duration summary\n")
+	b.WriteString("# TYPE firew2oai_http_request_duration_seconds_count counter\n")
+	b.WriteString("firew2oai_http_request_duration_seconds_count ")
+	b.WriteString(strconv.FormatInt(m.durationCount.Load(), 10))
+	b.WriteByte('\n')
+
+	b.WriteString("# HELP firew2oai_http_requests_by_status_total Total requests partitioned by method/path/status\n")
+	b.WriteString("# TYPE firew2oai_http_requests_by_status_total counter\n")
+	for _, row := range statusRows {
+		b.WriteString(`firew2oai_http_requests_by_status_total{method="`)
+		b.WriteString(escapeLabelValue(row.Method))
+		b.WriteString(`",path="`)
+		b.WriteString(escapeLabelValue(row.Path))
+		b.WriteString(`",status="`)
+		b.WriteString(escapeLabelValue(row.Status))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(row.Count, 10))
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("# HELP firew2oai_http_request_duration_by_route_seconds_sum Request duration sum by method/path\n")
+	b.WriteString("# TYPE firew2oai_http_request_duration_by_route_seconds_sum counter\n")
+	for _, row := range durationRows {
+		b.WriteString(`firew2oai_http_request_duration_by_route_seconds_sum{method="`)
+		b.WriteString(escapeLabelValue(row.Method))
+		b.WriteString(`",path="`)
+		b.WriteString(escapeLabelValue(row.Path))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatFloat(float64(row.DurationNS)/float64(time.Second), 'f', 6, 64))
+		b.WriteByte('\n')
+	}
+
+	b.WriteString("# HELP firew2oai_http_request_duration_by_route_seconds_count Request count by method/path in duration summary\n")
+	b.WriteString("# TYPE firew2oai_http_request_duration_by_route_seconds_count counter\n")
+	for _, row := range durationRows {
+		b.WriteString(`firew2oai_http_request_duration_by_route_seconds_count{method="`)
+		b.WriteString(escapeLabelValue(row.Method))
+		b.WriteString(`",path="`)
+		b.WriteString(escapeLabelValue(row.Path))
+		b.WriteString(`"} `)
+		b.WriteString(strconv.FormatInt(row.Count, 10))
+		b.WriteByte('\n')
+	}
+
+	return b.String()
+}
+
+// MetricsMiddleware records per-request status and latency metrics.
+func MetricsMiddleware(mc *metricsCollector) func(http.HandlerFunc) http.HandlerFunc {
 	return func(next http.HandlerFunc) http.HandlerFunc {
+		if mc == nil {
+			return next
+		}
 		return func(w http.ResponseWriter, r *http.Request) {
-			auth := r.Header.Get("Authorization")
-			if auth == "" {
-				writeError(w, http.StatusUnauthorized, "authentication_error", "missing_api_key", "missing Authorization header")
-				return
-			}
-			if !strings.HasPrefix(auth, "Bearer ") {
-				writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_auth_format", "invalid Authorization format, expected 'Bearer <key>'")
-				return
-			}
-			token := auth[7:]
-			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
-				writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid API key")
-				return
-			}
-			next(w, r)
+			start := mc.now()
+			mc.inFlight.Add(1)
+			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			defer func() {
+				mc.inFlight.Add(-1)
+				if r.URL.Path != "/metrics" {
+					mc.observe(r.Method, r.URL.Path, rw.statusCode, mc.now().Sub(start))
+				}
+			}()
+			next(rw, r)
 		}
 	}
 }
@@ -569,12 +845,24 @@ func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		next(rw, r)
+
+		// Extract token fingerprint for debugging (SHA-256 hash, first 8 hex chars)
+		tokenFP := ""
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token := auth[7:]
+			if token != "" {
+				h := sha256.Sum256([]byte(token))
+				tokenFP = hex.EncodeToString(h[:])[:8]
+			}
+		}
+
 		slog.Info("request",
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", rw.statusCode,
 			"duration", time.Since(start).String(),
 			"remote", r.RemoteAddr,
+			"token", tokenFP,
 		)
 	}
 }
@@ -591,6 +879,20 @@ func (rw *responseWriter) WriteHeader(code int) {
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func (rw *responseWriter) Flush() {
+	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (rw *responseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := rw.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("underlying ResponseWriter does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
 // Unwrap returns the underlying ResponseWriter.
 // This enables middleware chaining that checks for optional interfaces (Flusher, Hijacker).
 func (rw *responseWriter) Unwrap() http.ResponseWriter {
@@ -601,26 +903,43 @@ func (rw *responseWriter) Unwrap() http.ResponseWriter {
 
 // CORSMiddleware adds CORS headers for cross-origin API access.
 // origins is a comma-separated list; "*" allows all origins.
+// Invalid configurations (e.g. ",,,") that produce no valid entries will
+// block all cross-origin requests rather than silently becoming wildcard.
 func CORSMiddleware(origins string) func(http.HandlerFunc) http.HandlerFunc {
+	origins = strings.TrimSpace(origins)
+	isWildcard := origins == "*"
+	isBlocked := false // invalid config: block all CORS
 	allowedSet := parseOrigins(origins)
-	isWildcard := origins == "*" || len(allowedSet) == 0
+	if !isWildcard && len(allowedSet) == 0 && origins != "" {
+		slog.Warn("CORS origins produced no valid entries, blocking all cross-origin requests", "raw", origins)
+		isBlocked = true
+	}
 
 	return func(next http.HandlerFunc) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
 
-			if isWildcard {
+			if isBlocked {
+				// Invalid CORS config: do not set any CORS headers.
+				// Same-origin requests still work; cross-origin requests will be blocked by browser.
+			} else if isWildcard {
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else if origin != "" && allowedSet[origin] {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
+			} else if origin != "" {
+				// Always set Vary: Origin for non-wildcard CORS so that caches
+				// (CDN, browser) don't reuse a response for one origin on another.
 				w.Header().Add("Vary", "Origin")
+				if allowedSet[origin] {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+				}
 			}
 
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			w.Header().Set("Access-Control-Max-Age", "86400")
-
+			// Access-Control-Allow-Methods/Headers/Max-Age are only meaningful
+			// for preflight (OPTIONS) requests. Setting them on every response
+			// wastes bandwidth and pollutes cache entries.
 			if r.Method == http.MethodOptions {
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+				w.Header().Set("Access-Control-Max-Age", "86400")
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
@@ -674,27 +993,29 @@ func chain(handlers ...func(http.HandlerFunc) http.HandlerFunc) func(http.Handle
 // ─── Router ───────────────────────────────────────────────────────────────
 
 // NewMux creates the HTTP handler with all routes registered.
-// If tm is non-nil, its middleware handles auth + quota + rate limiting.
-// If tm is nil, the legacy single-key AuthMiddleware is used with apiKey.
-func NewMux(p *Proxy, corsOrigins string, apiKey string, tm *tokenauth.Manager) http.Handler {
+// tm must be constructed by the caller so auth configuration errors fail fast at startup.
+func NewMux(p *Proxy, corsOrigins string, tm *tokenauth.Manager) http.Handler {
+	if tm == nil {
+		panic("tokenauth manager is required")
+	}
+
 	mux := http.NewServeMux()
 
+	mc := p.metrics
+	publicMW := chain(CORSMiddleware(corsOrigins), MetricsMiddleware(mc), RecoveryMiddleware)
+
 	// Public routes (no auth required)
-	mux.HandleFunc("/", CORSMiddleware(corsOrigins)(RecoveryMiddleware(p.handleRoot)))
-	mux.HandleFunc("/health", CORSMiddleware(corsOrigins)(RecoveryMiddleware(p.handleHealth)))
+	mux.HandleFunc("/", publicMW(p.handleRoot))
+	mux.HandleFunc("/health", publicMW(p.handleHealth))
+	mux.HandleFunc("/metrics", publicMW(p.handleMetrics))
 
 	// Protected routes (require auth)
-	var commonMW func(http.HandlerFunc) http.HandlerFunc
-	if tm != nil && tm.TokenCount() > 0 {
-		// Use tokenauth for multi-key auth + quota + rate limiting
-		commonMW = chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, tm.Middleware(), LoggingMiddleware)
-	} else {
-		// Legacy fallback: single key auth
-		commonMW = chain(CORSMiddleware(corsOrigins), RecoveryMiddleware, AuthMiddleware(apiKey), LoggingMiddleware)
-	}
+	commonMW := chain(CORSMiddleware(corsOrigins), MetricsMiddleware(mc), RecoveryMiddleware, tm.Middleware(), LoggingMiddleware)
 
 	mux.HandleFunc("/v1/models", commonMW(p.handleModels))
 	mux.HandleFunc("/v1/chat/completions", commonMW(p.handleChatCompletions))
+	mux.HandleFunc("/v1/responses", commonMW(p.handleResponses))
+	mux.HandleFunc("/v1/responses/", commonMW(p.handleResponseByID))
 
 	return mux
 }

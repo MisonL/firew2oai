@@ -1,7 +1,6 @@
 package tokenauth
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,33 +15,33 @@ import (
 
 // TokenConfig defines the limits for a single API key.
 type TokenConfig struct {
-	Key        string `json:"key"`
-	Quota      int    `json:"quota"`       // max total requests (0 = unlimited)
-	RateLimit  int    `json:"rate_limit"`  // max requests per minute (0 = use global default)
+	Key       string `json:"key"`
+	Quota     int    `json:"quota"`      // max total requests (0 = unlimited)
+	RateLimit int    `json:"rate_limit"` // max requests per minute (0 = use global default)
 }
 
 // Manager handles multi-key authentication, quota tracking, and per-key rate limiting.
 type Manager struct {
-	mu      sync.RWMutex
-	tokens  map[string]*tokenState
-	limiter *rateLimiter
-	window  time.Duration
+	mu     sync.RWMutex
+	tokens map[string]*tokenState
+	window time.Duration
+	stopCh chan struct{}
+	once   sync.Once // ensures Stop() is idempotent
 }
 
 type tokenState struct {
-	cfg    TokenConfig
-	used   int64 // total requests used
-	limit  *rateLimiter
+	cfg   TokenConfig
+	used  int64 // total requests used
+	limit *rateLimiter
 }
 
 // rateLimiter is a simple token bucket for per-key rate limiting.
+// Cleanup is managed externally (by Manager) to avoid goroutine-per-limiter overhead.
 type rateLimiter struct {
-	mu         sync.Mutex
-	buckets    map[string]*bucket
-	rate       int
-	window     time.Duration
-	stopCh     chan struct{}
-	stopped    bool
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	rate    int
+	window  time.Duration
 }
 
 type bucket struct {
@@ -52,18 +51,16 @@ type bucket struct {
 
 // newRateLimiter creates a rate limiter with the given rate (requests per window).
 // rate 0 means disabled.
+// Note: does NOT start a cleanup goroutine; use Manager.cleanupLoop() instead.
 func newRateLimiter(rate int, window time.Duration) *rateLimiter {
 	if rate <= 0 {
 		return nil
 	}
-	rl := &rateLimiter{
+	return &rateLimiter{
 		buckets: make(map[string]*bucket),
 		rate:    rate,
 		window:  window,
-		stopCh:  make(chan struct{}),
 	}
-	go rl.cleanupLoop()
-	return rl
 }
 
 func (rl *rateLimiter) Stop() {
@@ -71,13 +68,8 @@ func (rl *rateLimiter) Stop() {
 		return
 	}
 	rl.mu.Lock()
-	if rl.stopped {
-		rl.mu.Unlock()
-		return
-	}
-	rl.stopped = true
-	rl.mu.Unlock()
-	close(rl.stopCh)
+	defer rl.mu.Unlock()
+	rl.buckets = nil // release memory
 }
 
 func (rl *rateLimiter) allow(key string) (allowed bool, remaining int, resetTime int64) {
@@ -112,22 +104,17 @@ func (rl *rateLimiter) allow(key string) (allowed bool, remaining int, resetTime
 	return false, 0, b.lastTime.Add(rl.window).Unix()
 }
 
-func (rl *rateLimiter) cleanupLoop() {
-	ticker := time.NewTicker(rl.window * 2)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-rl.stopCh:
-			return
-		case <-ticker.C:
-			rl.mu.Lock()
-			now := time.Now()
-			for k, b := range rl.buckets {
-				if now.Sub(b.lastTime) > rl.window*2 {
-					delete(rl.buckets, k)
-				}
-			}
-			rl.mu.Unlock()
+// cleanup removes expired buckets from the rate limiter.
+// Called periodically by the Manager's shared cleanup goroutine.
+func (rl *rateLimiter) cleanup(now time.Time, maxAge time.Duration) {
+	if rl == nil {
+		return
+	}
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	for k, b := range rl.buckets {
+		if now.Sub(b.lastTime) > maxAge {
+			delete(rl.buckets, k)
 		}
 	}
 }
@@ -157,16 +144,19 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 	m := &Manager{
 		tokens: make(map[string]*tokenState),
 		window: time.Minute,
+		stopCh: make(chan struct{}),
 	}
 
 	var tokenConfigs []TokenConfig
 
 	if configStr == "" {
+		go m.cleanupLoop()
 		return m, nil
 	}
 
-	// Try loading as JSON file first
-	if strings.HasPrefix(configStr, "/") || strings.HasPrefix(configStr, "./") || strings.HasPrefix(configStr, "../") {
+	// Try loading as JSON file: check if the string refers to an existing file.
+	// Use os.Stat to detect files regardless of path prefix (handles "tokens.json", "./tokens.json", etc.)
+	if _, statErr := os.Stat(configStr); statErr == nil {
 		f, err := os.Open(configStr)
 		if err == nil {
 			defer f.Close()
@@ -179,8 +169,11 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 			}
 			slog.Info("loaded token config from file", "path", configStr, "tokens", len(tokenConfigs))
 		} else {
-			return nil, fmt.Errorf("token config looks like a file path but cannot be opened: %w", err)
+			return nil, fmt.Errorf("token config file exists but cannot be opened: %w", err)
 		}
+	} else if strings.HasPrefix(configStr, "/") || strings.HasPrefix(configStr, "./") || strings.HasPrefix(configStr, "../") {
+		// Looks like a path but doesn't exist — report as error
+		return nil, fmt.Errorf("token config looks like a file path but file does not exist: %s", configStr)
 	} else if strings.HasPrefix(configStr, "[") {
 		// Inline JSON array
 		if err := json.Unmarshal([]byte(configStr), &tokenConfigs); err != nil {
@@ -211,6 +204,14 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 		if tc.Key == "" {
 			return nil, fmt.Errorf("token config contains empty key")
 		}
+		// Reject negative values: treat as configuration errors rather than
+		// silently disabling the limit (which a typo could cause).
+		if tc.Quota < 0 {
+			return nil, fmt.Errorf("token %q has negative quota %d; use 0 for unlimited", tc.Key, tc.Quota)
+		}
+		if tc.RateLimit < 0 {
+			return nil, fmt.Errorf("token %q has negative rate_limit %d; use 0 for default/global", tc.Key, tc.RateLimit)
+		}
 		// Determine per-key rate limit: use per-key value, or fall back to global
 		perKeyRate := tc.RateLimit
 		if perKeyRate <= 0 && globalRateLimit > 0 {
@@ -222,28 +223,42 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 		}
 	}
 
+	go m.cleanupLoop()
 	return m, nil
 }
 
-// Stop cleans up all rate limiter goroutines.
+// Stop cleans up all rate limiters and stops the shared cleanup goroutine.
+// Safe to call multiple times (idempotent via sync.Once).
 func (m *Manager) Stop() {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	for _, ts := range m.tokens {
-		ts.limit.Stop()
-	}
-	if m.limiter != nil {
-		m.limiter.Stop()
-	}
+	m.once.Do(func() {
+		close(m.stopCh)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, ts := range m.tokens {
+			ts.limit.Stop()
+		}
+	})
 }
 
-// SetGlobalRateLimit sets a global rate limiter applied to all authenticated keys.
-// This is used when no per-key rate_limit is specified.
-func (m *Manager) SetGlobalRateLimit(rate int) {
-	if rate <= 0 {
-		return
+// cleanupLoop runs a single shared goroutine that cleans up expired buckets
+// across all per-key rate limiters.
+func (m *Manager) cleanupLoop() {
+	ticker := time.NewTicker(m.window * 2)
+	defer ticker.Stop()
+	maxAge := m.window * 2
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case <-ticker.C:
+			m.mu.RLock()
+			now := time.Now()
+			for _, ts := range m.tokens {
+				ts.limit.cleanup(now, maxAge)
+			}
+			m.mu.RUnlock()
+		}
 	}
-	m.limiter = newRateLimiter(rate, time.Minute)
 }
 
 // Authenticate validates the token and returns (authenticated, reason).
@@ -251,13 +266,8 @@ func (m *Manager) Authenticate(token string) (bool, string) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ts, ok := m.tokens[token]
+	_, ok := m.tokens[token]
 	if !ok {
-		return false, "invalid_api_key"
-	}
-
-	// Check constant-time
-	if subtle.ConstantTimeCompare([]byte(token), []byte(ts.cfg.Key)) != 1 {
 		return false, "invalid_api_key"
 	}
 
@@ -308,12 +318,6 @@ func (m *Manager) CheckRateLimit(token string) (allowed bool, remaining int, lim
 		return allowed, remaining, ts.limit.rate, resetTime
 	}
 
-	// Check global rate limit
-	if m.limiter != nil {
-		allowed, remaining, resetTime := m.limiter.allow(token)
-		return allowed, remaining, m.limiter.rate, resetTime
-	}
-
 	return true, 0, 0, 0
 }
 
@@ -322,6 +326,67 @@ func (m *Manager) TokenCount() int {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return len(m.tokens)
+}
+
+// authResult holds the combined result of Authenticate + CheckQuota + CheckRateLimit
+// obtained in a single lock acquisition.
+type authResult struct {
+	authenticated bool
+	authReason    string
+
+	quotaExceeded  bool
+	quotaRemaining int
+	quotaLimit     int
+
+	rateLimited   bool
+	rateRemaining int
+	rateLimit     int
+	rateResetTime int64
+}
+
+// checkAll performs Authenticate + CheckQuota + CheckRateLimit in a single
+// read-lock acquisition, then upgrades to a write-lock only for RecordUsage.
+// This reduces per-request lock operations from 4 (RLock+RLock+RLock+Lock)
+// to 2 (RLock+Lock), cutting lock contention by ~50%.
+func (m *Manager) checkAll(token string) authResult {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ts, ok := m.tokens[token]
+	if !ok {
+		return authResult{authenticated: false, authReason: "invalid_api_key"}
+	}
+
+	result := authResult{authenticated: true}
+
+	// Check quota
+	if quota := ts.cfg.Quota; quota > 0 {
+		remaining := int(quota) - int(ts.used)
+		if remaining <= 0 {
+			result.quotaExceeded = true
+			result.quotaLimit = int(quota)
+			return result
+		}
+		result.quotaRemaining = remaining
+		result.quotaLimit = int(quota)
+	}
+
+	// Check rate limit
+	if ts.limit != nil {
+		allowed, remaining, resetTime := ts.limit.allow(token)
+		if !allowed {
+			result.rateLimited = true
+			result.rateRemaining = 0
+			result.rateLimit = ts.limit.rate
+			result.rateResetTime = resetTime
+			return result
+		}
+		result.rateRemaining = remaining
+		result.rateLimit = ts.limit.rate
+		result.rateResetTime = resetTime
+	}
+
+	return result
 }
 
 // Middleware returns an HTTP middleware that handles auth + quota + rate limiting.
@@ -340,68 +405,95 @@ func (m *Manager) Middleware() func(http.HandlerFunc) http.HandlerFunc {
 			}
 			token := auth[7:]
 
-			// Step 1: Authenticate
-			if ok, reason := m.Authenticate(token); !ok {
-				writeAuthError(w, reason, "invalid API key")
+			// Step 1-3: Combined auth + quota + rate limit check (single RLock)
+			result := m.checkAll(token)
+
+			if !result.authenticated {
+				writeAuthError(w, result.authReason, "invalid API key")
 				return
 			}
 
-			// Step 2: Check quota
-			if ok, remaining, limit := m.CheckQuota(token); !ok {
-				w.Header().Set("X-Quota-Limit", strconv.Itoa(limit))
+			if result.quotaExceeded {
+				w.Header().Set("X-Quota-Limit", strconv.Itoa(result.quotaLimit))
 				w.Header().Set("X-Quota-Remaining", "0")
 				writeLimitError(w, "quota_exceeded",
-					fmt.Sprintf("quota exceeded: %d/%d requests used", limit, limit))
+					fmt.Sprintf("quota exceeded: %d/%d requests used", result.quotaLimit, result.quotaLimit))
 				return
-			} else if remaining >= 0 {
-				w.Header().Set("X-Quota-Limit", strconv.Itoa(limit))
-				w.Header().Set("X-Quota-Remaining", strconv.Itoa(remaining))
+			} else if result.quotaRemaining >= 0 {
+				w.Header().Set("X-Quota-Limit", strconv.Itoa(result.quotaLimit))
+				w.Header().Set("X-Quota-Remaining", strconv.Itoa(result.quotaRemaining-1))
 			}
 
-			// Step 3: Check rate limit
-			if allowed, remaining, limit, resetTime := m.CheckRateLimit(token); !allowed {
-				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
+			if result.rateLimited {
+				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.rateLimit))
 				w.Header().Set("X-RateLimit-Remaining", "0")
-				w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(resetTime)))
-				w.Header().Set("Retry-After", strconv.Itoa(60))
+				w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(result.rateResetTime)))
+				retryAfter := int(result.rateResetTime - time.Now().Unix())
+				if retryAfter < 1 {
+					retryAfter = 1
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
 				writeLimitError(w, "rate_limit_exceeded", "rate limit exceeded, please slow down")
 				return
-			} else if limit > 0 {
-				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
-				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))
-				w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(resetTime)))
+			} else if result.rateLimit > 0 {
+				w.Header().Set("X-RateLimit-Limit", strconv.Itoa(result.rateLimit))
+				w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(result.rateRemaining))
+				w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(result.rateResetTime)))
 			}
 
-			// Step 4: Record usage
+			// Step 4: All checks passed — record usage (single write-lock)
 			m.RecordUsage(token)
-
 			next(w, r)
 		}
 	}
 }
 
+// authErrorResponse is a structured error response to prevent JSON injection.
+type authErrorResponse struct {
+	Error struct {
+		Message string `json:"message"`
+		Type    string `json:"type"`
+		Code    string `json:"code"`
+	} `json:"error"`
+}
+
 func writeAuthError(w http.ResponseWriter, code, message string) {
+	resp := authErrorResponse{}
+	resp.Error.Message = message
+	resp.Error.Type = "authentication_error"
+	resp.Error.Code = code
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"internal error","type":"server_error","code":"internal_error"}}`, http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
-	w.Write([]byte(fmt.Sprintf(
-		`{"error":{"message":"%s","type":"authentication_error","code":"%s"}}`+"\n",
-		message, code,
-	)))
+	w.Write(data)
+	w.Write([]byte("\n"))
 }
 
 func writeLimitError(w http.ResponseWriter, code, message string) {
-	status := http.StatusForbidden // 403 for quota
-	if code == "rate_limit_exceeded" {
-		status = http.StatusTooManyRequests // 429 for rate limit
-	}
+	status := http.StatusForbidden
 	errType := "quota_error"
 	if code == "rate_limit_exceeded" {
+		status = http.StatusTooManyRequests
 		errType = "rate_limit_error"
+	}
+
+	resp := authErrorResponse{}
+	resp.Error.Message = message
+	resp.Error.Type = errType
+	resp.Error.Code = code
+
+	data, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"internal error","type":"server_error","code":"internal_error"}}`, http.StatusInternalServerError)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	w.Write([]byte(fmt.Sprintf(
-		`{"error":{"message":"%s","type":"%s","code":"%s"}}`+"\n",
-		message, errType, code,
-	)))
+	w.Write(data)
+	w.Write([]byte("\n"))
 }

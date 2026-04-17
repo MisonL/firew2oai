@@ -2,8 +2,8 @@ package config
 
 import (
 	"flag"
-	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -11,41 +11,60 @@ import (
 
 // Config holds all service configuration.
 type Config struct {
-	Port         int
-	Host         string
-	APIKey       string // comma-separated keys, JSON file path, or inline JSON
-	Timeout      int    // seconds
-	LogLevel     string
-	ShowThinking bool   // default: show thinking process for thinking models
-	CORSOrigins  string
-	RateLimit    int    // global rate limit: max requests per minute per key (0 = disabled)
-	IPWhitelist  string // comma-separated IPs/CIDRs (empty = allow all)
+	Port              int
+	Host              string
+	APIKey            string // comma-separated keys, JSON file path, or inline JSON
+	Timeout           int    // seconds
+	LogLevel          string
+	ShowThinking      bool // default: show thinking process for thinking models
+	CORSOrigins       string
+	RateLimit         int    // global rate limit: max requests per minute per key (0 = disabled)
+	IPWhitelist       string // comma-separated IPs/CIDRs; default "127.0.0.1,::1" (loopback only); set "" or "0.0.0.0/0,::/0" to allow all
+	TrustedProxyCount int    // number of trusted reverse proxies (0 = trust none, use RemoteAddr)
 }
+
+const (
+	defaultPort      = 39527
+	defaultTimeout   = 120
+	defaultRateLimit = 0
+	minPort          = 1
+	maxPort          = 65535
+)
 
 var AvailableModels = []string{
 	"qwen3-vl-30b-a3b-thinking",
 	"qwen3-vl-30b-a3b-instruct",
 	"qwen3-8b",
 	"minimax-m2p5",
-	"minimax-m2p1",
 	"llama-v3p3-70b-instruct",
 	"kimi-k2p5",
-	"kimi-k2-thinking",
-	"kimi-k2-instruct-0905",
 	"gpt-oss-20b",
 	"gpt-oss-120b",
 	"glm-5",
 	"glm-4p7",
 	"deepseek-v3p2",
 	"deepseek-v3p1",
-	"cogito-671b-v2-p1", // 2026-04-15: 上游返回 404，疑似已下线
+	// Removed after live checks on 2026-04-17:
+	// minimax-m2p1, kimi-k2-thinking, kimi-k2-instruct-0905,
+	// cogito-671b-v2-p1 all returned upstream Fireworks 404.
+	// cogito-671b-v2-p1 removed: upstream returns 404 since 2026-04-15
+}
+
+// availableModelSet is a lookup map for O(1) model validation.
+var availableModelSet map[string]bool
+
+func init() {
+	availableModelSet = make(map[string]bool, len(AvailableModels))
+	for _, m := range AvailableModels {
+		availableModelSet[m] = true
+	}
 }
 
 // thinkingModels is the set of models that produce a thinking block
 // before the actual response, separated by the 💯 emoji.
 var thinkingModels = map[string]bool{
 	"qwen3-vl-30b-a3b-thinking": true,
-	"kimi-k2-thinking":          true,
+	"qwen3-8b":                  true,
 }
 
 // IsThinkingModel checks if the model name indicates a thinking/reasoning model.
@@ -55,34 +74,34 @@ func IsThinkingModel(model string) bool {
 
 // ValidModel checks if a model is in the supported list.
 func ValidModel(model string) bool {
-	for _, m := range AvailableModels {
-		if m == model {
-			return true
-		}
-	}
-	return false
+	return availableModelSet[model]
 }
 
-// Load reads configuration from environment variables and command-line flags.
-// Flags take precedence over environment variables.
+// Load reads configuration from environment variables only.
+// Command-line flags should be parsed separately and passed via ApplyFlags.
 func Load() *Config {
 	cfg := &Config{}
 
 	// Defaults
-	cfg.Port = 39527
+	cfg.Port = defaultPort
 	cfg.Host = ""
 	cfg.APIKey = "sk-admin"
-	cfg.Timeout = 120
+	cfg.Timeout = defaultTimeout
 	cfg.LogLevel = "info"
 	cfg.ShowThinking = false
 	cfg.CORSOrigins = "*"
-	cfg.RateLimit = 0 // disabled by default; set >0 to enable
+	cfg.RateLimit = defaultRateLimit  // disabled by default; set >0 to enable
 	cfg.IPWhitelist = "127.0.0.1,::1" // default: loopback only
+	cfg.TrustedProxyCount = 0         // default: trust no proxy, use RemoteAddr
 
 	// Environment variables
 	if v := os.Getenv("PORT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.Port = n
+			if n >= minPort && n <= maxPort {
+				cfg.Port = n
+			} else {
+				slog.Warn("PORT out of range, using default", "value", v, "min", minPort, "max", maxPort)
+			}
 		} else {
 			slog.Warn("invalid PORT value, using default", "value", v)
 		}
@@ -94,8 +113,10 @@ func Load() *Config {
 		cfg.APIKey = v
 	}
 	if v := os.Getenv("TIMEOUT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			cfg.Timeout = n
+		} else if n <= 0 {
+			slog.Warn("TIMEOUT must be positive, using default", "value", v)
 		} else {
 			slog.Warn("invalid TIMEOUT value, using default", "value", v)
 		}
@@ -111,36 +132,66 @@ func Load() *Config {
 	}
 	if v := os.Getenv("RATE_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
-			cfg.RateLimit = n
+			if n >= 0 {
+				cfg.RateLimit = n
+			} else {
+				slog.Warn("RATE_LIMIT must be non-negative, using default", "value", v)
+			}
 		} else {
 			slog.Warn("invalid RATE_LIMIT value, using default", "value", v)
 		}
 	}
-	if v := os.Getenv("IP_WHITELIST"); v != "" {
+	if v, ok := os.LookupEnv("IP_WHITELIST"); ok {
 		cfg.IPWhitelist = v
 	}
-
-	// Command-line flags (override env)
-	fs := flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	fs.IntVar(&cfg.Port, "port", cfg.Port, "listen port")
-	fs.StringVar(&cfg.Host, "host", cfg.Host, "listen host (default: all interfaces)")
-	fs.StringVar(&cfg.APIKey, "api-key", cfg.APIKey, "API key for authentication")
-	fs.IntVar(&cfg.Timeout, "timeout", cfg.Timeout, "upstream request timeout in seconds")
-	fs.StringVar(&cfg.LogLevel, "log-level", cfg.LogLevel, "log level: debug, info, warn, error")
-	fs.BoolVar(&cfg.ShowThinking, "show-thinking", cfg.ShowThinking, "show thinking process for thinking models")
-	fs.StringVar(&cfg.CORSOrigins, "cors-origins", cfg.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
-	fs.IntVar(&cfg.RateLimit, "rate-limit", cfg.RateLimit, "max requests per minute per IP (0 to disable)")
-	fs.StringVar(&cfg.IPWhitelist, "ip-whitelist", cfg.IPWhitelist, "allowed IPs/CIDRs (comma-separated, empty to allow all)")
-	_ = fs.Parse(os.Args[1:])
+	if v := os.Getenv("TRUSTED_PROXY_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.TrustedProxyCount = n
+		} else {
+			slog.Warn("invalid TRUSTED_PROXY_COUNT value, using default", "value", v)
+		}
+	}
 
 	return cfg
+}
+
+// ApplyFlags parses command-line flags and overrides config values.
+// This is called from main() to avoid flag pollution in tests.
+func (c *Config) ApplyFlags(args []string) {
+	fs := flag.NewFlagSet(args[0], flag.ExitOnError)
+	fs.IntVar(&c.Port, "port", c.Port, "listen port")
+	fs.StringVar(&c.Host, "host", c.Host, "listen host (default: all interfaces)")
+	fs.StringVar(&c.APIKey, "api-key", c.APIKey, "API key for authentication")
+	fs.IntVar(&c.Timeout, "timeout", c.Timeout, "upstream request timeout in seconds")
+	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug, info, warn, error")
+	fs.BoolVar(&c.ShowThinking, "show-thinking", c.ShowThinking, "show thinking process for thinking models")
+	fs.StringVar(&c.CORSOrigins, "cors-origins", c.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
+	fs.IntVar(&c.RateLimit, "rate-limit", c.RateLimit, "max requests per minute per key (0 to disable)")
+	fs.StringVar(&c.IPWhitelist, "ip-whitelist", c.IPWhitelist, "allowed IPs/CIDRs (comma-separated, empty to allow all)")
+	fs.IntVar(&c.TrustedProxyCount, "trusted-proxy-count", c.TrustedProxyCount, "number of trusted reverse proxies for X-Forwarded-For (0 = trust none)")
+	_ = fs.Parse(args[1:])
+	if c.Port < minPort || c.Port > maxPort {
+		slog.Warn("port out of range, using default", "value", c.Port, "min", minPort, "max", maxPort)
+		c.Port = defaultPort
+	}
+	if c.Timeout <= 0 {
+		slog.Warn("timeout must be positive, using default", "value", c.Timeout)
+		c.Timeout = defaultTimeout
+	}
+	if c.RateLimit < 0 {
+		slog.Warn("rate-limit must be non-negative, clamping to 0", "value", c.RateLimit)
+		c.RateLimit = defaultRateLimit
+	}
+	if c.TrustedProxyCount < 0 {
+		slog.Warn("trusted-proxy-count must be non-negative, clamping to 0", "value", c.TrustedProxyCount)
+		c.TrustedProxyCount = 0
+	}
 }
 
 // Addr returns the listen address string.
 func (c *Config) Addr() string {
 	if c.Host != "" {
-		return fmt.Sprintf("%s:%d", c.Host, c.Port)
+		return net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	}
-	return fmt.Sprintf(":%d", c.Port)
+	return ":" + strconv.Itoa(c.Port)
 }
-

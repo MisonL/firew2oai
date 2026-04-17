@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -49,6 +50,26 @@ func TestNew_InvalidConfig(t *testing.T) {
 	_, err := New(`[{"key": "", "quota": 0}]`, 0)
 	if err == nil {
 		t.Error("expected error for empty key")
+	}
+}
+
+func TestNew_NegativeQuotaRejected(t *testing.T) {
+	_, err := New(`[{"key": "sk-test", "quota": -1}]`, 0)
+	if err == nil {
+		t.Error("expected error for negative quota")
+	}
+	if err != nil && !strings.Contains(err.Error(), "negative quota") {
+		t.Errorf("error should mention negative quota, got: %v", err)
+	}
+}
+
+func TestNew_NegativeRateLimitRejected(t *testing.T) {
+	_, err := New(`[{"key": "sk-test", "rate_limit": -1}]`, 0)
+	if err == nil {
+		t.Error("expected error for negative rate_limit")
+	}
+	if err != nil && !strings.Contains(err.Error(), "negative rate_limit") {
+		t.Errorf("error should mention negative rate_limit, got: %v", err)
 	}
 }
 
@@ -369,7 +390,61 @@ func TestMiddleware_QuotaHeaders(t *testing.T) {
 	if h := rec.Header().Get("X-Quota-Limit"); h != "100" {
 		t.Errorf("X-Quota-Limit = %q, want 100", h)
 	}
-	if h := rec.Header().Get("X-Quota-Remaining"); h != "100" {
-		t.Errorf("X-Quota-Remaining = %q, want 100 (quota checked before record)", h)
+	if h := rec.Header().Get("X-Quota-Remaining"); h != "99" {
+		t.Errorf("X-Quota-Remaining = %q, want 99 (quota recorded before header)", h)
+	}
+}
+
+// TestStop_Idempotent verifies that calling Stop() multiple times
+// does not panic (P3-2 regression: double-close on stopCh).
+func TestStop_Idempotent(t *testing.T) {
+	m, err := New("sk-stop-test", 0)
+	if err != nil {
+		t.Fatalf("New error: %v", err)
+	}
+
+	// First stop should succeed
+	m.Stop()
+
+	// Second stop should NOT panic (was: close of closed channel)
+	m.Stop()
+
+	// Third stop for good measure
+	m.Stop()
+}
+
+// TestMiddleware_QuotaNotConsumedOnRateLimit verifies that a request rejected
+// by rate limiting does NOT consume quota. Previously RecordUsage was called
+// before CheckRateLimit, causing quota to be wasted on 429'd requests.
+func TestMiddleware_QuotaNotConsumedOnRateLimit(t *testing.T) {
+	m := newTestManager(t, `[{"key":"sk-combined","quota":3,"rate_limit":1}]`, 0)
+	defer m.Stop()
+
+	handler := m.Middleware()(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Request 1: allowed (rate limit OK, quota 3→2)
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer sk-combined")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("request 1: status = %d, want 200", rec.Code)
+	}
+
+	// Request 2: rate limited (quota should NOT be consumed)
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Header.Set("Authorization", "Bearer sk-combined")
+	rec2 := httptest.NewRecorder()
+	handler(rec2, req2)
+	if rec2.Code != http.StatusTooManyRequests {
+		t.Fatalf("request 2: status = %d, want 429", rec2.Code)
+	}
+
+	// Verify quota is still 2 remaining (not 1)
+	ok, rem, _ := m.CheckQuota("sk-combined")
+	if !ok || rem != 2 {
+		t.Errorf("after rate-limit rejection: quota ok=%v, rem=%d, want ok=true, rem=2", ok, rem)
 	}
 }
