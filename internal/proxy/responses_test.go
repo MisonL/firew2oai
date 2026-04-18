@@ -59,7 +59,7 @@ func TestResponsesPromptMessages_InstructionsNotStored(t *testing.T) {
 		{Role: "user", Content: "second"},
 	}
 	tools := json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`)
-	prompt := buildResponsesPrompt(base, "be concise", current, tools)
+	prompt := buildResponsesPrompt(base, "be concise", current, tools, 0)
 
 	for _, want := range []string{
 		"<BASE_INSTRUCTIONS>",

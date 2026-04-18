@@ -1,0 +1,911 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/mison/firew2oai/internal/transport"
+)
+
+func marshalSSEContent(t *testing.T, content string) string {
+	t.Helper()
+
+	data, err := json.Marshal(map[string]string{
+		"type":    "content",
+		"content": content,
+	})
+	if err != nil {
+		t.Fatalf("marshal SSE content: %v", err)
+	}
+	return "data: " + string(data) + "\n\n"
+}
+
+func TestBuildChatPrompt_UsesAIActionsProtocol(t *testing.T) {
+	prompt := buildChatPrompt(
+		[]ChatMessage{{Role: "user", Content: "读取 README.md"}},
+		json.RawMessage(`[{"type":"function","name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}]`),
+		nil,
+		0,
+	)
+
+	for _, want := range []string{
+		"<<<AI_ACTIONS_V1>>>",
+		"<<<END_AI_ACTIONS_V1>>>",
+		`{"mode":"tool","calls":[`,
+		`{"mode":"final"}`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "reply with exactly one JSON object") {
+		t.Fatalf("prompt still contains legacy single-JSON instruction:\n%s", prompt)
+	}
+}
+
+func TestBuildResponsesPrompt_UsesAIActionsProtocol(t *testing.T) {
+	prompt := buildResponsesPrompt(
+		nil,
+		"be concise",
+		[]ChatMessage{{Role: "user", Content: "列出目录并读取 README.md"}},
+		json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`),
+		0,
+	)
+
+	for _, want := range []string{
+		"<<<AI_ACTIONS_V1>>>",
+		"<<<END_AI_ACTIONS_V1>>>",
+		`{"mode":"tool","calls":[`,
+		`{"mode":"final"}`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	if strings.Contains(prompt, "reply with exactly one JSON object") {
+		t.Fatalf("prompt still contains legacy single-JSON instruction:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Emit exactly one AI_ACTIONS block per reply.") {
+		t.Fatalf("prompt missing single-block guidance:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Use mode final only when the task is fully complete") {
+		t.Fatalf("prompt missing final-mode completion guidance:\n%s", prompt)
+	}
+}
+
+func TestBuildResponsesPrompt_MaxCallsOneIncludesSingleStepGuidance(t *testing.T) {
+	prompt := buildResponsesPrompt(
+		nil,
+		"be concise",
+		[]ChatMessage{{Role: "user", Content: "先读 README 再读 tool_protocol"}},
+		json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`),
+		1,
+	)
+
+	if !strings.Contains(prompt, "calls array must contain exactly one item") {
+		t.Fatalf("prompt missing maxCalls=1 one-call constraint:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "emit only the next single tool call now") {
+		t.Fatalf("prompt missing single-step guidance for maxCalls=1:\n%s", prompt)
+	}
+}
+
+func TestBuildToolChoiceInstructions_RequiredNamedToolIsMandatory(t *testing.T) {
+	instructions := buildToolChoiceInstructions(mustMarshalRawJSON(map[string]any{"name": "exec_command"}))
+
+	if !strings.Contains(instructions, `must`) {
+		t.Fatalf("tool choice instructions should be mandatory, got %q", instructions)
+	}
+	if strings.Contains(instructions, "If you emit") {
+		t.Fatalf("tool choice instructions should not be conditional, got %q", instructions)
+	}
+	if !strings.Contains(instructions, `"exec_command"`) {
+		t.Fatalf("tool choice instructions missing required tool name: %q", instructions)
+	}
+}
+
+func TestBuildChatPrompt_ToolChoiceNoneDoesNotExposeTools(t *testing.T) {
+	prompt := buildChatPrompt(
+		[]ChatMessage{{Role: "user", Content: "只回答结果"}},
+		json.RawMessage(`[{"type":"function","name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}]`),
+		mustMarshalRawJSON("none"),
+		0,
+	)
+
+	for _, unwanted := range []string{
+		"<AVAILABLE_TOOLS>",
+		"Read",
+		"<<<AI_ACTIONS_V1>>>",
+		`{"mode":"tool","calls":[`,
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt should not expose tools when tool_choice=none, found %q:\n%s", unwanted, prompt)
+		}
+	}
+	if !strings.Contains(prompt, "Do not call any tools. Answer with plain text only.") {
+		t.Fatalf("prompt missing tool_choice=none guidance:\n%s", prompt)
+	}
+}
+
+func TestBuildResponsesPrompt_ToolChoiceNoneDoesNotExposeTools(t *testing.T) {
+	prompt := buildResponsesPrompt(
+		nil,
+		"",
+		[]ChatMessage{{Role: "user", Content: "只回答结果"}},
+		nil,
+		0,
+	)
+	if strings.Contains(prompt, "<AVAILABLE_TOOLS>") || strings.Contains(prompt, "<<<AI_ACTIONS_V1>>>") {
+		t.Fatalf("prompt without tools should not expose tool protocol:\n%s", prompt)
+	}
+}
+
+func TestParseToolCallOutputs_AIActionsBlockMultipleCalls(t *testing.T) {
+	text := "先读取 README.md 和当前目录。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}},{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"show cwd\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"Read": {Name: "Read", Type: "function", Structured: true},
+		"Bash": {Name: "Bash", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 2 {
+		t.Fatalf("tool call count = %d, want 2", len(result.calls))
+	}
+	if result.visibleText != "先读取 README.md 和当前目录。" {
+		t.Fatalf("visible text = %q", result.visibleText)
+	}
+	if !strings.Contains(string(result.calls[0].item), `"name":"Read"`) {
+		t.Fatalf("first item = %s", string(result.calls[0].item))
+	}
+	if !strings.Contains(string(result.calls[1].item), `"name":"Bash"`) {
+		t.Fatalf("second item = %s", string(result.calls[1].item))
+	}
+}
+
+func TestParseToolCallOutputs_AIActionsBlockFinalMode(t *testing.T) {
+	text := "这是最终答案。\n\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"Read": {Name: "Read", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 0 {
+		t.Fatalf("tool call count = %d, want 0", len(result.calls))
+	}
+	if result.visibleText != "这是最终答案。" {
+		t.Fatalf("visible text = %q", result.visibleText)
+	}
+}
+
+func TestParseToolCallOutputs_AIActionsBlockWithFencedJSON(t *testing.T) {
+	text := "先读取 README。\n<<<AI_ACTIONS_V1>>>\n```json\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}]}\n```\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if result.visibleText != "先读取 README。" {
+		t.Fatalf("visible text = %q", result.visibleText)
+	}
+}
+
+func TestParseToolCallOutputs_FallsBackToLegacyJSON(t *testing.T) {
+	result := parseToolCallOutputs(
+		"I will inspect first.\n{\"type\":\"function_call\",\"name\":\"run_terminal\",\"arguments\":{\"cmd\":\"pwd\"}}",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if !strings.Contains(string(result.calls[0].item), `"name":"exec_command"`) {
+		t.Fatalf("item did not normalize alias: %s", string(result.calls[0].item))
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesTerminalCommandAliases(t *testing.T) {
+	for _, alias := range []string{"run_terminal_cmd", "run_command", "shell_command"} {
+		t.Run(alias, func(t *testing.T) {
+			result := parseToolCallOutputs(
+				fmt.Sprintf(`{"type":"function_call","name":%q,"arguments":{"cmd":"ls -la"}}`, alias),
+				map[string]responseToolDescriptor{
+					"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+				},
+				"",
+			)
+
+			if result.err != nil {
+				t.Fatalf("unexpected parse error: %v", result.err)
+			}
+			if len(result.calls) != 1 {
+				t.Fatalf("tool call count = %d, want 1", len(result.calls))
+			}
+			if !strings.Contains(string(result.calls[0].item), `"name":"exec_command"`) {
+				t.Fatalf("item did not normalize alias: %s", string(result.calls[0].item))
+			}
+		})
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesExecCommandInputField(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"shell\",\"input\":\"ls -la\"}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"exec_command"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `\"cmd\":\"ls -la\"`) {
+		t.Fatalf("item missing normalized cmd argument: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesExecCommandCommandField(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"command\":\"pwd\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"exec_command"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `\"cmd\":\"pwd\"`) {
+		t.Fatalf("item missing normalized cmd argument: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesReadFileAliasToExecCommand(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"exec_command"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `\"cmd\":\"sed -n '1,200p' -- 'README.md'\"`) {
+		t.Fatalf("item missing normalized read command: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_LegacyJSONSequence(t *testing.T) {
+	result := parseToolCallOutputs(
+		"{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 2 {
+		t.Fatalf("tool call count = %d, want 2", len(result.calls))
+	}
+	if !strings.Contains(string(result.calls[0].item), `\"cmd\":\"sed -n '1,5p' README.md\"`) {
+		t.Fatalf("first item missing cmd: %s", string(result.calls[0].item))
+	}
+	if !strings.Contains(string(result.calls[1].item), `\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"`) {
+		t.Fatalf("second item missing cmd: %s", string(result.calls[1].item))
+	}
+}
+
+func TestParseToolCallOutputs_LegacyJSONSequenceWithPrefixText(t *testing.T) {
+	result := parseToolCallOutputs(
+		"我先读取两个位置。\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 2 {
+		t.Fatalf("tool call count = %d, want 2", len(result.calls))
+	}
+	if result.visibleText != "我先读取两个位置。\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}" {
+		t.Fatalf("visible text = %q", result.visibleText)
+	}
+}
+
+func TestParseToolCallOutputs_LegacyJSONSequenceRejectsMarkdownBetweenCalls(t *testing.T) {
+	result := parseToolCallOutputs(
+		"```json\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}}\n```\n```json\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"ls\"}}\n```",
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err == nil || !strings.Contains(result.err.Error(), "tool call JSON decode failed") {
+		t.Fatalf("expected decode error for markdown-separated legacy JSON, got %v", result.err)
+	}
+}
+
+func TestParseToolCallOutputs_LegacyJSONWithoutTypeStaysPlainText(t *testing.T) {
+	text := `{"name":"exec_command","arguments":{"cmd":"pwd"}}`
+	result := parseToolCallOutputs(
+		text,
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 0 {
+		t.Fatalf("tool call count = %d, want 0", len(result.calls))
+	}
+	if result.visibleText != text {
+		t.Fatalf("visible text = %q, want %q", result.visibleText, text)
+	}
+}
+
+func TestParseToolCallOutputsWithConstraints_RequireToolRejectsFinalMode(t *testing.T) {
+	result := parseToolCallOutputsWithConstraints(
+		"这是最终答案。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"Read": {Name: "Read", Type: "function", Structured: true},
+		},
+		toolProtocolConstraints{RequireTool: true},
+	)
+
+	if result.err == nil || !strings.Contains(result.err.Error(), "requires a tool call") {
+		t.Fatalf("expected required-tool error, got %v", result.err)
+	}
+}
+
+func TestParseToolCallOutputsWithConstraints_MaxCallsRejectsMultipleCalls(t *testing.T) {
+	result := parseToolCallOutputsWithConstraints(
+		"先做两步。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}},{\"name\":\"Read\",\"arguments\":{\"file_path\":\"AGENTS.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"Read": {Name: "Read", Type: "function", Structured: true},
+		},
+		toolProtocolConstraints{MaxCalls: 1},
+	)
+
+	if result.err == nil || !strings.Contains(result.err.Error(), "at most 1 call") {
+		t.Fatalf("expected max-calls error, got %v", result.err)
+	}
+}
+
+func TestParseToolCallOutputs_RejectsStructuredToolUsingInputField(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"input\":\"README.md\"}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"Read": {Name: "Read", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err == nil || !strings.Contains(result.err.Error(), "must use arguments") {
+		t.Fatalf("expected structured-field mismatch error, got %v", result.err)
+	}
+}
+
+func TestHandleChatCompletions_NonStreamAIActionsBlock_MultipleToolCalls(t *testing.T) {
+	content := "先检查文件和目录。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}},{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"show cwd\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(marshalSSEContent(t, content)))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{
+		"model":"deepseek-v3p2",
+		"stream":false,
+		"messages":[{"role":"user","content":"读取 README.md 并查看当前目录"}],
+		"tools":[
+			{"type":"function","function":{"name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}},
+			{"type":"function","function":{"name":"Bash","description":"run shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"description":{"type":"string"}},"required":["command"]}}}
+		]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := resp.Choices[0].FinishReason; got != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", got)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 2 {
+		t.Fatalf("tool_calls len = %d, want 2", len(resp.Choices[0].Message.ToolCalls))
+	}
+	if resp.Choices[0].Message.ToolCalls[0].Function.Name != "Read" {
+		t.Fatalf("first tool = %q, want Read", resp.Choices[0].Message.ToolCalls[0].Function.Name)
+	}
+	if resp.Choices[0].Message.ToolCalls[1].Function.Name != "Bash" {
+		t.Fatalf("second tool = %q, want Bash", resp.Choices[0].Message.ToolCalls[1].Function.Name)
+	}
+}
+
+func TestHandleResponses_StreamAIActionsBlock_MultipleToolCalls(t *testing.T) {
+	content := "先检查目录和 README。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}},{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"ls\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(marshalSSEContent(t, content)))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","input":"查看目录并列出文件","stream":true,"tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	if strings.Count(bodyText, "event: response.output_item.added") != 2 {
+		t.Fatalf("response.output_item.added count = %d, want 2:\n%s", strings.Count(bodyText, "event: response.output_item.added"), bodyText)
+	}
+	if strings.Count(bodyText, "event: response.output_item.done") != 2 {
+		t.Fatalf("response.output_item.done count = %d, want 2:\n%s", strings.Count(bodyText, "event: response.output_item.done"), bodyText)
+	}
+	if strings.Index(bodyText, "event: response.output_item.added") > strings.Index(bodyText, "event: response.output_item.done") {
+		t.Fatalf("response.output_item.added should appear before done:\n%s", bodyText)
+	}
+	for _, want := range []string{
+		`"type":"function_call"`,
+		`"name":"exec_command"`,
+		`\"cmd\":\"pwd\"`,
+		`\"cmd\":\"ls\"`,
+		"event: response.completed",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Contains(bodyText, "response.output_text.delta") {
+		t.Fatalf("tool-call stream should not emit text deltas:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_ToolChoiceNoneDoesNotExposeToolsToUpstream(t *testing.T) {
+	var capturedPrompt string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var req FireworksRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if len(req.Messages) != 1 {
+			t.Fatalf("upstream messages len = %d, want 1", len(req.Messages))
+		}
+		capturedPrompt = req.Messages[0].Content
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, marshalSSEContent(t, "纯文本结果"))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"只回答结果","stream":false,"tool_choice":"none","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	for _, unwanted := range []string{
+		"<AVAILABLE_TOOLS>",
+		"exec_command",
+		"<<<AI_ACTIONS_V1>>>",
+		`{"mode":"tool","calls":[`,
+	} {
+		if strings.Contains(capturedPrompt, unwanted) {
+			t.Fatalf("responses upstream prompt should not expose tools when tool_choice=none, found %q:\n%s", unwanted, capturedPrompt)
+		}
+	}
+	if !strings.Contains(capturedPrompt, "Do not call any tools. Answer with plain text only.") {
+		t.Fatalf("responses upstream prompt missing tool_choice=none guidance:\n%s", capturedPrompt)
+	}
+}
+
+func TestExtractAIActionsBlock_RejectsTrailingContentAfterMarker(t *testing.T) {
+	_, found := extractAIActionsBlock("ok\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>\nextra")
+	if found {
+		t.Fatal("expected trailing content after end marker to disable block parsing")
+	}
+}
+
+func TestHandleResponses_NonStreamAIActionsBlock_FinalModeStripsControlBlock(t *testing.T) {
+	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, marshalSSEContent(t, content))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"只回答结果","stream":false,"tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Output) != 1 {
+		t.Fatalf("output len = %d, want 1", len(resp.Output))
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if got := item.Content[0].Text; got != "这是最终文本。" {
+		t.Fatalf("final text = %q, want stripped text", got)
+	}
+}
+
+func TestHandleResponses_NonStreamAIActionsBlock_RequiredToolRejectsFinalMode(t *testing.T) {
+	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, marshalSSEContent(t, content))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"必须用工具","stream":false,"tool_choice":"required","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if !strings.Contains(item.Content[0].Text, "Codex adapter error: tool_choice requires a tool call") {
+		t.Fatalf("expected explicit required-tool error, got %q", item.Content[0].Text)
+	}
+}
+
+func TestHandleResponses_NonStreamAIActionsBlock_ParallelToolCallsFalseRejectsMultipleCalls(t *testing.T) {
+	content := "先做两步。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}},{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"ls\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, marshalSSEContent(t, content))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"最多一个工具","stream":false,"parallel_tool_calls":false,"tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if !strings.Contains(item.Content[0].Text, "at most 1 call") {
+		t.Fatalf("expected parallel limit error, got %q", item.Content[0].Text)
+	}
+}
+
+func TestHandleChatCompletions_NonStreamAIActionsBlock_RequiredToolRejectsFinalMode(t *testing.T) {
+	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(marshalSSEContent(t, content)))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{
+		"model":"deepseek-v3p2",
+		"stream":false,
+		"tool_choice":"required",
+		"messages":[{"role":"user","content":"必须调用工具"}],
+		"tools":[{"type":"function","function":{"name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := resp.Choices[0].FinishReason; got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop", got)
+	}
+	if !strings.Contains(resp.Choices[0].Message.Content, "Codex adapter error: tool_choice requires a tool call") {
+		t.Fatalf("expected explicit required-tool error, got %q", resp.Choices[0].Message.Content)
+	}
+}
+
+func TestHandleChatCompletions_ToolChoiceRequiredWithoutToolsRejected(t *testing.T) {
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, "http://127.0.0.1:1")
+	mux := newTestMux(t, p, "*")
+
+	body := `{
+		"model":"deepseek-v3p2",
+		"stream":false,
+		"tool_choice":"required",
+		"messages":[{"role":"user","content":"必须调用工具"}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tool_choice requires at least one declared tool") {
+		t.Fatalf("expected explicit tool-choice validation error, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleResponses_StreamAIActionsBlock_RequiredToolRejectsFinalMode(t *testing.T) {
+	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, marshalSSEContent(t, content))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"必须调用工具","stream":true,"tool_choice":"required","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_item.added",
+		"event: response.output_item.done",
+		"event: response.completed",
+		"Codex adapter error: tool_choice requires a tool call",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Index(bodyText, "event: response.output_item.added") > strings.Index(bodyText, "event: response.output_item.done") {
+		t.Fatalf("response.output_item.added should appear before done on fallback path:\n%s", bodyText)
+	}
+	if strings.Contains(bodyText, `"type":"function_call"`) {
+		t.Fatalf("required-tool error path should not emit function_call item:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_ToolChoiceRequiredWithoutToolsRejected(t *testing.T) {
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, "http://127.0.0.1:1")
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"必须调用工具","stream":false,"tool_choice":"required"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "tool_choice requires at least one declared tool") {
+		t.Fatalf("expected explicit tool-choice validation error, got %s", rec.Body.String())
+	}
+}
+
+func TestHandleResponses_StreamAIActionsBlock_ParallelToolCallsFalseRejectsMultipleCalls(t *testing.T) {
+	content := "先做两步。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}},{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"ls\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, marshalSSEContent(t, content))
+		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"最多一个工具","stream":true,"parallel_tool_calls":false,"tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_item.done",
+		"event: response.completed",
+		"Codex adapter error: tool protocol allows at most 1 call",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Contains(bodyText, `"type":"function_call"`) {
+		t.Fatalf("parallel-tool limit error path should not emit function_call item:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_StreamAIActionsBlock_RequiredToolRejectsFinalModeWithoutDoneStillEmitsAdded(t *testing.T) {
+	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, marshalSSEContent(t, content))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","input":"必须调用工具","stream":true,"tool_choice":"required","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_item.added",
+		"event: response.output_text.done",
+		"event: response.output_item.done",
+		"event: response.completed",
+		"Codex adapter error: tool_choice requires a tool call",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Index(bodyText, "event: response.output_item.added") > strings.Index(bodyText, "event: response.output_item.done") {
+		t.Fatalf("response.output_item.added should appear before done on no-done fallback path:\n%s", bodyText)
+	}
+}
