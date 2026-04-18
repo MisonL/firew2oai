@@ -821,6 +821,258 @@ func buildHistoryItems(baseHistory, requestItems, outputItems []json.RawMessage)
 	return history
 }
 
+type executionEvidence struct {
+	Commands []string
+	Outputs  []string
+}
+
+func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
+	if len(historyItems) == 0 {
+		return executionEvidence{}
+	}
+
+	callIDToCommand := make(map[string]string, 8)
+	commands := make([]string, 0, 8)
+	outputs := make([]string, 0, 8)
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+
+		itemType, _ := item["type"].(string)
+		switch itemType {
+		case "function_call":
+			name, _ := item["name"].(string)
+			normalizedName := normalizeToolName(name)
+			if normalizedName != "exec_command" {
+				continue
+			}
+			command := extractExecCommandFromFunctionCall(item, normalizedName)
+			if command == "" {
+				continue
+			}
+			commands = append(commands, command)
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToCommand[callID] = command
+			}
+		case "custom_tool_call":
+			name, _ := item["name"].(string)
+			normalizedName := normalizeToolName(name)
+			if normalizedName != "exec_command" {
+				continue
+			}
+			input, _ := item["input"].(string)
+			command := strings.TrimSpace(input)
+			if command == "" {
+				continue
+			}
+			commands = append(commands, command)
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToCommand[callID] = command
+			}
+		case "function_call_output", "custom_tool_call_output":
+			callID, _ := item["call_id"].(string)
+			command := strings.TrimSpace(callIDToCommand[callID])
+			text, success := extractToolOutputText(item["output"])
+			if strings.TrimSpace(text) == "" {
+				if encoded, err := json.Marshal(item["output"]); err == nil {
+					text = string(encoded)
+				}
+			}
+			text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+			if text == "" {
+				continue
+			}
+			var summary strings.Builder
+			if command != "" {
+				summary.WriteString(command)
+				summary.WriteString(" => ")
+			}
+			if success != nil {
+				if *success {
+					summary.WriteString("success=true ")
+				} else {
+					summary.WriteString("success=false ")
+				}
+			}
+			summary.WriteString(truncateString(text, 180))
+			outputs = append(outputs, summary.String())
+		}
+	}
+
+	commands = dedupePreserveOrder(commands)
+	outputs = dedupePreserveOrder(outputs)
+	if len(commands) > 6 {
+		commands = append([]string(nil), commands[len(commands)-6:]...)
+	}
+	if len(outputs) > 6 {
+		outputs = append([]string(nil), outputs[len(outputs)-6:]...)
+	}
+	return executionEvidence{
+		Commands: commands,
+		Outputs:  outputs,
+	}
+}
+
+func buildExecutionEvidencePromptBlock(evidence executionEvidence) string {
+	if len(evidence.Commands) == 0 && len(evidence.Outputs) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n<EXECUTION_EVIDENCE>\n")
+	if len(evidence.Commands) > 0 {
+		b.WriteString("Recent executed commands:\n")
+		for _, command := range evidence.Commands {
+			b.WriteString("- ")
+			b.WriteString(command)
+			b.WriteByte('\n')
+		}
+	}
+	if len(evidence.Outputs) > 0 {
+		b.WriteString("Recent tool outputs (truncated):\n")
+		for _, output := range evidence.Outputs {
+			b.WriteString("- ")
+			b.WriteString(output)
+			b.WriteByte('\n')
+		}
+	}
+	b.WriteString("Use this evidence when deciding RESULT/TEST claims and avoid repeating completed commands.\n")
+	b.WriteString("</EXECUTION_EVIDENCE>\n")
+	return b.String()
+}
+
+func enforceTaskOutputConstraints(task, text string, evidence executionEvidence, checkControlMarkup bool) (string, error) {
+	trimmed := strings.TrimSpace(text)
+	requiredLabels := dedupePreserveOrder(extractRequiredOutputLabels(task))
+	if trimmed == "" {
+		if len(requiredLabels) > 0 {
+			executed := "none"
+			if len(evidence.Commands) > 0 {
+				executed = strings.Join(evidence.Commands, ", ")
+			}
+			return "", fmt.Errorf("final output missing required labels: %s; executed commands: %s", strings.Join(requiredLabels, ", "), executed)
+		}
+		return trimmed, nil
+	}
+
+	if strings.HasPrefix(trimmed, "Codex adapter error:") {
+		return trimmed, nil
+	}
+
+	if checkControlMarkup {
+		if marker, found := detectLeakedToolControlMarkup(trimmed); found {
+			return "", fmt.Errorf("model leaked unsupported tool-control markup %q in final text", marker)
+		}
+	}
+
+	if len(requiredLabels) == 0 {
+		return trimmed, nil
+	}
+
+	normalized, missing := normalizeRequiredLabelOutput(trimmed, requiredLabels)
+	if len(missing) == 0 {
+		return normalized, nil
+	}
+
+	executed := "none"
+	if len(evidence.Commands) > 0 {
+		executed = strings.Join(evidence.Commands, ", ")
+	}
+	return "", fmt.Errorf("final output missing required labels: %s; executed commands: %s", strings.Join(missing, ", "), executed)
+}
+
+func normalizeRequiredLabelOutput(text string, labels []string) (string, []string) {
+	lines := strings.Split(text, "\n")
+	found := make(map[string]string, len(labels))
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		line = strings.TrimSpace(taskBulletPrefixPattern.ReplaceAllString(line, ""))
+		for _, label := range labels {
+			prefix := label + ":"
+			if !strings.HasPrefix(line, prefix) {
+				continue
+			}
+			if _, exists := found[label]; exists {
+				break
+			}
+			value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if value == "" {
+				found[label] = prefix
+			} else {
+				found[label] = prefix + " " + value
+			}
+			break
+		}
+	}
+
+	missing := make([]string, 0, len(labels))
+	ordered := make([]string, 0, len(labels))
+	for _, label := range labels {
+		value, ok := found[label]
+		if !ok {
+			missing = append(missing, label)
+			continue
+		}
+		ordered = append(ordered, value)
+	}
+	if len(missing) > 0 {
+		return "", missing
+	}
+	return strings.Join(ordered, "\n"), nil
+}
+
+func detectLeakedToolControlMarkup(text string) (string, bool) {
+	lower := strings.ToLower(text)
+	markers := []string{
+		"<<<ai_actions_v1",
+		"</ai_actions>",
+		"<function_call",
+		"</function_call>",
+		"<function_calls",
+		"</function_calls>",
+		"<invoke",
+		"</invoke>",
+		"<tool_call",
+		"</tool_call>",
+		"<tool_calls",
+		"</tool_calls>",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return marker, true
+		}
+	}
+	return "", false
+}
+
+func constrainFinalText(task, text string, evidence executionEvidence, checkControlMarkup bool) string {
+	constrained, err := enforceTaskOutputConstraints(task, text, evidence, checkControlMarkup)
+	if err != nil {
+		return "Codex adapter error: " + err.Error()
+	}
+	return constrained
+}
+
+func shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted bool, resultLen int, scanErr error, attempt int, clientGone bool) bool {
+	if attempt > 0 {
+		return false
+	}
+	if clientGone || errors.Is(scanErr, context.Canceled) {
+		return false
+	}
+	return !doneReceived && !contentEmitted && resultLen == 0
+}
+
 func estimateResponseUsage(inputItems, outputItems []json.RawMessage) *ResponseUsage {
 	inputTokens := estimateMessagesTokenCount(rawItemsToMessages(inputItems))
 	outputTokens := estimateMessagesTokenCount(rawItemsToMessages(outputItems))
@@ -1136,6 +1388,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	currentTask := latestActionableUserTask(promptMessages)
 	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
 	policyHistoryItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
+	executionEvidence := buildExecutionEvidence(policyHistoryItems)
 	executionPolicy := buildExecutionPolicy(req.Model, currentTask, policyHistoryItems, len(toolCatalog) > 0, toolChoice.DisableTools, autoRequireTool)
 	disableToolsForFinalize := shouldDisableToolsForExecutionFinalize(executionPolicy, toolChoice)
 	effectiveToolChoice := toolChoice
@@ -1149,6 +1402,9 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, promptTools, maxToolCalls)
 	if policyBlock := buildExecutionPolicyPromptBlock(executionPolicy); policyBlock != "" {
 		prompt += policyBlock
+	}
+	if evidenceBlock := buildExecutionEvidencePromptBlock(executionEvidence); evidenceBlock != "" {
+		prompt += evidenceBlock
 	}
 	toolConstraints := toolProtocolConstraints{
 		RequiredTool:       toolChoice.RequiredTool,
@@ -1199,10 +1455,10 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	)
 
 	if req.Stream {
-		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy)
+		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 		return
 	}
-	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy)
+	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 }
 
 func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
@@ -1238,7 +1494,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry.response)
 }
 
-func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy) {
+func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -1247,13 +1503,16 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		authToken = auth[7:]
 	}
 
-	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	openReader := func() (io.ReadCloser, error) {
+		return p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	}
+
+	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream responses stream error", "response_id", responseID, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error")
 		return
 	}
-	defer reader.Close()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -1289,65 +1548,83 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	isThinking := config.IsThinkingModel(model)
 	var result strings.Builder
 	doneReceived := false
-	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
-		switch evt.Type {
-		case "done":
-			doneReceived = true
-			finalText := result.String()
-			if bufferForToolCalls {
-				parseResult := parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints)
-				parseResult = applyExecutionPolicyToParseResult(parseResult, executionPolicy, toolCatalog, toolConstraints)
-				slog.Info("tool protocol outcome",
-					"api", "responses",
-					"response_id", responseID,
-					"mode", parseResult.mode,
-					"tool_calls", len(parseResult.calls),
-					"required_tool", toolConstraints.RequiredTool,
-					"require_tool", toolConstraints.RequireTool,
-					"max_tool_calls", toolConstraints.MaxCalls,
-					"execution_stage", executionPolicy.Stage,
-					"execution_read_loop", executionPolicy.ReadLoop,
-					"execution_next_command", executionPolicy.NextCommand,
-					"error", toolProtocolErrorString(parseResult.err),
-				)
-				if parseResult.err == nil && len(parseResult.calls) > 0 {
-					outputItems := buildParsedToolOutputItems(parseResult.calls)
+	contentEmitted := false
+	var scanErr error
+	attempt := 0
+	for {
+		doneReceived = false
+		contentEmitted, scanErr = scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+			switch evt.Type {
+			case "done":
+				doneReceived = true
+				finalText := result.String()
+				if bufferForToolCalls {
+					parseResult := parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints)
+					parseResult = applyExecutionPolicyToParseResult(parseResult, executionPolicy, toolCatalog, toolConstraints)
+					slog.Info("tool protocol outcome",
+						"api", "responses",
+						"response_id", responseID,
+						"mode", parseResult.mode,
+						"tool_calls", len(parseResult.calls),
+						"required_tool", toolConstraints.RequiredTool,
+						"require_tool", toolConstraints.RequireTool,
+						"max_tool_calls", toolConstraints.MaxCalls,
+						"execution_stage", executionPolicy.Stage,
+						"execution_read_loop", executionPolicy.ReadLoop,
+						"execution_next_command", executionPolicy.NextCommand,
+						"error", toolProtocolErrorString(parseResult.err),
+					)
+					if parseResult.err == nil && len(parseResult.calls) > 0 {
+						outputItems := buildParsedToolOutputItems(parseResult.calls)
+						completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+						for index, item := range outputItems {
+							if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+								Type:        "response.output_item.added",
+								ResponseID:  responseID,
+								OutputIndex: index,
+								Item:        item,
+							}) {
+								return false
+							}
+						}
+						for index, item := range outputItems {
+							if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+								Type:        "response.output_item.done",
+								ResponseID:  responseID,
+								OutputIndex: index,
+								Item:        item,
+							}) {
+								return false
+							}
+						}
+						if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+							return false
+						}
+						p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+						return true
+					}
+					if parseResult.err != nil {
+						finalText = buildToolProtocolErrorMessage(parseResult.err, finalText)
+					} else {
+						finalText = parseResult.visibleText
+					}
+					finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
+					outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
+					if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
+						return false
+					}
+					if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
+						return false
+					}
 					completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-					for index, item := range outputItems {
-						if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
-							Type:        "response.output_item.added",
-							ResponseID:  responseID,
-							OutputIndex: index,
-							Item:        item,
-						}) {
-							return false
-						}
-					}
-					for index, item := range outputItems {
-						if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
-							Type:        "response.output_item.done",
-							ResponseID:  responseID,
-							OutputIndex: index,
-							Item:        item,
-						}) {
-							return false
-						}
-					}
 					if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 						return false
 					}
 					p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 					return true
 				}
-				if parseResult.err != nil {
-					finalText = buildToolProtocolErrorMessage(parseResult.err, finalText)
-				} else {
-					finalText = parseResult.visibleText
-				}
+				finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 				outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
-				if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
-					return false
-				}
 				if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
 					return false
 				}
@@ -1357,39 +1634,42 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				}
 				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 				return true
+			case "thinking_separator":
+				fallthrough
+			case "content":
+				delta := evt.Content
+				if evt.Type == "thinking_separator" {
+					delta = "\n\n--- Answer ---\n\n"
+				}
+				result.WriteString(delta)
+				if bufferForToolCalls {
+					return true
+				}
+				return writeAndFlushEvent("response.output_text.delta", ResponseOutputTextDeltaEvent{
+					Type:         "response.output_text.delta",
+					ResponseID:   responseID,
+					ItemID:       messageID,
+					OutputIndex:  0,
+					ContentIndex: 0,
+					Delta:        delta,
+				})
 			}
-			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
-			if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
-				return false
-			}
-			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-			if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
-				return false
-			}
-			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			return true
-		case "thinking_separator":
-			fallthrough
-		case "content":
-			delta := evt.Content
-			if evt.Type == "thinking_separator" {
-				delta = "\n\n--- Answer ---\n\n"
+		})
+		_ = reader.Close()
+
+		if shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted, result.Len(), scanErr, attempt, clientGone) {
+			attempt++
+			slog.Warn("responses stream empty attempt, retrying once", "response_id", responseID, "attempt", attempt, "error", scanErr)
+			reader, err = openReader()
+			if err != nil {
+				scanErr = err
+				break
 			}
-			result.WriteString(delta)
-			if bufferForToolCalls {
-				return true
-			}
-			return writeAndFlushEvent("response.output_text.delta", ResponseOutputTextDeltaEvent{
-				Type:         "response.output_text.delta",
-				ResponseID:   responseID,
-				ItemID:       messageID,
-				OutputIndex:  0,
-				ContentIndex: 0,
-				Delta:        delta,
-			})
+			continue
 		}
-		return true
-	})
+		break
+	}
 
 	// If no done event but content was emitted, send completion events
 	if !doneReceived && (contentEmitted || result.Len() > 0) {
@@ -1437,6 +1717,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			} else {
 				finalText = parseResult.visibleText
 			}
+			finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
 			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 			writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID)
@@ -1445,6 +1726,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			return
 		}
+		finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 		outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
 		writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
 		completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
@@ -1481,7 +1763,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy) {
+func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.transport.Timeout())
 	defer cancel()
 
@@ -1491,29 +1773,50 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		authToken = auth[7:]
 	}
 
-	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	openReader := func() (io.ReadCloser, error) {
+		return p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	}
+
+	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream responses non-stream error", "response_id", responseID, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error")
 		return
 	}
-	defer reader.Close()
 
 	var result strings.Builder
 	isThinking := config.IsThinkingModel(model)
 	doneReceived := false
+	contentEmitted := false
+	var scanErr error
+	attempt := 0
+	for {
+		doneReceived = false
+		contentEmitted, scanErr = scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+			switch evt.Type {
+			case "done":
+				doneReceived = true
+			case "thinking_separator":
+				result.WriteString("\n\n--- Answer ---\n\n")
+			case "content":
+				result.WriteString(evt.Content)
+			}
+			return true
+		})
+		_ = reader.Close()
 
-	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
-		switch evt.Type {
-		case "done":
-			doneReceived = true
-		case "thinking_separator":
-			result.WriteString("\n\n--- Answer ---\n\n")
-		case "content":
-			result.WriteString(evt.Content)
+		if shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted, result.Len(), scanErr, attempt, false) {
+			attempt++
+			slog.Warn("responses non-stream empty attempt, retrying once", "response_id", responseID, "attempt", attempt, "error", scanErr)
+			reader, err = openReader()
+			if err != nil {
+				scanErr = err
+				break
+			}
+			continue
 		}
-		return true
-	})
+		break
+	}
 
 	if scanErr != nil {
 		if errors.Is(scanErr, context.Canceled) {
@@ -1568,6 +1871,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 			finalText = parseResult.visibleText
 		}
 	}
+	finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 
 	outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
 	completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)

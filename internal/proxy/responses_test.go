@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -591,5 +592,251 @@ func TestHandleResponses_PreviousResponseIDWithToolOutput(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("second prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestBuildExecutionEvidencePromptBlock_FromHistoryItems(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_1","arguments":"{\"cmd\":\"go test ./internal/proxy\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_1","output":{"content":"ok","success":true}}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	block := buildExecutionEvidencePromptBlock(evidence)
+	for _, want := range []string{
+		"<EXECUTION_EVIDENCE>",
+		"go test ./internal/proxy",
+		"success=true ok",
+	} {
+		if !strings.Contains(block, want) {
+			t.Fatalf("evidence block missing %q:\n%s", want, block)
+		}
+	}
+}
+
+func TestHandleResponses_StreamEmptyUpstreamRetriesOnce(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&attempts, 1)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		if current == 1 {
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"retry-ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","input":"hello","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", attempts)
+	}
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		`"delta":"retry-ok"`,
+		`"text":"retry-ok"`,
+		"event: response.completed",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Contains(bodyText, "upstream response ended without a completion signal") {
+		t.Fatalf("stream body should not return empty-stream terminal error after retry:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_NonStreamEmptyUpstreamRetriesOnce(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if current == 1 {
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"retry-ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","input":"say ok","stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 2 {
+		t.Fatalf("upstream attempts = %d, want 2", attempts)
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if got := item.Content[0].Text; got != "retry-ok" {
+		t.Fatalf("final text = %q, want retry-ok", got)
+	}
+}
+
+func TestHandleResponses_NonStreamRequiredLabelsNormalized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"好的，结果如下。\\n- RESULT: PASS\\nREADME: # firew2oai\\nTOOLP: go test ./internal/proxy ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"你在真实 Go 项目中执行任务。最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	want := "RESULT: PASS\nREADME: # firew2oai\nTOOLP: go test ./internal/proxy ok"
+	if item.Content[0].Text != want {
+		t.Fatalf("final text = %q, want %q", item.Content[0].Text, want)
+	}
+}
+
+func TestHandleResponses_NonStreamRequiredLabelsMissingReturnsAdapterError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"RESULT: PASS\\nREADME: # firew2oai\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"执行任务后最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if !strings.Contains(item.Content[0].Text, "Codex adapter error: final output missing required labels: TOOLP") {
+		t.Fatalf("expected missing-label adapter error, got %q", item.Content[0].Text)
+	}
+}
+
+func TestHandleResponses_NonStreamRequiredLabelsEmptyReturnsAdapterError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"执行任务后最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	if !strings.Contains(item.Content[0].Text, "Codex adapter error: final output missing required labels: RESULT, README, TOOLP") {
+		t.Fatalf("expected empty-output adapter error, got %q", item.Content[0].Text)
+	}
+}
+
+func TestHandleResponses_NonStreamLeakedControlMarkupReturnsAdapterError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"分析完成。\\n<function_calls><call name=\\\"exec_command\\\" /></function_calls>\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"只回答结果","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	text := item.Content[0].Text
+	if !strings.Contains(text, "Codex adapter error: model leaked unsupported tool-control markup") {
+		t.Fatalf("expected control markup error, got %q", text)
+	}
+	if strings.Contains(text, "<function_calls>") {
+		t.Fatalf("final text should not leak control markup, got %q", text)
 	}
 }
