@@ -446,6 +446,44 @@ func TestHandleResponses_Stream(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_StreamEmptyUpstreamEmitsCompletedError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","input":"hello","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_text.done",
+		"event: response.output_item.done",
+		"event: response.completed",
+		"Codex adapter error: upstream response ended without a completion signal",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+}
+
 func TestHandleResponses_StreamFunctionToolCall(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

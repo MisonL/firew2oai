@@ -46,16 +46,34 @@ type SSEEvent struct {
 // ─── OpenAI Request / Response Types ──────────────────────────────────────
 
 type ChatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string         `json:"role"`
+	Content    string         `json:"content"`
+	Name       *string        `json:"name,omitempty"`
+	ToolCallID string         `json:"tool_call_id,omitempty"`
+	ToolCalls  []ChatToolCall `json:"tool_calls,omitempty"`
+}
+
+type ChatToolCall struct {
+	Index    *int             `json:"index,omitempty"`
+	ID       string           `json:"id,omitempty"`
+	Type     string           `json:"type"`
+	Function ChatToolFunction `json:"function,omitempty"`
+}
+
+type ChatToolFunction struct {
+	Name      string `json:"name,omitempty"`
+	Arguments string `json:"arguments,omitempty"`
 }
 
 type ChatCompletionRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Stream      bool          `json:"stream,omitempty"`
-	Temperature *float64      `json:"temperature,omitempty"`
-	MaxTokens   *int          `json:"max_tokens,omitempty"`
+	Model             string          `json:"model"`
+	Messages          []ChatMessage   `json:"messages"`
+	Stream            bool            `json:"stream,omitempty"`
+	Temperature       *float64        `json:"temperature,omitempty"`
+	MaxTokens         *int            `json:"max_tokens,omitempty"`
+	Tools             json.RawMessage `json:"tools,omitempty"`
+	ToolChoice        json.RawMessage `json:"tool_choice,omitempty"`
+	ParallelToolCalls *bool           `json:"parallel_tool_calls,omitempty"`
 	// Custom extension: show thinking process for thinking models
 	ShowThinking *bool `json:"show_thinking,omitempty"`
 }
@@ -82,8 +100,9 @@ type ChatCompletionResponse struct {
 }
 
 type StreamDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string         `json:"role,omitempty"`
+	Content   string         `json:"content,omitempty"`
+	ToolCalls []ChatToolCall `json:"tool_calls,omitempty"`
 }
 
 type StreamChoice struct {
@@ -275,7 +294,32 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if req.ShowThinking != nil {
 		showThinking = *req.ShowThinking
 	}
+	allowParallelToolCalls := req.ParallelToolCalls == nil || *req.ParallelToolCalls
+	maxToolCalls := 0
+	if !allowParallelToolCalls {
+		maxToolCalls = 1
+	}
+	normalizedTools := normalizeChatTools(req.Tools)
+	normalizedToolChoice := normalizeChatToolChoice(req.ToolChoice)
+	toolCatalog := buildResponseToolCatalog(normalizedTools)
+	toolChoice := resolveToolChoice(normalizedToolChoice)
+	if err := validateToolChoiceConfiguration(toolChoice, toolCatalog); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", "%s", err.Error())
+		return
+	}
+	currentTask := latestUserTask(req.Messages)
+	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
+	toolConstraints := toolProtocolConstraints{
+		RequiredTool: toolChoice.RequiredTool,
+		RequireTool:  toolChoice.RequireTool,
+		MaxCalls:     maxToolCalls,
+	}
+	bufferForToolCalls := len(toolCatalog) > 0 && !toolChoice.DisableTools
+	promptTools := toolsForPrompt(normalizedTools, toolChoice)
 	prompt := messagesToPrompt(req.Messages)
+	if len(promptTools) > 0 || len(normalizedToolChoice) > 0 {
+		prompt = buildChatPrompt(req.Messages, promptTools, normalizedToolChoice, maxToolCalls)
+	}
 
 	slog.Info("chat completion request",
 		"request_id", requestID,
@@ -283,6 +327,11 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"stream", req.Stream,
 		"messages", len(req.Messages),
 		"thinking", showThinking,
+		"tools_present", bufferForToolCalls,
+		"required_tool", toolConstraints.RequiredTool,
+		"require_tool", toolConstraints.RequireTool,
+		"auto_require_tool", autoRequireTool,
+		"max_tool_calls", toolConstraints.MaxCalls,
 	)
 
 	// Build Fireworks request body
@@ -305,16 +354,16 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		p.handleStream(w, r, requestID, req.Model, bodyBytes, showThinking)
+		p.handleStream(w, r, requestID, req.Model, bodyBytes, showThinking, toolCatalog, toolConstraints, bufferForToolCalls)
 	} else {
-		p.handleNonStream(w, r, requestID, req.Model, bodyBytes, showThinking)
+		p.handleNonStream(w, r, requestID, req.Model, bodyBytes, showThinking, toolCatalog, toolConstraints, bufferForToolCalls)
 	}
 }
 
 // ─── Streaming Handler ────────────────────────────────────────────────────
 
 // handleStream converts Fireworks SSE events to OpenAI streaming format.
-func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool) {
+func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -390,30 +439,18 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 
 	isThinking := config.IsThinkingModel(model)
 	doneReceived := false
+	var result strings.Builder
 	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
 		switch evt.Type {
 		case "done":
 			doneReceived = true
-			stop := "stop"
-			chunk := StreamChunk{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []StreamChoice{
-					{Index: 0, Delta: StreamDelta{}, FinishReason: &stop},
-				},
-			}
-			if !writeAndFlushChunk(chunk) {
-				return false
-			}
-			if !writeAndFlushBytes([]byte("data: [DONE]\n\n")) {
-				return false
-			}
-			slog.Debug("stream completed", "request_id", requestID)
-			return true
+			return finalizeChatStream(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, result.String(), toolCatalog, toolConstraints, bufferForToolCalls)
 
 		case "thinking_separator":
+			if bufferForToolCalls {
+				result.WriteString("\n\n--- Answer ---\n\n")
+				return true
+			}
 			chunk := StreamChunk{
 				ID:      requestID,
 				Object:  "chat.completion.chunk",
@@ -426,6 +463,10 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 			return writeAndFlushChunk(chunk)
 
 		case "content":
+			if bufferForToolCalls {
+				result.WriteString(evt.Content)
+				return true
+			}
 			chunk := StreamChunk{
 				ID:      requestID,
 				Object:  "chat.completion.chunk",
@@ -443,18 +484,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	// If no done event but content was emitted, send completion markers
 	if !doneReceived && contentEmitted {
 		slog.Debug("stream ended without done event but content available, sending completion markers", "request_id", requestID)
-		stop := "stop"
-		chunk := StreamChunk{
-			ID:      requestID,
-			Object:  "chat.completion.chunk",
-			Created: created,
-			Model:   model,
-			Choices: []StreamChoice{
-				{Index: 0, Delta: StreamDelta{}, FinishReason: &stop},
-			},
-		}
-		writeAndFlushChunk(chunk)
-		writeAndFlushBytes([]byte("data: [DONE]\n\n"))
+		finalizeChatStream(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, result.String(), toolCatalog, toolConstraints, bufferForToolCalls)
 	}
 
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) {
@@ -462,11 +492,107 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	}
 }
 
+func finalizeChatStream(
+	writeChunk func(StreamChunk) bool,
+	writeDone func([]byte) bool,
+	requestID, model string,
+	created int64,
+	finalText string,
+	toolCatalog map[string]responseToolDescriptor,
+	toolConstraints toolProtocolConstraints,
+	bufferForToolCalls bool,
+) bool {
+	if bufferForToolCalls {
+		calls, visibleText, parseErr := parseChatToolCallOutput(finalText, toolCatalog, toolConstraints)
+		slog.Info("tool protocol outcome",
+			"api", "chat",
+			"request_id", requestID,
+			"mode", parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints).mode,
+			"tool_calls", len(calls),
+			"required_tool", toolConstraints.RequiredTool,
+			"require_tool", toolConstraints.RequireTool,
+			"max_tool_calls", toolConstraints.MaxCalls,
+			"error", toolProtocolErrorString(parseErr),
+		)
+		if len(calls) > 0 {
+			for i := range calls {
+				callIndex := i
+				calls[i].Index = &callIndex
+			}
+			chunk := StreamChunk{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []StreamChoice{
+					{
+						Index:        0,
+						Delta:        StreamDelta{ToolCalls: calls},
+						FinishReason: nil,
+					},
+				},
+			}
+			if !writeChunk(chunk) {
+				return false
+			}
+			reason := "tool_calls"
+			stopChunk := StreamChunk{
+				ID:      requestID,
+				Object:  "chat.completion.chunk",
+				Created: created,
+				Model:   model,
+				Choices: []StreamChoice{
+					{Index: 0, Delta: StreamDelta{}, FinishReason: &reason},
+				},
+			}
+			if !writeChunk(stopChunk) {
+				return false
+			}
+			return writeDone([]byte("data: [DONE]\n\n"))
+		}
+		if parseErr != nil {
+			finalText = buildToolProtocolErrorMessage(parseErr, finalText)
+		} else {
+			finalText = visibleText
+		}
+	}
+
+	if strings.TrimSpace(finalText) != "" {
+		chunk := StreamChunk{
+			ID:      requestID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []StreamChoice{
+				{Index: 0, Delta: StreamDelta{Content: finalText}, FinishReason: nil},
+			},
+		}
+		if !writeChunk(chunk) {
+			return false
+		}
+	}
+
+	reason := "stop"
+	stopChunk := StreamChunk{
+		ID:      requestID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []StreamChoice{
+			{Index: 0, Delta: StreamDelta{}, FinishReason: &reason},
+		},
+	}
+	if !writeChunk(stopChunk) {
+		return false
+	}
+	return writeDone([]byte("data: [DONE]\n\n"))
+}
+
 // ─── Non-Streaming Handler ────────────────────────────────────────────────
 
 // handleNonStream collects the full response from Fireworks and returns it
 // in OpenAI non-streaming format.
-func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool) {
+func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool) {
 	ctx := r.Context()
 
 	// For non-streaming requests, apply an overall timeout to prevent
@@ -540,6 +666,51 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 
 	if !doneReceived {
 		slog.Debug("stream ended without done event but content available, treating as success", "request_id", requestID, "result_len", result.Len())
+	}
+
+	if bufferForToolCalls {
+		assistantText := result.String()
+		parseResult := parseToolCallOutputsWithConstraints(assistantText, toolCatalog, toolConstraints)
+		calls, visibleText, parseErr := parseChatToolCallOutput(assistantText, toolCatalog, toolConstraints)
+		slog.Info("tool protocol outcome",
+			"api", "chat",
+			"request_id", requestID,
+			"mode", parseResult.mode,
+			"tool_calls", len(parseResult.calls),
+			"required_tool", toolConstraints.RequiredTool,
+			"require_tool", toolConstraints.RequireTool,
+			"max_tool_calls", toolConstraints.MaxCalls,
+			"error", toolProtocolErrorString(parseErr),
+		)
+		if len(calls) > 0 {
+			resp := ChatCompletionResponse{
+				ID:      requestID,
+				Object:  "chat.completion",
+				Created: time.Now().Unix(),
+				Model:   model,
+				Choices: []ChatCompletionChoice{
+					{
+						Index: 0,
+						Message: ChatMessage{
+							Role:      "assistant",
+							Content:   "",
+							ToolCalls: calls,
+						},
+						FinishReason: "tool_calls",
+					},
+				},
+				Usage: Usage{},
+			}
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+		if parseErr != nil {
+			result.Reset()
+			result.WriteString(buildToolProtocolErrorMessage(parseErr, assistantText))
+		} else {
+			result.Reset()
+			result.WriteString(visibleText)
+		}
 	}
 
 	resp := ChatCompletionResponse{

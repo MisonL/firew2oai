@@ -26,3 +26,13 @@
 
 ## Security & Configuration Tips
 不要提交真实 API Key、令牌 JSON 或本地私密配置。开发环境优先使用 `API_KEY`、`PORT`、`CORS_ORIGINS`、`IP_WHITELIST` 等环境变量。若为测试临时放宽 CORS 或 IP 白名单，必须在 PR 中说明，便于审查时确认不会误带到生产配置。
+
+## Codex Tooling Rules
+当通过 Codex 执行仓库任务时，必须优先遵守当前会话已声明的工具与 schema，不得臆造工具名。
+
+- 读取文件、搜索文本、查看目录时，只能使用已声明工具；若当前会话只有 `exec_command`，则统一通过 `exec_command` 执行 `sed`、`nl`、`rg`、`ls` 等只读命令。
+- 调用结构化工具时，只能输出单个 JSON 对象，不得混入解释文字、Markdown 代码块或连续多个 JSON 对象。
+- `exec_command` 必须使用结构化 `function_call` 形式，`arguments` 必须是 JSON 对象，且必须包含字符串字段 `cmd`。禁止改写为 `custom_tool_call`，禁止使用 `command`、`path`、`file_path` 等替代字段。
+- 禁止使用未声明工具名，例如 `read_file`、`Read`、`list_files`、`run_command`、`run_terminal_cmd`。如果需要这些能力，必须改写为当前会话内可用工具。
+- 收到工具错误或 `Codex adapter error` 后，先修正同一工具调用的名称和参数，再继续任务；不要向用户反问，不要把错误当成最终答案。
+- 在复杂任务中，先执行必要的只读工具调用获取证据，再输出结论；禁止编造文件内容、行号或审计结论。

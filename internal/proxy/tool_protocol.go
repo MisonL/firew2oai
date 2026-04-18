@@ -42,9 +42,10 @@ type parsedToolCallBatchResult struct {
 }
 
 type toolProtocolConstraints struct {
-	RequiredTool string
-	RequireTool  bool
-	MaxCalls     int
+	RequiredTool       string
+	RequireTool        bool
+	MaxCalls           int
+	AllowTruncateToMax bool
 }
 
 func buildParsedToolOutputItems(calls []parsedToolCall) []json.RawMessage {
@@ -206,6 +207,10 @@ func applyToolProtocolConstraints(result parsedToolCallBatchResult, constraints 
 		return result
 	}
 	if constraints.MaxCalls > 0 && len(result.calls) > constraints.MaxCalls {
+		if constraints.AllowTruncateToMax {
+			result.calls = append([]parsedToolCall(nil), result.calls[:constraints.MaxCalls]...)
+			return result
+		}
 		result.err = fmt.Errorf("tool protocol allows at most %d call(s), got %d", constraints.MaxCalls, len(result.calls))
 		return result
 	}
@@ -245,10 +250,25 @@ func parseLegacyToolCallOutput(text string, allowedTools map[string]responseTool
 }
 
 func parseLegacyToolCallOutputs(text string, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallBatchResult {
-	candidate := strings.TrimSpace(stripMarkdownCodeFence(text))
-	if start := strings.IndexByte(candidate, '{'); start >= 0 {
-		candidate = strings.TrimSpace(candidate[start:])
+	candidateSource := strings.TrimSpace(stripMarkdownCodeFence(text))
+	if candidateSource == "" {
+		return parsedToolCallBatchResult{
+			visibleText: text,
+			mode:        toolProtocolModePlainText,
+		}
 	}
+
+	start := strings.IndexByte(candidateSource, '{')
+	if start >= 0 {
+		if !legacyJSONPrefixLooksLikeToolOutput(candidateSource[:start]) {
+			return parsedToolCallBatchResult{
+				visibleText: text,
+				mode:        toolProtocolModePlainText,
+			}
+		}
+		candidateSource = strings.TrimSpace(candidateSource[start:])
+	}
+	candidate := candidateSource
 	if candidate == "" || !strings.HasPrefix(candidate, "{") {
 		return parsedToolCallBatchResult{
 			visibleText: text,
@@ -296,6 +316,28 @@ func parseLegacyToolCallOutputs(text string, allowedTools map[string]responseToo
 	return result
 }
 
+func legacyJSONPrefixLooksLikeToolOutput(prefix string) bool {
+	trimmed := strings.TrimSpace(prefix)
+	if trimmed == "" {
+		return true
+	}
+	// Allow short lead-in text such as "先做两步：" but avoid treating long prose/code as tool JSON.
+	if len(trimmed) > 120 {
+		return false
+	}
+	if strings.Count(trimmed, "\n") > 2 {
+		return false
+	}
+	if strings.Contains(trimmed, "```") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "function_call") || strings.Contains(lower, "tool_call") || strings.Contains(lower, "ai_actions") {
+		return true
+	}
+	return true
+}
+
 func decodeLegacyToolCallSequence(candidate string) ([]map[string]any, error) {
 	decoder := json.NewDecoder(strings.NewReader(candidate))
 	raws := make([]map[string]any, 0, 1)
@@ -332,6 +374,7 @@ func isIgnorableLegacyTail(tail string) bool {
 		"</tool_call>",
 		"</function>",
 		"</tool>",
+		"</ai_actions>",
 		"</think>",
 	}
 
@@ -406,7 +449,7 @@ func shellQuoteSingle(text string) string {
 }
 
 func buildReadFileCommand(path string) string {
-	return "sed -n '1,200p' -- " + shellQuoteSingle(path)
+	return "sed -n '1,200p' " + shellQuoteSingle(path)
 }
 
 func buildListFilesCommand(path string) string {

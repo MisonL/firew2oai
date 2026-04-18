@@ -131,21 +131,51 @@ func messagesToPrompt(messages []ChatMessage) string {
 		return ""
 	}
 
-	total := 0
-	for _, msg := range messages {
-		total += len(msg.Content) + len(rolePrefix(msg.Role)) + 1
-	}
-
 	var builder strings.Builder
-	builder.Grow(total)
-	for i, msg := range messages {
-		if i > 0 {
+	wrote := false
+	for _, msg := range messages {
+		content := promptMessageContent(msg)
+		keepEmpty := msg.Role != "tool" && len(msg.ToolCalls) == 0
+		if strings.TrimSpace(content) == "" && !keepEmpty {
+			continue
+		}
+		if wrote {
 			builder.WriteByte('\n')
 		}
 		builder.WriteString(rolePrefix(msg.Role))
-		builder.WriteString(msg.Content)
+		builder.WriteString(content)
+		wrote = true
 	}
 	return builder.String()
+}
+
+func promptMessageContent(msg ChatMessage) string {
+	var parts []string
+	if msg.Role != "tool" && strings.TrimSpace(msg.Content) != "" {
+		parts = append(parts, msg.Content)
+	}
+	if len(msg.ToolCalls) > 0 {
+		for _, call := range msg.ToolCalls {
+			parts = append(parts, formatToolCallSummary(call.Function.Name, call.ID, call.Function.Arguments))
+		}
+	}
+	if msg.Role == "tool" {
+		parts = append(parts, formatToolOutputSummary(msg.ToolCallID, nil, msg.Content))
+	}
+	return strings.Join(filterNonEmptyStrings(parts), "\n")
+}
+
+func filterNonEmptyStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	filtered := values[:0]
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			filtered = append(filtered, value)
+		}
+	}
+	return filtered
 }
 
 func rolePrefix(role string) string {
@@ -158,6 +188,8 @@ func rolePrefix(role string) string {
 		return "User: "
 	case "assistant":
 		return "Assistant: "
+	case "tool":
+		return "Tool: "
 	default:
 		return ""
 	}

@@ -526,8 +526,17 @@ func formatToolOutputSummary(callID string, success *bool, text string) string {
 }
 
 func buildResponsesPrompt(base []ChatMessage, instructions string, current []ChatMessage, tools json.RawMessage, maxToolCalls int) string {
-	contextMessages, currentTask := splitCurrentTurnMessages(current)
+	contextMessages, fallbackTask := splitCurrentTurnMessages(current)
+	combined := append(cloneMessages(base), current...)
+	currentTask := latestActionableUserTask(combined)
+	if currentTask == "" {
+		currentTask = fallbackTask
+	} else if strings.TrimSpace(fallbackTask) != "" && strings.TrimSpace(fallbackTask) != strings.TrimSpace(currentTask) {
+		// Keep tool-output user messages in turn context while retaining the original actionable task.
+		contextMessages = append(contextMessages, ChatMessage{Role: "user", Content: fallbackTask})
+	}
 	toolInstructions := summarizeResponsesTools(tools)
+	requiresToolLoop := toolInstructions != "" && taskLikelyNeedsTools(currentTask)
 
 	var builder strings.Builder
 	builder.Grow(4096)
@@ -536,8 +545,18 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 	builder.WriteString("Treat CURRENT_USER_TASK as the active task for this turn.\n")
 	builder.WriteString("Only CURRENT_USER_TASK is the target output. Never summarize repository guidelines or instruction blocks as the final answer.\n")
 	builder.WriteString("Execute the current task immediately. Do not say you are ready, waiting, or asking for a task.\n")
+	builder.WriteString("Never ask for additional task context when CURRENT_USER_TASK is already present.\n")
+	builder.WriteString("Do not return repository overviews unless CURRENT_USER_TASK explicitly asks for an overview.\n")
+	builder.WriteString("If CURRENT_USER_TASK defines an exact output format, follow it exactly and output nothing extra.\n")
 	builder.WriteString("If the current task is a simple text request, answer with the exact result and do not inspect the workspace.\n")
 	builder.WriteString("If CURRENT_USER_TASK names specific files or commands, call tools for those targets first and avoid unrelated exploration.\n")
+	if requiresToolLoop {
+		builder.WriteString("CURRENT_USER_TASK requires real workspace execution. Emit tool calls before any final answer text.\n")
+		builder.WriteString("Do not stop after read-only inspection when the task still requires edits or tests.\n")
+	}
+	if gate := buildTaskCompletionGate(currentTask); gate != "" {
+		builder.WriteString(gate)
+	}
 	if currentTask != "" {
 		builder.WriteString("\n<CURRENT_USER_TASK>\n")
 		builder.WriteString(currentTask)
@@ -757,7 +776,7 @@ func extractJSONObject(text string) (string, bool) {
 func normalizeToolName(name string) string {
 	trimmed := strings.TrimSpace(name)
 	switch strings.ToLower(trimmed) {
-	case "run_terminal", "run_terminal_cmd", "run_command", "shell", "shell_command", "bash", "terminal", "read_file", "readfile", "cat", "list_files", "listfiles", "execute_command":
+	case "run_terminal", "run_terminal_cmd", "run_command", "shell", "shell_command", "bash", "terminal", "terminal_exec", "read_file", "readfile", "cat", "list_files", "listfiles", "execute_command":
 		return "exec_command"
 	default:
 		return trimmed
@@ -966,6 +985,19 @@ func resolveToolChoice(toolChoice json.RawMessage) resolvedToolChoice {
 	}
 }
 
+func shouldDisableToolsForExecutionFinalize(policy executionPolicy, toolChoice resolvedToolChoice) bool {
+	if !policy.Enabled || policy.Stage != "finalize" {
+		return false
+	}
+	if toolChoice.DisableTools {
+		return true
+	}
+	if toolChoice.RequireTool || toolChoice.RequiredTool != "" {
+		return false
+	}
+	return true
+}
+
 func buildToolChoiceInstructions(toolChoice json.RawMessage) string {
 	trimmed := bytes.TrimSpace(toolChoice)
 	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
@@ -1101,18 +1133,44 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", "%s", err.Error())
 		return
 	}
-	promptTools := toolsForPrompt(req.Tools, toolChoice)
+	currentTask := latestActionableUserTask(promptMessages)
+	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
+	policyHistoryItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
+	executionPolicy := buildExecutionPolicy(req.Model, currentTask, policyHistoryItems, len(toolCatalog) > 0, toolChoice.DisableTools, autoRequireTool)
+	disableToolsForFinalize := shouldDisableToolsForExecutionFinalize(executionPolicy, toolChoice)
+	effectiveToolChoice := toolChoice
+	if disableToolsForFinalize {
+		effectiveToolChoice.DisableTools = true
+	}
+	if maxToolCalls == 0 && executionPolicy.ForceSingleToolCall {
+		maxToolCalls = 1
+	}
+	promptTools := toolsForPrompt(req.Tools, effectiveToolChoice)
 	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, promptTools, maxToolCalls)
+	if policyBlock := buildExecutionPolicyPromptBlock(executionPolicy); policyBlock != "" {
+		prompt += policyBlock
+	}
 	toolConstraints := toolProtocolConstraints{
-		RequiredTool: toolChoice.RequiredTool,
-		RequireTool:  toolChoice.RequireTool,
-		MaxCalls:     maxToolCalls,
+		RequiredTool:       toolChoice.RequiredTool,
+		RequireTool:        toolChoice.RequireTool || executionPolicy.RequireTool,
+		MaxCalls:           maxToolCalls,
+		AllowTruncateToMax: executionPolicy.AllowTruncateToMax,
+	}
+	if disableToolsForFinalize {
+		toolConstraints.RequiredTool = ""
+		toolConstraints.RequireTool = false
 	}
 	toolChoiceInstructions := buildToolChoiceInstructions(req.ToolChoice)
+	if toolChoiceInstructions == "" && autoRequireTool && executionPolicy.RequireTool {
+		toolChoiceInstructions = "This task requires real workspace operations. Do not emit mode final until required edits, commands, and output constraints are satisfied."
+	}
+	if toolChoiceInstructions == "" && disableToolsForFinalize {
+		toolChoiceInstructions = "Execution policy reached finalize stage. Do not call any tools. Return plain text final answer now."
+	}
 	if toolChoiceInstructions != "" {
 		prompt += "\n<TOOL_CHOICE>\n" + toolChoiceInstructions + "\n</TOOL_CHOICE>\n"
 	}
-	bufferForToolCalls := len(toolCatalog) > 0 && !toolChoice.DisableTools
+	bufferForToolCalls := len(toolCatalog) > 0 && !effectiveToolChoice.DisableTools
 	promptInputItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
 
 	bodyBytes, err := buildFireworksRequestBody(req.Model, prompt, req.Temperature, req.MaxOutputTokens)
@@ -1132,14 +1190,19 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"tools_present", bufferForToolCalls,
 		"required_tool", toolConstraints.RequiredTool,
 		"require_tool", toolConstraints.RequireTool,
+		"auto_require_tool", autoRequireTool,
 		"max_tool_calls", toolConstraints.MaxCalls,
+		"execution_stage", executionPolicy.Stage,
+		"execution_read_loop", executionPolicy.ReadLoop,
+		"execution_next_command", executionPolicy.NextCommand,
+		"execution_disable_tools", disableToolsForFinalize,
 	)
 
 	if req.Stream {
-		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls)
+		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy)
 		return
 	}
-	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls)
+	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy)
 }
 
 func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
@@ -1175,7 +1238,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry.response)
 }
 
-func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool) {
+func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -1233,6 +1296,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			finalText := result.String()
 			if bufferForToolCalls {
 				parseResult := parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints)
+				parseResult = applyExecutionPolicyToParseResult(parseResult, executionPolicy, toolCatalog, toolConstraints)
 				slog.Info("tool protocol outcome",
 					"api", "responses",
 					"response_id", responseID,
@@ -1241,6 +1305,9 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 					"required_tool", toolConstraints.RequiredTool,
 					"require_tool", toolConstraints.RequireTool,
 					"max_tool_calls", toolConstraints.MaxCalls,
+					"execution_stage", executionPolicy.Stage,
+					"execution_read_loop", executionPolicy.ReadLoop,
+					"execution_next_command", executionPolicy.NextCommand,
 					"error", toolProtocolErrorString(parseResult.err),
 				)
 				if parseResult.err == nil && len(parseResult.calls) > 0 {
@@ -1330,6 +1397,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		finalText := result.String()
 		if bufferForToolCalls {
 			parseResult := parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints)
+			parseResult = applyExecutionPolicyToParseResult(parseResult, executionPolicy, toolCatalog, toolConstraints)
 			slog.Info("tool protocol outcome",
 				"api", "responses",
 				"response_id", responseID,
@@ -1338,6 +1406,9 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				"required_tool", toolConstraints.RequiredTool,
 				"require_tool", toolConstraints.RequireTool,
 				"max_tool_calls", toolConstraints.MaxCalls,
+				"execution_stage", executionPolicy.Stage,
+				"execution_read_loop", executionPolicy.ReadLoop,
+				"execution_next_command", executionPolicy.NextCommand,
 				"error", toolProtocolErrorString(parseResult.err),
 			)
 			if parseResult.err == nil && len(parseResult.calls) > 0 {
@@ -1381,12 +1452,36 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 	}
 
+	// If stream ended without done/content, emit a terminal error response instead of leaving client pending.
+	if !doneReceived && !contentEmitted && result.Len() == 0 && !clientGone && !errors.Is(scanErr, context.Canceled) {
+		finalText := "Codex adapter error: upstream response ended without a completion signal"
+		if scanErr != nil {
+			finalText = "Codex adapter error: upstream stream failed before content: " + scanErr.Error()
+		}
+		slog.Error("responses stream ended without completion payload", "response_id", responseID, "error", scanErr)
+		outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
+		if bufferForToolCalls {
+			if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
+				return
+			}
+		}
+		if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
+			return
+		}
+		completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+		if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+			return
+		}
+		p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+		return
+	}
+
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) {
 		slog.Error("responses stream read error", "response_id", responseID, "error", scanErr)
 	}
 }
 
-func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool) {
+func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.transport.Timeout())
 	defer cancel()
 
@@ -1446,6 +1541,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 	createdAt := time.Now().Unix()
 	if bufferForToolCalls {
 		parseResult := parseToolCallOutputsWithConstraints(finalText, toolCatalog, toolConstraints)
+		parseResult = applyExecutionPolicyToParseResult(parseResult, executionPolicy, toolCatalog, toolConstraints)
 		slog.Info("tool protocol outcome",
 			"api", "responses",
 			"response_id", responseID,
@@ -1454,6 +1550,9 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 			"required_tool", toolConstraints.RequiredTool,
 			"require_tool", toolConstraints.RequireTool,
 			"max_tool_calls", toolConstraints.MaxCalls,
+			"execution_stage", executionPolicy.Stage,
+			"execution_read_loop", executionPolicy.ReadLoop,
+			"execution_next_command", executionPolicy.NextCommand,
 			"error", toolProtocolErrorString(parseResult.err),
 		)
 		if parseResult.err == nil && len(parseResult.calls) > 0 {

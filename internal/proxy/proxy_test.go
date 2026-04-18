@@ -216,7 +216,27 @@ func TestMessagesToPrompt(t *testing.T) {
 		{
 			name: "unknown role",
 			msgs: []ChatMessage{{Role: "tool", Content: "data"}},
-			want: "data",
+			want: "Tool: Tool result\nOutput:\ndata",
+		},
+		{
+			name: "assistant tool calls and tool result",
+			msgs: []ChatMessage{
+				{
+					Role: "assistant",
+					ToolCalls: []ChatToolCall{
+						{
+							ID:   "call_123",
+							Type: "function",
+							Function: ChatToolFunction{
+								Name:      "Read",
+								Arguments: `{"file_path":"README.md"}`,
+							},
+						},
+					},
+				},
+				{Role: "tool", ToolCallID: "call_123", Content: "file content"},
+			},
+			want: "Assistant: Assistant requested tool: Read (call_id=call_123)\nTool payload:\n{\"file_path\":\"README.md\"}\nTool: Tool result (call_id=call_123)\nOutput:\nfile content",
 		},
 		{
 			name: "empty",
@@ -246,6 +266,132 @@ func TestMessagesToPrompt(t *testing.T) {
 				t.Errorf("messagesToPrompt() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestChatMessageUnmarshal_ContentBlocks(t *testing.T) {
+	var msg ChatMessage
+	body := `{"role":"user","content":[{"type":"text","text":"hello "},{"type":"text","text":"world","cache_control":{"type":"ephemeral"}}]}`
+	if err := json.Unmarshal([]byte(body), &msg); err != nil {
+		t.Fatalf("json.Unmarshal error: %v", err)
+	}
+	if msg.Content != "hello world" {
+		t.Fatalf("content = %q, want %q", msg.Content, "hello world")
+	}
+}
+
+func TestChatMessageUnmarshal_RejectsUnsupportedBlock(t *testing.T) {
+	var msg ChatMessage
+	body := `{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]}`
+	if err := json.Unmarshal([]byte(body), &msg); err == nil {
+		t.Fatal("expected unsupported content block error")
+	}
+}
+
+func TestHandleChatCompletions_NonStreamToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"{\\\"type\\\":\\\"function_call\\\",\\\"name\\\":\\\"Read\\\",\\\"arguments\\\":{\\\"file_path\\\":\\\"README.md\\\"}}\"}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{
+		"model":"deepseek-v3p2",
+		"stream":false,
+		"messages":[{"role":"user","content":[{"type":"text","text":"读取 README.md"}]}],
+		"tools":[{"type":"function","function":{"name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json decode: %v", err)
+	}
+	if got := resp.Choices[0].FinishReason; got != "tool_calls" {
+		t.Fatalf("finish_reason = %q, want tool_calls", got)
+	}
+	if len(resp.Choices[0].Message.ToolCalls) != 1 {
+		t.Fatalf("tool_calls len = %d, want 1", len(resp.Choices[0].Message.ToolCalls))
+	}
+	call := resp.Choices[0].Message.ToolCalls[0]
+	if call.Function.Name != "Read" {
+		t.Fatalf("tool name = %q, want Read", call.Function.Name)
+	}
+	if call.Function.Arguments != `{"file_path":"README.md"}` {
+		t.Fatalf("arguments = %q", call.Function.Arguments)
+	}
+}
+
+func TestHandleChatCompletions_StreamToolCall(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"{\\\"type\\\":\\\"function_call\\\",\\\"name\\\":\\\"Read\\\",\\\"arguments\\\":{\\\"file_path\\\":\\\"README.md\\\"}}\"}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+
+	body := `{
+		"model":"deepseek-v3p2",
+		"stream":true,
+		"messages":[{"role":"user","content":[{"type":"text","text":"读取 README.md"}]}],
+		"tools":[{"type":"function","function":{"name":"Read","description":"read file","parameters":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}}]
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		`"role":"assistant"`,
+		`"tool_calls":[{"index":0,`,
+		`"id":"call_`,
+		`"type":"function"`,
+		`"name":"Read"`,
+		`"arguments":"{\"file_path\":\"README.md\"}"`,
+		`"finish_reason":"tool_calls"`,
+		`data: [DONE]`,
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Contains(bodyText, `"content":"{\"type\":\"function_call\""`) {
+		t.Fatalf("tool-call stream should not leak raw text content:\n%s", bodyText)
 	}
 }
 

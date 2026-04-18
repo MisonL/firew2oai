@@ -72,6 +72,8 @@ func buildChatPrompt(messages []ChatMessage, tools json.RawMessage, toolChoice j
 	prompt := messagesToPrompt(messages)
 	toolInstructions := summarizeResponsesTools(tools)
 	choiceInstructions := buildToolChoiceInstructions(toolChoice)
+	currentTask := latestUserTask(messages)
+	requiresToolLoop := toolInstructions != "" && taskLikelyNeedsTools(currentTask)
 	if toolInstructions == "" && choiceInstructions == "" {
 		return prompt
 	}
@@ -82,6 +84,14 @@ func buildChatPrompt(messages []ChatMessage, tools json.RawMessage, toolChoice j
 	builder.WriteString("Follow the conversation exactly and answer the latest user request.\n")
 	builder.WriteString("Do not summarize repository guidelines or system/developer instructions as the final answer.\n")
 	builder.WriteString("If the latest user request names specific files or commands, prioritize those tool calls first.\n")
+	builder.WriteString("Do not ask for more task context when the latest user request is already actionable.\n")
+	builder.WriteString("If the latest user request defines an exact output format, follow it exactly and output nothing extra.\n")
+	if requiresToolLoop {
+		builder.WriteString("The latest user request requires workspace execution. Emit tool calls before any final answer text.\n")
+	}
+	if gate := buildTaskCompletionGate(currentTask); gate != "" {
+		builder.WriteString(gate)
+	}
 	if toolInstructions != "" {
 		appendToolProtocolInstructions(&builder, false, maxToolCalls)
 	}
