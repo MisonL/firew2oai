@@ -18,6 +18,8 @@ GET /v1/responses/{id}
 GET /v1/responses/{id}/input_items
 POST https://chat.fireworks.ai/chat/single for minimax-m2p1, kimi-k2-thinking, kimi-k2-instruct-0905, cogito-671b-v2-p1
 codex six-model retest via new-api (result: /tmp/codex-six-models-20260418-newapi-iter2/summary.tsv)
+codex six-model retest direct (result: /tmp/codex-six-models-20260418-iter9-direct/summary.tsv)
+codex six-model retest via new-api (result: /tmp/codex-six-models-20260418-newapi-iter4/summary.tsv)
 select id,channel_id,model_name,to_timestamp(created_at) from logs where id > <start_id> ...
 ```
 
@@ -65,6 +67,9 @@ select id,channel_id,model_name,to_timestamp(created_at) from logs where id > <s
 - 部署后补跑 `Codex -> new-api -> firew2oai` 六模型复测：6/6 仍未闭环，详见 `/tmp/codex-six-models-20260418-newapi-iter2/summary.tsv`。
 - 同批请求在 new-api `logs` 中均命中 `channel_id=106`，排除“走错渠道”。
 - 抽样直连 `http://127.0.0.1:39527/v1` 的 `deepseek-v3p2` 复测可达 `cmd_count=3`，说明 firew2oai 新容器生效；中转链路与直连仍存在行为差异。
+- 最新附加机制迭代后再次补跑六模型：直连结果 `/tmp/codex-six-models-20260418-iter9-direct/summary.tsv`，中转结果 `/tmp/codex-six-models-20260418-newapi-iter4/summary.tsv`。
+- `new-api` 中转侧 `partial_tool_then_adapter_error` 从 `3/6` 降到 `0/6`，但两链路依然 `0/6` 完成复杂任务闭环。
+- 按 `logs.id >= 162170` 复核，六模型请求仍全部命中 `channel_id=106`，确认不是渠道漂移造成的结果变化。
 
 ## Limits
 
