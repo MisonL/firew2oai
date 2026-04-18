@@ -26,7 +26,8 @@
 
 - `deepseek-v3p2` 修复前复测：`/private/tmp/codex-iter-retest-20260418-224440-postfix`  
 - 6 模型修复前矩阵：`/private/tmp/codex-iter-matrix-20260418-224926-postfix`  
-- 6 模型修复后矩阵：`/private/tmp/codex-iter-matrix-20260418-230952-postpatch`
+- 6 模型修复后矩阵：`/private/tmp/codex-iter-matrix-20260418-230952-postpatch`  
+- `deepseek-v3p2` 补充抽测：`/private/tmp/codex-iter-retest-20260418-230719-postfix2`
 
 ## 结果对比（12 样本）
 
@@ -44,6 +45,12 @@
 - 12/12 样本都执行了三条命令并返回 `turn.completed`。  
 - `deepseek-v3p2` 不再出现 `Reconnecting... stream closed before response.completed`。  
 - 仍有多模型在最终消息输出“执行中描述”或格式偏离，导致复杂任务不可用。
+
+## 补充抽测（deepseek-v3p2）
+
+- 直连与中转在补测中都完成三条命令并返回 `turn.completed`。  
+- 直连补测出现一次上游 `tls: bad record MAC`，代理返回终止态错误文本：`Codex adapter error: upstream stream failed before content: ...`。  
+- 该行为符合本轮“可终止优先”目标：客户端不再进入无限重连等待。
 
 ## new-api 渠道路由复核
 
