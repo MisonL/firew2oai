@@ -9,6 +9,7 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 - 支持能力：多轮会话、工具调用协议适配、`tool_choice` 约束、`previous_response_id` 历史恢复
 - 安全与运维：API Key、配额/限流、IP 白名单、`/health`、`/metrics`
 - 上游传输：Chrome 风格 TLS/HTTP 指纹，降低上游拒绝概率
+- 架构说明：`docs/ARCHITECTURE.md`
 
 ## 当前验证状态
 
