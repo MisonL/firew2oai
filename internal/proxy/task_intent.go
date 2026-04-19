@@ -59,6 +59,8 @@ var taskShellCommandPrefixes = []string{
 var taskFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql)`)
 var taskCommandLinePattern = regexp.MustCompile(`(?im)^\s*(?:[-*]|\d+[.)])?\s*((?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^\n]*)$`)
 var taskInlineCommandPattern = regexp.MustCompile(`(?i)\b(?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^,\n。；;]*`)
+var taskCommandLabelPattern = regexp.MustCompile(`(?i)(?:执行命令|run command|execute command)\s*[:：]`)
+var taskTrailingBulletSuffixPattern = regexp.MustCompile(`\s+[（(]?\d+[.)）]\s*$`)
 var taskBacktickPattern = regexp.MustCompile("`([^`\\n]+)`")
 var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
@@ -210,6 +212,8 @@ func extractRequiredCommands(task string) []string {
 		commands = append(commands, cmd)
 	}
 
+	commands = append(commands, extractLabeledCommands(task)...)
+
 	for _, match := range taskBacktickPattern.FindAllStringSubmatch(task, -1) {
 		if len(match) < 2 {
 			continue
@@ -260,6 +264,36 @@ func normalizeTaskCommandCandidate(line string) string {
 	}
 	candidate = strings.TrimRight(candidate, "。；;，,")
 	return strings.TrimSpace(candidate)
+}
+
+func extractLabeledCommands(task string) []string {
+	indices := taskCommandLabelPattern.FindAllStringIndex(task, -1)
+	if len(indices) == 0 {
+		return nil
+	}
+
+	commands := make([]string, 0, len(indices))
+	for i, idx := range indices {
+		start := idx[1]
+		end := len(task)
+		if i+1 < len(indices) {
+			end = indices[i+1][0]
+		}
+		segment := normalizeTaskCommandCandidate(task[start:end])
+		if segment == "" {
+			continue
+		}
+		segment = strings.TrimSpace(taskTrailingBulletSuffixPattern.ReplaceAllString(segment, ""))
+		segment = strings.TrimRight(segment, "。；;，,`")
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		if isLikelyTaskShellCommand(segment) {
+			commands = append(commands, segment)
+		}
+	}
+	return commands
 }
 
 func isLikelyTaskShellCommand(text string) bool {

@@ -739,7 +739,136 @@ func TestHandleResponses_NonStreamRequiredLabelsNormalized(t *testing.T) {
 	}
 }
 
-func TestHandleResponses_NonStreamRequiredLabelsMissingReturnsAdapterError(t *testing.T) {
+func TestHandleResponses_NonStreamRequiredLabelsMissingSynthesizesLabels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"RESULT: PASS\\nREADME: # firew2oai\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"执行任务后最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	got := item.Content[0].Text
+	lines := strings.Split(got, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("final text lines = %d, want 3, text=%q", len(lines), got)
+	}
+	if !strings.HasPrefix(lines[0], "RESULT: ") {
+		t.Fatalf("line1 = %q, want RESULT label", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "README: ") {
+		t.Fatalf("line2 = %q, want README label", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "TOOLP: ") {
+		t.Fatalf("line3 = %q, want TOOLP label", lines[2])
+	}
+}
+
+func TestHandleResponses_NonStreamRequiredLabelsEmptySynthesizesLabels(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"执行任务后最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	got := item.Content[0].Text
+	lines := strings.Split(got, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("final text lines = %d, want 3, text=%q", len(lines), got)
+	}
+	if !strings.HasPrefix(lines[0], "RESULT: ") {
+		t.Fatalf("line1 = %q, want RESULT label", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "README: ") {
+		t.Fatalf("line2 = %q, want README label", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "TOOLP: ") {
+		t.Fatalf("line3 = %q, want TOOLP label", lines[2])
+	}
+}
+
+func TestHandleResponses_NonStreamLeakedControlMarkupIsSanitized(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"分析完成。\\n<function_calls><call name=\\\"exec_command\\\" /></function_calls>\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","stream":false,"input":"只回答结果","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	text := item.Content[0].Text
+	if strings.Contains(text, "Codex adapter error:") {
+		t.Fatalf("expected sanitized text, got %q", text)
+	}
+	if strings.Contains(text, "<function_calls>") {
+		t.Fatalf("final text should not leak control markup, got %q", text)
+	}
+	if text != "分析完成。" {
+		t.Fatalf("final text = %q, want %q", text, "分析完成。")
+	}
+}
+
+func TestHandleResponses_NonStreamRequiredLabelsMissingReturnsAdapterErrorWhenStrictGateEnabled(t *testing.T) {
+	t.Setenv("FIREW2OAI_STRICT_OUTPUT_GATE", "1")
+
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"RESULT: PASS\\nREADME: # firew2oai\"}\n\n"))
@@ -768,43 +897,13 @@ func TestHandleResponses_NonStreamRequiredLabelsMissingReturnsAdapterError(t *te
 		t.Fatalf("decode output item: %v", err)
 	}
 	if !strings.Contains(item.Content[0].Text, "Codex adapter error: final output missing required labels: TOOLP") {
-		t.Fatalf("expected missing-label adapter error, got %q", item.Content[0].Text)
+		t.Fatalf("expected strict missing-label adapter error, got %q", item.Content[0].Text)
 	}
 }
 
-func TestHandleResponses_NonStreamRequiredLabelsEmptyReturnsAdapterError(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
-	}))
-	defer upstream.Close()
+func TestHandleResponses_NonStreamLeakedControlMarkupReturnsAdapterErrorWhenStrictGateEnabled(t *testing.T) {
+	t.Setenv("FIREW2OAI_STRICT_OUTPUT_GATE", "1")
 
-	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
-	mux := newTestMux(t, p, "*")
-	body := `{"model":"deepseek-v3p2","stream":false,"input":"执行任务后最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。"}`
-	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer test-key")
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	mux.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
-	}
-	var resp ResponsesResponse
-	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	var item ResponseOutputMessage
-	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
-		t.Fatalf("decode output item: %v", err)
-	}
-	if !strings.Contains(item.Content[0].Text, "Codex adapter error: final output missing required labels: RESULT, README, TOOLP") {
-		t.Fatalf("expected empty-output adapter error, got %q", item.Content[0].Text)
-	}
-}
-
-func TestHandleResponses_NonStreamLeakedControlMarkupReturnsAdapterError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"分析完成。\\n<function_calls><call name=\\\"exec_command\\\" /></function_calls>\"}\n\n"))
@@ -834,9 +933,40 @@ func TestHandleResponses_NonStreamLeakedControlMarkupReturnsAdapterError(t *test
 	}
 	text := item.Content[0].Text
 	if !strings.Contains(text, "Codex adapter error: model leaked unsupported tool-control markup") {
-		t.Fatalf("expected control markup error, got %q", text)
+		t.Fatalf("expected strict control-markup error, got %q", text)
 	}
-	if strings.Contains(text, "<function_calls>") {
-		t.Fatalf("final text should not leak control markup, got %q", text)
+}
+
+func TestSynthesizeRequiredLabelOutput_FromEvidence(t *testing.T) {
+	text := "已完成。"
+	labels := []string{"RESULT", "README", "TOOLP"}
+	evidence := executionEvidence{
+		Commands: []string{
+			"head -n 5 README.md",
+			"sed -n '170,260p' internal/proxy/tool_protocol.go",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"head -n 5 README.md => success=true # firew2oai Fireworks.ai Chat API 转换代理",
+			"sed -n '170,260p' internal/proxy/tool_protocol.go => success=true 该段处理 AI_ACTIONS 解析与约束校验",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+	got, ok := synthesizeRequiredLabelOutput(text, labels, evidence)
+	if !ok {
+		t.Fatal("synthesizeRequiredLabelOutput returned ok=false, want true")
+	}
+	lines := strings.Split(got, "\n")
+	if len(lines) != 3 {
+		t.Fatalf("line count = %d, want 3, text=%q", len(lines), got)
+	}
+	if !strings.HasPrefix(lines[0], "RESULT: PASS") {
+		t.Fatalf("line1 = %q, want RESULT: PASS...", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "README: ") {
+		t.Fatalf("line2 = %q, want README label", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "TOOLP: ") {
+		t.Fatalf("line3 = %q, want TOOLP label", lines[2])
 	}
 }

@@ -137,6 +137,121 @@ func TestApplyExecutionPolicyToParseResult_DoesNotRewriteWhenAlreadyOnNextComman
 	}
 }
 
+func TestApplyExecutionPolicyToParseResult_ExplicitCommandsDoNotRewriteModelCall(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "按要求先读 README。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"head -n 5 README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:          true,
+		RequireTool:      true,
+		ReadLoop:         false,
+		Stage:            "verify",
+		NextCommand:      "go test ./internal/proxy",
+		RequiredCommands: []string{"head -n 5 README.md", "go test ./internal/proxy"},
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if command != "head -n 5 README.md" {
+		t.Fatalf("command = %q, want keep model emitted explicit command", command)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_ExplicitCommandsRewriteOnReadLoop(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "重复读取。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"head -n 5 README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:          true,
+		RequireTool:      true,
+		ReadLoop:         true,
+		Stage:            "verify",
+		NextCommand:      "sed -n '170,260p' internal/proxy/tool_protocol.go",
+		RequiredCommands: []string{"head -n 5 README.md", "sed -n '170,260p' internal/proxy/tool_protocol.go", "go test ./internal/proxy"},
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if command != "sed -n '170,260p' internal/proxy/tool_protocol.go" {
+		t.Fatalf("command = %q, want rewritten to next required command", command)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_ExplicitCommandsRewriteRepeatedReadCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "重复读取。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"head -n 5 README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:          true,
+		RequireTool:      true,
+		ReadLoop:         false,
+		Stage:            "verify",
+		NextCommand:      "sed -n '170,260p' internal/proxy/tool_protocol.go",
+		RequiredCommands: []string{"head -n 5 README.md", "sed -n '170,260p' internal/proxy/tool_protocol.go", "go test ./internal/proxy"},
+		SeenCommands:     []string{"head -n 5 README.md"},
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if command != "sed -n '170,260p' internal/proxy/tool_protocol.go" {
+		t.Fatalf("command = %q, want rewritten to next required command after repeated read", command)
+	}
+}
+
+func TestBuildParsedToolCall_SanitizesLeakedPromptInExecCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	raw := map[string]any{
+		"type": "function_call",
+		"name": "exec_command",
+		"arguments": map[string]any{
+			"cmd": "go test ./internal/proxy\n\n完成后只输出三行，不要有任何其他文字：\nRESULT: <PASS 或 FAIL>",
+		},
+	}
+
+	call, err := buildParsedToolCall(raw, toolCatalog, "", false)
+	if err != nil {
+		t.Fatalf("buildParsedToolCall error = %v", err)
+	}
+	command := parsedCallCommand(t, *call)
+	if command != "go test ./internal/proxy" {
+		t.Fatalf("command = %q, want sanitized go test command", command)
+	}
+}
+
+func TestExtractExecCommandFromArgumentsText_SanitizesLeakedPromptInCommand(t *testing.T) {
+	argsText := `{"cmd":"go test ./internal/proxy\n\n完成后只输出三行，不要有任何其他文字：\nRESULT: <PASS 或 FAIL>"}`
+	got := extractExecCommandFromArgumentsText(argsText)
+	if got != "go test ./internal/proxy" {
+		t.Fatalf("extractExecCommandFromArgumentsText = %q, want sanitized go test command", got)
+	}
+}
+
 func TestExtractRequiredCommands_IncludesReadCommands(t *testing.T) {
 	task := "严格按顺序执行：\n" +
 		"1) `head -n 5 README.md`\n" +
@@ -159,6 +274,20 @@ func TestExtractRequiredCommands_BacktickSedCommandInChineseSentence(t *testing.
 		"1) 执行 `head -n 5 README.md`\n" +
 		"2) 执行 `sed -n '170,260p' internal/proxy/tool_protocol.go`\n" +
 		"3) 执行 `go test ./internal/proxy`\n"
+
+	got := dedupePreserveOrder(extractRequiredCommands(task))
+	want := []string{
+		"head -n 5 README.md",
+		"sed -n '170,260p' internal/proxy/tool_protocol.go",
+		"go test ./internal/proxy",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("required commands mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestExtractRequiredCommands_ChineseColonCommandWithoutBackticks(t *testing.T) {
+	task := "请严格完成以下任务：1) 执行命令：head -n 5 README.md 2) 执行命令：sed -n '170,260p' internal/proxy/tool_protocol.go 3) 执行命令：go test ./internal/proxy"
 
 	got := dedupePreserveOrder(extractRequiredCommands(task))
 	want := []string{
@@ -215,6 +344,56 @@ func TestChooseNextExecutionCommand_NoPendingWorkReturnsEmpty(t *testing.T) {
 	got := chooseNextExecutionCommand(nil, nil, signals, false)
 	if got != "" {
 		t.Fatalf("next command = %q, want empty", got)
+	}
+}
+
+func TestChooseNextExecutionCommand_ExplicitCommandsDoneNoReadFallback(t *testing.T) {
+	requiredCommands := []string{
+		"head -n 5 README.md",
+		"sed -n '170,260p' internal/proxy/tool_protocol.go",
+		"go test ./internal/proxy",
+	}
+	signals := executionHistorySignals{
+		Commands: []string{
+			"head -n 5 README.md",
+			"sed -n '170,260p' internal/proxy/tool_protocol.go",
+			"go test ./internal/proxy",
+		},
+		ReadCalls:  2,
+		TestCalls:  1,
+		WriteCalls: 0,
+	}
+
+	got := chooseNextExecutionCommand(requiredCommands, []string{"internal/proxy/tool_protocol.go"}, signals, false)
+	if got != "" {
+		t.Fatalf("next command = %q, want empty when explicit required commands are already done", got)
+	}
+}
+
+func TestChooseNextExecutionCommand_UsesSuccessfulCommandsWhenPresent(t *testing.T) {
+	requiredCommands := []string{
+		"head -n 5 README.md",
+		"sed -n '170,260p' internal/proxy/tool_protocol.go",
+		"go test ./internal/proxy",
+	}
+	signals := executionHistorySignals{
+		Commands: []string{
+			"head -n 5 README.md",
+			"sed -n '170,260p' internal/proxy/tool_protocol.go",
+			"go test ./internal/proxy",
+		},
+		SuccessfulCommands: []string{
+			"head -n 5 README.md",
+			"sed -n '170,260p' internal/proxy/tool_protocol.go",
+		},
+		FailedCommands: []string{
+			"go test ./internal/proxy",
+		},
+	}
+
+	got := chooseNextExecutionCommand(requiredCommands, nil, signals, false)
+	if got != "go test ./internal/proxy" {
+		t.Fatalf("next command = %q, want go test ./internal/proxy when only failed run exists", got)
 	}
 }
 

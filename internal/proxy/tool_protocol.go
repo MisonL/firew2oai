@@ -444,6 +444,56 @@ func firstStringField(values map[string]any, keys ...string) (string, bool) {
 	return "", false
 }
 
+func isLikelyCommandContinuationLine(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" {
+		return true
+	}
+	for _, prefix := range []string{
+		"&&",
+		"||",
+		"|",
+		";",
+		"\\",
+		"then",
+		"do",
+		"fi",
+		"done",
+		"elif",
+		"else",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeExecCommandText(command string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ""
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) <= 1 {
+		return trimmed
+	}
+	first := strings.TrimSpace(lines[0])
+	if first == "" {
+		return trimmed
+	}
+	for _, line := range lines[1:] {
+		current := strings.TrimSpace(line)
+		if current == "" {
+			continue
+		}
+		if !isLikelyCommandContinuationLine(current) {
+			return first
+		}
+	}
+	return trimmed
+}
+
 func shellQuoteSingle(text string) string {
 	return "'" + strings.ReplaceAll(text, "'", "'\"'\"'") + "'"
 }
@@ -459,16 +509,24 @@ func buildListFilesCommand(path string) string {
 func normalizeExecCommandArguments(args any, sourceToolName string) (any, bool) {
 	switch value := args.(type) {
 	case string:
-		command := strings.TrimSpace(value)
+		command := sanitizeExecCommandText(value)
 		if command == "" {
 			return args, false
 		}
 		return map[string]any{"cmd": command}, true
 	case map[string]any:
 		if cmd, ok := firstStringField(value, "cmd"); ok {
+			cmd = sanitizeExecCommandText(cmd)
+			if cmd == "" {
+				return args, false
+			}
 			return map[string]any{"cmd": cmd}, true
 		}
 		if command, ok := firstStringField(value, "command", "command_line", "cmdline", "shell_command", "input"); ok {
+			command = sanitizeExecCommandText(command)
+			if command == "" {
+				return args, false
+			}
 			return map[string]any{"cmd": command}, true
 		}
 

@@ -11,16 +11,20 @@ type executionPolicy struct {
 	RequireTool         bool
 	ReadLoop            bool
 	NextCommand         string
+	RequiredCommands    []string
+	SeenCommands        []string
 	ForceSingleToolCall bool
 	AllowTruncateToMax  bool
 }
 
 type executionHistorySignals struct {
-	ToolCalls  int
-	ReadCalls  int
-	WriteCalls int
-	TestCalls  int
-	Commands   []string
+	ToolCalls          int
+	ReadCalls          int
+	WriteCalls         int
+	TestCalls          int
+	Commands           []string
+	SuccessfulCommands []string
+	FailedCommands     []string
 }
 
 func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMessage, hasTools, toolsDisabled, autoRequireTool bool) executionPolicy {
@@ -43,6 +47,8 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 
 	policy.Enabled = true
 	policy.NextCommand = nextCommand
+	policy.RequiredCommands = requiredCommands
+	policy.SeenCommands = dedupePreserveOrder(signals.Commands)
 	switch {
 	case signals.ToolCalls == 0:
 		policy.Stage = "explore"
@@ -99,6 +105,30 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 	}
 
 	if len(result.calls) > 0 {
+		if len(policy.RequiredCommands) > 0 {
+			// Keep model-emitted explicit commands untouched by default.
+			// If a read loop is already detected, force progression to the next unmet command.
+			if policy.ReadLoop && shouldRewriteReadOnlyCallsToNext(result.calls, policy.NextCommand) {
+				if synthetic, ok := buildSyntheticExecCommandCall(policy.NextCommand, toolCatalog, constraints.RequiredTool); ok {
+					result.calls = []parsedToolCall{synthetic}
+					result.err = nil
+					result.visibleText = ""
+					result.mode = toolProtocolModeAIActionsTool
+					result.candidateFound = true
+				}
+			}
+			// For explicit command tasks, avoid repeating already-seen read commands.
+			if shouldAdvanceExplicitRequiredCommand(result.calls, policy.NextCommand, policy.SeenCommands) {
+				if synthetic, ok := buildSyntheticExecCommandCall(policy.NextCommand, toolCatalog, constraints.RequiredTool); ok {
+					result.calls = []parsedToolCall{synthetic}
+					result.err = nil
+					result.visibleText = ""
+					result.mode = toolProtocolModeAIActionsTool
+					result.candidateFound = true
+				}
+			}
+			return result
+		}
 		if shouldRewriteReadOnlyCallsToNext(result.calls, policy.NextCommand) {
 			if synthetic, ok := buildSyntheticExecCommandCall(policy.NextCommand, toolCatalog, constraints.RequiredTool); ok {
 				result.calls = []parsedToolCall{synthetic}
@@ -144,6 +174,31 @@ func shouldRewriteReadOnlyCallsToNext(calls []parsedToolCall, nextCommand string
 	return allReadOnly && !matchedNext
 }
 
+func shouldAdvanceExplicitRequiredCommand(calls []parsedToolCall, nextCommand string, seenCommands []string) bool {
+	next := strings.TrimSpace(nextCommand)
+	if next == "" || len(calls) == 0 || len(seenCommands) == 0 {
+		return false
+	}
+
+	repeatedSeenRead := false
+	for _, call := range calls {
+		name, command, ok := parsedToolCallInvocation(call)
+		if !ok {
+			return false
+		}
+		if !isReadOnlyInvocation(name, command) {
+			return false
+		}
+		if name == "exec_command" && hasSeenCommand([]string{command}, next) {
+			return false
+		}
+		if hasSeenCommand(seenCommands, command) {
+			repeatedSeenRead = true
+		}
+	}
+	return repeatedSeenRead
+}
+
 func modelNeedsStrictToolLoop(model string) bool {
 	lower := strings.ToLower(strings.TrimSpace(model))
 	switch {
@@ -159,8 +214,11 @@ func modelNeedsStrictToolLoop(model string) bool {
 
 func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHistorySignals {
 	signals := executionHistorySignals{
-		Commands: make([]string, 0, 8),
+		Commands:           make([]string, 0, 8),
+		SuccessfulCommands: make([]string, 0, 8),
+		FailedCommands:     make([]string, 0, 4),
 	}
+	callIDToCommand := make(map[string]string, 8)
 
 	for _, raw := range historyItems {
 		if len(raw) == 0 {
@@ -192,6 +250,10 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 				continue
 			}
 			signals.Commands = append(signals.Commands, command)
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToCommand[callID] = command
+			}
 			if isTestCommand(command) {
 				signals.TestCalls++
 				continue
@@ -212,19 +274,72 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			signals.ToolCalls++
 			if isMutationToolName(normalizedName) {
 				signals.WriteCalls++
+				continue
+			}
+			if normalizedName != "exec_command" {
+				continue
+			}
+			input, _ := item["input"].(string)
+			command := strings.TrimSpace(input)
+			if command == "" {
+				continue
+			}
+			signals.Commands = append(signals.Commands, command)
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToCommand[callID] = command
+			}
+			if isTestCommand(command) {
+				signals.TestCalls++
+				continue
+			}
+			if isMutationCommand(command) {
+				signals.WriteCalls++
+				continue
+			}
+			if isReadOnlyCommand(command) {
+				signals.ReadCalls++
+			}
+		case "function_call_output", "custom_tool_call_output":
+			callID, _ := item["call_id"].(string)
+			command := strings.TrimSpace(callIDToCommand[callID])
+			if command == "" {
+				continue
+			}
+			_, success := extractToolOutputText(item["output"])
+			if success == nil || *success {
+				signals.SuccessfulCommands = append(signals.SuccessfulCommands, command)
+			} else {
+				signals.FailedCommands = append(signals.FailedCommands, command)
 			}
 		}
 	}
 
+	signals.SuccessfulCommands = dedupePreserveOrder(signals.SuccessfulCommands)
+	signals.FailedCommands = dedupePreserveOrder(signals.FailedCommands)
 	return signals
 }
 
 func chooseNextExecutionCommand(requiredCommands, requiredFiles []string, signals executionHistorySignals, needsWrite bool) string {
+	resolveCommandDone := func(command string) bool {
+		if hasSeenCommand(signals.SuccessfulCommands, command) {
+			return true
+		}
+		// Backward-compatible fallback for environments that do not emit success flags.
+		if len(signals.SuccessfulCommands) == 0 {
+			return hasSeenCommand(signals.Commands, command)
+		}
+		return false
+	}
+
 	for _, command := range requiredCommands {
-		if hasSeenCommand(signals.Commands, command) {
+		if resolveCommandDone(command) {
 			continue
 		}
 		return command
+	}
+	if len(requiredCommands) > 0 {
+		return ""
 	}
 
 	for _, filePath := range requiredFiles {
@@ -399,15 +514,15 @@ func extractExecCommandFromArgumentsText(argsText string) string {
 			switch value := normalizedArgs.(type) {
 			case map[string]any:
 				if command, ok := firstStringField(value, "cmd", "command", "input"); ok {
-					return command
+					return sanitizeExecCommandText(command)
 				}
 			case string:
-				return strings.TrimSpace(value)
+				return sanitizeExecCommandText(value)
 			}
 		}
 		if rawMap, ok := decoded.(map[string]any); ok {
 			if command, ok := firstStringField(rawMap, "cmd", "command", "input"); ok {
-				return command
+				return sanitizeExecCommandText(command)
 			}
 		}
 	}
@@ -415,7 +530,7 @@ func extractExecCommandFromArgumentsText(argsText string) string {
 	if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
 		return ""
 	}
-	return trimmed
+	return sanitizeExecCommandText(trimmed)
 }
 
 func allParsedCallsReadOnly(calls []parsedToolCall) bool {
