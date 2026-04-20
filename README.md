@@ -87,6 +87,39 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 - 第二梯队：`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7`
 - 第三梯队：`qwen3-8b`、`qwen3-vl-30b-a3b-thinking`、`gpt-oss-20b`、`gpt-oss-120b`
 
+### 2026-04-20 深夜增量复测
+
+本轮又继续修正了三类 Codex 适配误差：
+
+- 同一句任务里的多条验证命令被错误粘成一条，导致 `taskCompletionSatisfied(...)` 误判未完成
+- 模型最终文本里自带的 `RESULT: FAIL` / `TEST: ...失败` 会反向污染适配层推断
+- 探索阶段预期失败的读文件结果，会污染最终 `RESULT/TEST`
+
+对应代码位于：
+
+- `internal/proxy/task_intent.go`
+- `internal/proxy/output_constraints.go`
+- `internal/proxy/execution_policy.go`
+
+本地回归验证：
+
+- `go test ./internal/proxy`
+- `go test ./...`
+
+基于当前最新代码，对第二梯队同一真实写代码任务做了单模型复测，证据目录：
+
+- `minimax-m2p5`：`/private/tmp/firew2oai-stage4-driver-20260420-130112/minimax-m2p5.json`
+- `kimi-k2p5`：`/private/tmp/firew2oai-kimi-single-rerun-20260420-131621/kimi-k2p5.json`
+- `glm-5`：`/private/tmp/firew2oai-glm5-single-rerun-20260420-131447/glm-5.json`
+- `glm-4p7`：`/private/tmp/firew2oai-glm4p7-single-20260420-131040/glm-4p7.json`
+
+当前增量结论：
+
+- `minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7` 均已在该真实写代码任务上完成写文件、执行两条 `go test`，并最终返回 `PASS`
+- 第二梯队此前确认的几处问题，已被验证主要属于适配层误差，而不是任务本身无法闭环
+- 剩余不稳定性主要来自上游扰动，例如本轮仍观察到 `502 upstream_failed`、`upstream returned status 500`、`tls: bad record MAC`
+- 这组增量复测只覆盖第二梯队与单一真实任务，不等同于“当前 12 模型全量矩阵已全部按最新代码重跑”
+
 详细记录见：
 
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`

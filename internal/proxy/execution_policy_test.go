@@ -395,6 +395,19 @@ func TestExtractRequiredCommands_StripsInlineOutputDirectiveOnSameLine(t *testin
 	}
 }
 
+func TestExtractRequiredCommands_SplitsCompoundInlineCommands(t *testing.T) {
+	task := "读取 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，运行 go test ./internal/proxy 和 go test ./...，最终只输出四行：RESULT: PASS 或 FAIL；CONSTRAINT: 说明；EVIDENCE: 说明；TEST: 说明。"
+
+	got := dedupePreserveOrder(extractRequiredCommands(task))
+	want := []string{
+		"go test ./internal/proxy",
+		"go test ./...",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("required commands mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestChooseNextExecutionCommand_PrioritizesUnmetCommand(t *testing.T) {
 	requiredCommands := []string{
 		"head -n 5 README.md",
@@ -1004,6 +1017,37 @@ func TestBuildExecutionPolicy_ReadOnlyCodingTaskKeepsVerifyWhenFinalTestOutputIs
 	}
 	if strings.TrimSpace(policy.NextCommand) == "" {
 		t.Fatalf("policy.NextCommand = empty, want a follow-up tool step while final test output is partial")
+	}
+}
+
+func TestBuildExecutionPolicy_ClearsMissingFileAfterSuccessfulMutation(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n"
+	readMissingArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,200p' 'internal/proxy/output_constraints_test.go'"})
+	readRefArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,200p' 'internal/proxy/output_constraints.go'"})
+	writeArgs, _ := json.Marshal(map[string]any{"cmd": "python3 -c 'from pathlib import Path; Path(\"internal/proxy/output_constraints_test.go\").write_text(\"package proxy\\n\", encoding='\"'\"'utf-8'\"'\"')'"})
+	testArgs, _ := json.Marshal(map[string]any{"cmd": "go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'"})
+
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_missing", "arguments": string(readMissingArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_missing", "output": map[string]any{"content": "sed: internal/proxy/output_constraints_test.go: No such file or directory", "success": false}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_ref", "arguments": string(readRefArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_ref", "output": map[string]any{"content": "package proxy", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "write_target", "arguments": string(writeArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "write_target", "output": map[string]any{"content": "", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "test_target", "arguments": string(testArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "test_target", "output": map[string]any{"content": "--- FAIL: TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise", "success": false}}),
+	}
+
+	policy := buildExecutionPolicy("minimax-m2p5", task, history, true, false, true)
+	if len(policy.MissingFiles) != 0 {
+		t.Fatalf("policy.MissingFiles = %#v, want empty after successful mutation", policy.MissingFiles)
+	}
+	if !policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = false, want true after failed test following mutation: %+v", policy)
 	}
 }
 

@@ -124,6 +124,63 @@
 - 正式 `new-api -> firew2oai` 链路下，另外 10 个模型在最小多轮工具任务中全部 PASS
 - 但这批 PASS 仅代表多轮工具链路已通，不应直接上升为“真实写代码任务全部可用”
 
+## 2026-04-20 深夜第二梯队复测
+
+在晚间补丁之后，又继续收敛了第二梯队的三类适配误差：
+
+1. 同一句里的多条命令抽取粘连  
+   - 例如 `运行 go test ./internal/proxy 和 go test ./...` 先前会被误抽成一条命令，导致任务完成判定错误
+2. 模型自带 FAIL 标签污染  
+   - 某些模型真实已完成任务，但最终文本仍写 `RESULT: FAIL`，旧逻辑会把这类标签本身再次当成失败证据
+3. 探索阶段失败污染最终结论  
+   - 例如先读一个尚不存在的目标测试文件，返回 `No such file or directory`，旧逻辑会把这类预期探索失败带入最终 `RESULT/TEST`
+
+对应代码：
+
+- `internal/proxy/task_intent.go`
+- `internal/proxy/output_constraints.go`
+- `internal/proxy/execution_policy.go`
+
+对应新增回归测试：
+
+- `TestExtractRequiredCommands_SplitsCompoundInlineCommands`
+- `TestConstrainFinalText_OverridesModelFailLabelWhenEvidencePassed`
+- `TestConstrainFinalText_IgnoresExploratoryFailureAfterRequiredCommandsPass`
+- `TestBuildExecutionPolicy_ClearsMissingFileAfterSuccessfulMutation`
+
+本地验证：
+
+- `go test ./internal/proxy`
+- `go test ./...`
+
+### 深夜单模型真实任务复测
+
+统一任务仍为“新增 `internal/proxy/output_constraints_test.go` 并执行两条 `go test`”。
+
+证据目录：
+
+- `minimax-m2p5`：`/private/tmp/firew2oai-stage4-driver-20260420-130112/minimax-m2p5.json`
+- `kimi-k2p5`：`/private/tmp/firew2oai-kimi-single-rerun-20260420-131621/kimi-k2p5.json`
+- `glm-5`：`/private/tmp/firew2oai-glm5-single-rerun-20260420-131447/glm-5.json`
+- `glm-4p7`：`/private/tmp/firew2oai-glm4p7-single-20260420-131040/glm-4p7.json`
+
+结果：
+
+| 模型 | 写文件 | 定向测试 | 包测试 | 最终 PASS | 备注 |
+|---|---:|---:|---:|---:|---|
+| `minimax-m2p5` | 是 | 是 | 是 | 是 | 当前代码下已完成闭环 |
+| `kimi-k2p5` | 是 | 是 | 是 | 是 | finalize 阶段仍可能受上游 TLS 扰动影响，但本轮重试后 PASS |
+| `glm-5` | 是 | 是 | 是 | 是 | 先前“做完但 FAIL”确认是适配层误判 |
+| `glm-4p7` | 是 | 是 | 是 | 是 | 当前代码下已完成闭环 |
+
+增量结论：
+
+- 第二梯队当前不应再简单归因为“模型自身完全不会做 Codex 真实任务”
+- 至少在该统一真实写代码任务上，`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7` 已能在当前最新代码上闭环完成
+- 这一批模型当前主要剩余风险已从“适配层协议误判”转向“上游稳定性扰动”
+- 本节只代表第二梯队在单一真实任务上的最新复测，不等同于重新刷新全部 12 模型总矩阵
+- 因此本报告前文的全量矩阵统计仍保留原值；若要刷新总表，需要再按同口径重跑全模型
+
 ## 结论
 
 截至 2026-04-20，`firew2oai -> Codex` 在只读 Coding 审计任务上已经稳定；而在真实写代码任务上，当前结论应收紧为：

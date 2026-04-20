@@ -1115,6 +1115,9 @@ func collectMissingRequiredFiles(signals executionHistorySignals, requiredFiles 
 		if !hasFailedReadForFile(signals.FailedCommands, filePath) {
 			continue
 		}
+		if hasSeenReadForFile(signals.SuccessfulCommands, filePath) || hasSuccessfulMutationForFile(signals.SuccessfulCommands, filePath) {
+			continue
+		}
 		missing = append(missing, filePath)
 	}
 	return missing
@@ -1127,6 +1130,9 @@ func collectEmptyRequiredFiles(signals executionHistorySignals, requiredFiles []
 	empty := make([]string, 0, len(requiredFiles))
 	for _, filePath := range requiredFiles {
 		if !hasSeenReadForFile(signals.EmptyCommands, filePath) {
+			continue
+		}
+		if hasSuccessfulMutationForFile(signals.SuccessfulCommands, filePath) {
 			continue
 		}
 		empty = append(empty, filePath)
@@ -1155,6 +1161,26 @@ func hasFailedReadForFile(failed []string, filePath string) bool {
 	}
 	for _, command := range failed {
 		if !isReadOnlyCommand(command) {
+			continue
+		}
+		commandKey := normalizeCommandForCompare(command)
+		if commandKey == "" {
+			continue
+		}
+		if strings.Contains(commandKey, pathKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSuccessfulMutationForFile(successful []string, filePath string) bool {
+	pathKey := normalizeCommandForCompare(filePath)
+	if pathKey == "" {
+		return false
+	}
+	for _, command := range successful {
+		if !isMutationCommand(command) {
 			continue
 		}
 		commandKey := normalizeCommandForCompare(command)

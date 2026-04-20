@@ -103,6 +103,11 @@ func TestBuildResponsesPrompt_FinalizeCompactsMetaContext(t *testing.T) {
 		"只输出四行",
 		"Finalize stage reached.",
 		"Use CURRENT_USER_TASK and EXECUTION_EVIDENCE to produce the final answer.",
+		"<FINAL_OUTPUT_FORMAT>",
+		"RESULT: <value>",
+		"CONSTRAINT: <value>",
+		"EVIDENCE: <value>",
+		"TEST: <value>",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("compact finalize prompt missing %q:\n%s", want, prompt)
@@ -1199,6 +1204,156 @@ func TestConstrainFinalText_RepairsMalformedFilesAndNoteLabelsFromTask(t *testin
 	}
 	if lines[3] != "NOTE: 只新增测试文件，未修改业务逻辑。" {
 		t.Fatalf("NOTE line = %q", lines[3])
+	}
+}
+
+func TestConstrainFinalText_CanonicalizesDeterministicLabelsEvenWhenPresent(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: Done.\n" +
+		"NOTE: Completed the requested change."
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_OverridesModelFailLabelWhenEvidencePassed(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "RESULT: FAIL\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 测试未全部通过，至少一个验证命令返回失败。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_IgnoresExploratoryFailureAfterRequiredCommandsPass(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "ID: 001\n" +
+		"RESULT: FAIL\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 测试未全部通过，至少一个验证命令返回失败。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5",
+			"sed -n '1,200p' 'internal/proxy/output_constraints_test.go'",
+			"python3 -c 'from pathlib import Path; Path(\"internal/proxy/output_constraints_test.go\").write_text(\"package proxy\\n\", encoding='\"'\"'utf-8'\"'\"')'",
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5 => success=true internal/proxy/execution_policy_test.go",
+			"sed -n '1,200p' 'internal/proxy/output_constraints_test.go' => success=false sed: internal/proxy/output_constraints_test.go: No such file or directory",
+			"python3 -c 'from pathlib import Path; Path(\"internal/proxy/output_constraints_test.go\").write_text(\"package proxy\\n\", encoding='\"'\"'utf-8'\"'\"')' => success=true",
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_DoesNotMarkIncompleteWriteTaskAsPass(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "ID: <tool_code> <tool name=\"exec_command\"> <parameter name=\"cmd\">cat internal/proxy/output_constraints.go</parameter> </tool> </tool_code>\n" +
+		"RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5",
+		},
+		Outputs: []string{
+			"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5 => success=true internal/proxy/execution_policy_test.go",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 未完成任务要求的验证命令，当前不能判定测试通过。\n" +
+		"NOTE: 任务尚未完成，仍缺少所需修改或验证步骤。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
 	}
 }
 

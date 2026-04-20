@@ -453,6 +453,9 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString("Finalize stage reached. Ignore handoff, checkpoint, and readiness chatter from prior turns.\n")
 		builder.WriteString("Use CURRENT_USER_TASK and EXECUTION_EVIDENCE to produce the final answer.\n")
 		builder.WriteString("Do not acknowledge session state or ask what task to work on.\n")
+		if formatBlock := buildFinalizeOutputFormatBlock(currentTask); formatBlock != "" {
+			builder.WriteString(formatBlock)
+		}
 	}
 	if requiresToolLoop {
 		builder.WriteString("CURRENT_USER_TASK requires real workspace execution. Emit tool calls before any final answer text.\n")
@@ -491,6 +494,22 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString("\n</AVAILABLE_TOOLS>\n")
 	}
 	return builder.String()
+}
+
+func buildFinalizeOutputFormatBlock(task string) string {
+	labels := dedupePreserveOrder(extractRequiredOutputLabels(task))
+	if len(labels) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\n<FINAL_OUTPUT_FORMAT>\n")
+	b.WriteString("Output exactly these labels in this order, one line per label, with no preface, no markdown, and no extra lines:\n")
+	for _, label := range labels {
+		b.WriteString(label)
+		b.WriteString(": <value>\n")
+	}
+	b.WriteString("</FINAL_OUTPUT_FORMAT>\n")
+	return b.String()
 }
 
 func filterPromptMetaMessages(messages []ChatMessage) []ChatMessage {

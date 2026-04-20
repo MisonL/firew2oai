@@ -88,6 +88,7 @@ var goTestNamePattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*\b`)
 var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
 var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only output|output only)\b[\s\S]*$`)
+var taskCommandTrailingConnectorPattern = regexp.MustCompile(`(?:\s|，|,|、|；|;)*(?:和|以及|及|and|then|然后)\s*$`)
 
 func latestUserTask(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -478,12 +479,19 @@ func stripTaskCommandTrailingDirectives(command string) string {
 	trimmed = strings.TrimSpace(taskCommandTrailingStepPattern.ReplaceAllString(trimmed, ""))
 
 	for _, marker := range []string{
+		"最终只输出",
 		" 最终只输出",
+		"完成后只输出",
 		" 完成后只输出",
+		"最后只输出",
 		" 最后只输出",
+		"只输出",
 		" 只输出",
+		"最终仅输出",
 		" 最终仅输出",
+		"完成后仅输出",
 		" 完成后仅输出",
+		"仅输出",
 		" 仅输出",
 	} {
 		if idx := strings.Index(trimmed, marker); idx >= 0 {
@@ -550,13 +558,83 @@ func extractInlineCommands(task string) []string {
 		cmd := strings.TrimSpace(task[start:end])
 		cmd = strings.Trim(cmd, "`")
 		cmd = stripTaskCommandTrailingDirectives(cmd)
+		cmd = trimTaskCommandTrailingConnector(cmd)
 		cmd = strings.TrimRight(cmd, "，,`")
 		cmd = strings.TrimSpace(cmd)
-		if isLikelyTaskShellCommand(cmd) {
-			commands = append(commands, cmd)
+		for _, segment := range splitCompoundTaskCommand(cmd) {
+			if isLikelyTaskShellCommand(segment) {
+				commands = append(commands, segment)
+			}
 		}
 	}
 	return commands
+}
+
+func splitCompoundTaskCommand(command string) []string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return nil
+	}
+
+	type span struct {
+		start int
+	}
+	spans := []span{{start: 0}}
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range taskShellCommandPrefixes {
+		needle := strings.ToLower(prefix)
+		search := len(needle)
+		for search < len(lower) {
+			idx := strings.Index(lower[search:], needle)
+			if idx < 0 {
+				break
+			}
+			start := search + idx
+			search = start + len(needle)
+			if !isInlineCommandBoundary(lower, start, needle) {
+				continue
+			}
+			spans = append(spans, span{start: start})
+		}
+	}
+	if len(spans) == 1 {
+		return []string{trimmed}
+	}
+
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	segments := make([]string, 0, len(spans))
+	lastStart := -1
+	for i, current := range spans {
+		if current.start == lastStart {
+			continue
+		}
+		lastStart = current.start
+
+		end := len(trimmed)
+		if i+1 < len(spans) && spans[i+1].start < end {
+			end = spans[i+1].start
+		}
+		segment := strings.TrimSpace(trimmed[current.start:end])
+		segment = stripTaskCommandTrailingDirectives(segment)
+		segment = trimTaskCommandTrailingConnector(segment)
+		segment = strings.TrimSpace(segment)
+		if segment != "" {
+			segments = append(segments, segment)
+		}
+	}
+	if len(segments) == 0 {
+		return []string{trimmed}
+	}
+	return segments
+}
+
+func trimTaskCommandTrailingConnector(command string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ""
+	}
+	trimmed = strings.TrimSpace(taskCommandTrailingConnectorPattern.ReplaceAllString(trimmed, ""))
+	return strings.TrimSpace(trimmed)
 }
 
 func isInlineCommandBoundary(text string, start int, prefix string) bool {

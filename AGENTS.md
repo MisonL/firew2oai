@@ -42,6 +42,8 @@
 
 - 只读型 Coding 审计任务当前已经稳定，真实写代码任务不能默认假设“所有模型都稳定可用”。
 - 2026-04-20 的最新矩阵结论见 [docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md](/Volumes/Work/code/firew2oai/docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md)；当前应以该文档和 `README.md` 为准，不要沿用更早的口头结论。
+- 2026-04-20 深夜又补跑了一轮当前最新代码下的第二梯队真实写代码复测：`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7` 都已在统一测试补强任务中完成写文件、执行两条 `go test` 并返回 `PASS`；对应证据目录已写入 `README.md` 与当日矩阵文档。
 - 走 `new-api -> firew2oai` 正式链路时，如同模型存在多渠道，必须先确认 `firew2oai` 渠道优先级最高，否则测试结果不能代表本项目适配效果。
 - 与 Codex 兼容性直接相关的高风险边界仍集中在 `apply_patch`、`tool_choice`、四行收口和 finalize 收口稳定性，修改这些路径后必须补对应回归测试。
-- 如果模型未按协议产出工具块、错误把自述文本写进 `FILES`/`NOTE`、或在 finalize 阶段漂移，优先视为模型能力或协议收口问题，先查 `internal/proxy/` 下的协议适配与测试，再下结论。
+- 如果模型未按协议产出工具块、错误把自述文本写进 `FILES`/`NOTE`、或在 finalize 阶段漂移，先检查是否属于当前已知适配层误差：
+  `task_intent.go` 的命令抽取、`output_constraints.go` 的标签推断、`execution_policy.go` 的写入完成态识别；确认排除这些路径后，再归因为模型能力或上游扰动。

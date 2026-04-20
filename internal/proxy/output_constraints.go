@@ -81,7 +81,7 @@ func enforceTaskOutputConstraints(task, text string, evidence executionEvidence,
 
 	normalized, missing := normalizeRequiredLabelOutput(trimmed, requiredLabels)
 	if len(missing) == 0 {
-		return normalized, nil
+		return canonicalizeRequiredLabelOutput(normalized, requiredLabels, task, evidence), nil
 	}
 	if !strictOutputGate {
 		if normalizedFallback, ok := synthesizeRequiredLabelOutput(task, trimmed, requiredLabels, evidence); ok {
@@ -254,10 +254,51 @@ func synthesizeRequiredLabelOutput(task, text string, labels []string, evidence 
 	return strings.Join(ordered, "\n"), true
 }
 
+func canonicalizeRequiredLabelOutput(text string, labels []string, task string, evidence executionEvidence) string {
+	values := extractRequiredLabelValues(text, labels)
+	if len(values) == 0 {
+		return text
+	}
+
+	ordered := make([]string, 0, len(labels))
+	for _, label := range labels {
+		value := strings.TrimSpace(values[label])
+		if shouldPreferInferredRequiredLabelValue(label, task, evidence) {
+			if inferred, ok := inferRequiredLabelValue(label, task, text, evidence); ok {
+				value = inferred
+			}
+		}
+		value = strings.Join(strings.Fields(value), " ")
+		if value == "" {
+			return text
+		}
+		ordered = append(ordered, label+": "+truncateString(value, 220))
+	}
+	return strings.Join(ordered, "\n")
+}
+
+func shouldPreferInferredRequiredLabelValue(label, task string, evidence executionEvidence) bool {
+	switch strings.ToUpper(strings.TrimSpace(label)) {
+	case "FILES", "NOTE":
+		return strings.TrimSpace(task) != ""
+	case "RESULT", "TEST":
+		return len(evidence.Commands) > 0 || len(evidence.Outputs) > 0
+	default:
+		return false
+	}
+}
+
+func hasExecutionEvidence(evidence executionEvidence) bool {
+	return len(evidence.Commands) > 0 || len(evidence.Outputs) > 0
+}
+
 func inferRequiredLabelValue(label, task, text string, evidence executionEvidence) (string, bool) {
 	switch strings.ToUpper(strings.TrimSpace(label)) {
 	case "RESULT":
-		combined := strings.ToLower(strings.TrimSpace(text + "\n" + strings.Join(evidence.Outputs, "\n")))
+		if !taskCompletionSatisfied(task, evidence) {
+			return "FAIL", true
+		}
+		combined := strings.ToLower(strings.TrimSpace(outcomeSignalText(text) + "\n" + strings.Join(relevantOutcomeEvidence(task, evidence), "\n")))
 		if strings.Contains(combined, "success=false") || strings.Contains(combined, " fail") || strings.Contains(combined, "error") {
 			return "FAIL", true
 		}
@@ -287,7 +328,10 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		}
 		return "负责从历史消息中提取已执行命令与工具输出摘要，构建可追溯的执行证据块。", true
 	case "TEST":
-		combined := strings.ToLower(strings.TrimSpace(text + "\n" + strings.Join(evidence.Outputs, "\n")))
+		if !taskCompletionSatisfied(task, evidence) {
+			return "未完成任务要求的验证命令，当前不能判定测试通过。", true
+		}
+		combined := strings.ToLower(strings.TrimSpace(outcomeSignalText(text) + "\n" + strings.Join(relevantOutcomeEvidence(task, evidence), "\n")))
 		if strings.Contains(combined, "success=false") || strings.Contains(combined, " fail") || strings.Contains(combined, "error") {
 			return "测试未全部通过，至少一个验证命令返回失败。", true
 		}
@@ -308,6 +352,9 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		}
 		return strings.Join(targets, ", "), true
 	case "NOTE":
+		if taskLikelyNeedsWrite(task) && !taskCompletionSatisfied(task, evidence) {
+			return "任务尚未完成，仍缺少所需修改或验证步骤。", true
+		}
 		targets := extractWriteTargetFiles(task)
 		if len(targets) > 0 && allFilesMatchSuffix(targets, "_test.go") {
 			return "只新增测试文件，未修改业务逻辑。", true
@@ -323,6 +370,79 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		}
 		return truncateString(strings.Join(strings.Fields(trimmed), " "), 220), true
 	}
+}
+
+func outcomeSignalText(text string) string {
+	if strings.TrimSpace(text) == "" {
+		return ""
+	}
+	lines := strings.Split(text, "\n")
+	filtered := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		line = strings.TrimSpace(taskBulletPrefixPattern.ReplaceAllString(line, ""))
+		if taskOutputLabelPattern.MatchString(line) {
+			continue
+		}
+		filtered = append(filtered, line)
+	}
+	return strings.Join(filtered, "\n")
+}
+
+func relevantOutcomeEvidence(task string, evidence executionEvidence) []string {
+	requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
+	if len(requiredCommands) == 0 {
+		return evidence.Outputs
+	}
+	selected := make([]string, 0, len(requiredCommands))
+	for _, output := range evidence.Outputs {
+		outputKey := normalizeCommandForCompare(output)
+		for _, command := range requiredCommands {
+			commandKey := normalizeCommandForCompare(command)
+			if commandKey == "" || !strings.Contains(outputKey, commandKey) {
+				continue
+			}
+			selected = append(selected, output)
+			break
+		}
+	}
+	if len(selected) == 0 {
+		return evidence.Outputs
+	}
+	return selected
+}
+
+func taskCompletionSatisfied(task string, evidence executionEvidence) bool {
+	requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
+	if len(requiredCommands) == 0 {
+		return hasExecutionEvidence(evidence)
+	}
+	for _, command := range requiredCommands {
+		if !hasSuccessfulCommandEvidence(evidence, command) {
+			return false
+		}
+	}
+	return true
+}
+
+func hasSuccessfulCommandEvidence(evidence executionEvidence, target string) bool {
+	targetKey := normalizeCommandForCompare(target)
+	if targetKey == "" {
+		return false
+	}
+	for _, output := range evidence.Outputs {
+		lower := strings.ToLower(strings.TrimSpace(output))
+		if !strings.Contains(lower, "success=true") {
+			continue
+		}
+		if strings.Contains(normalizeCommandForCompare(output), targetKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func allFilesMatchSuffix(paths []string, suffix string) bool {
