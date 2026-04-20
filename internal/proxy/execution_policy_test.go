@@ -578,6 +578,21 @@ func TestInferTestCommandOutputSuccess_RecognizesSingleLineGoTestOK(t *testing.T
 	}
 }
 
+func TestInferTestCommandOutputSuccess_RecognizesWrappedGoTestOK(t *testing.T) {
+	text := "Command: /bin/zsh -lc 'go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation'\n" +
+		"Chunk ID: abc123\n" +
+		"Wall time: 0.0000 seconds\n" +
+		"Process exited with code 0\n" +
+		"Original token count: 14\n" +
+		"Output:\n" +
+		"ok  \tgithub.com/mison/firew2oai/internal/proxy\t(cached)\n"
+
+	got := inferTestCommandOutputSuccess(text)
+	if got == nil || !*got {
+		t.Fatalf("inferTestCommandOutputSuccess should return true for wrapped go test ok, got %#v", got)
+	}
+}
+
 func TestInferTestCommandOutputSuccess_DoesNotAssumeSuccessForPartialMultiLineOutput(t *testing.T) {
 	got := inferTestCommandOutputSuccess("ok\tgithub.com/mison/firew2oai/internal/config\t(cached)\nok\tgithub.com/mison/firew2oai/internal/tokenauth\t(cached)")
 	if got != nil {
@@ -607,6 +622,35 @@ func TestCollectExecutionHistorySignals_DoesNotMarkPartialTestOutputAsSuccessful
 	}
 	if !reflect.DeepEqual(signals.CommandsWithResult, []string{"go test ./..."}) {
 		t.Fatalf("CommandsWithResult = %#v, want recorded test command", signals.CommandsWithResult)
+	}
+}
+
+func TestCollectExecutionHistorySignals_MarksWrappedGoTestOutputAsSuccessful(t *testing.T) {
+	args, _ := json.Marshal(map[string]any{"cmd": "go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation"})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "exec_command",
+			"call_id":   "call_1",
+			"arguments": string(args),
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_1",
+			"output": "Command: /bin/zsh -lc 'go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation'\n" +
+				"Chunk ID: abc123\n" +
+				"Wall time: 0.0000 seconds\n" +
+				"Process exited with code 0\n" +
+				"Original token count: 14\n" +
+				"Output:\n" +
+				"ok  \tgithub.com/mison/firew2oai/internal/proxy\t(cached)\n",
+		}),
+	}
+
+	signals := collectExecutionHistorySignals(history)
+	want := "go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation"
+	if !reflect.DeepEqual(signals.SuccessfulCommands, []string{want}) {
+		t.Fatalf("SuccessfulCommands = %#v, want %#v", signals.SuccessfulCommands, []string{want})
 	}
 }
 
@@ -926,11 +970,11 @@ func TestLatestActionableUserTask_SkipsToolResultSummary(t *testing.T) {
 	}
 }
 
-func TestStableActionableUserTask_PrefersEarlierSpecificPromptOverContinuation(t *testing.T) {
+func TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation(t *testing.T) {
 	messages := []ChatMessage{
 		{Role: "user", Content: "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n4) 执行命令：go test ./internal/proxy"},
 		{Role: "assistant", Content: "Assistant requested tool: exec_command"},
-		{Role: "user", Content: "继续完成这个测试补强任务"},
+		{Role: "user", Content: "继续推进"},
 		{Role: "user", Content: "Tool result (call_id=abc)\nSuccess: true\nOutput:\npackage proxy"},
 	}
 
@@ -1017,6 +1061,41 @@ func TestBuildExecutionPolicy_ReadOnlyCodingTaskKeepsVerifyWhenFinalTestOutputIs
 	}
 	if strings.TrimSpace(policy.NextCommand) == "" {
 		t.Fatalf("policy.NextCommand = empty, want a follow-up tool step while final test output is partial")
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyCodingTaskAdvancesAfterSeenReadCommandWithoutSuccessFlag(t *testing.T) {
+	task := "你是资深 Go 工程师。请执行一个真实编码排障任务（只读分析，不修改文件）：\n1) 执行 `sed -n '1,220p' internal/proxy/output_constraints.go`\n2) 执行 `sed -n '1,220p' internal/proxy/execution_evidence.go`\n3) 执行 `go test ./internal/proxy`\n4) 执行 `go test ./...`\n完成后只输出四行。"
+	readOneArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,220p' internal/proxy/output_constraints.go"})
+	readTwoArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,220p' internal/proxy/execution_evidence.go"})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": string(readOneArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package proxy", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_2", "arguments": string(readTwoArgs)}),
+	}
+
+	policy := buildExecutionPolicy("deepseek-v3p2", task, history, true, false, true)
+	if policy.NextCommand != "go test ./internal/proxy" {
+		t.Fatalf("next command = %q, want go test ./internal/proxy; policy=%+v", policy.NextCommand, policy)
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyInlinePromptFinalizesWithoutRequiredFiles(t *testing.T) {
+	task := "在当前仓库执行只读核验任务：1) 运行 `sed -n '1,80p' internal/proxy/task_intent.go`；2) 运行 `go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation`；3) 不要修改文件；4) 最后只输出两行。"
+	history := historyExecCommandItems(
+		"sed -n '1,80p' internal/proxy/task_intent.go",
+		"go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation",
+	)
+
+	policy := buildExecutionPolicy("deepseek-v3p2", task, history, true, false, true)
+	if policy.Stage != "finalize" {
+		t.Fatalf("stage = %q, want finalize; policy=%+v", policy.Stage, policy)
+	}
+	if policy.RequireTool {
+		t.Fatalf("policy.RequireTool = true, want false after read-only required commands are done: %+v", policy)
+	}
+	if len(policy.RequiredFiles) != 0 {
+		t.Fatalf("policy.RequiredFiles = %#v, want empty for read-only inline prompt", policy.RequiredFiles)
 	}
 }
 

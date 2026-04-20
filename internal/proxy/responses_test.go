@@ -1357,6 +1357,92 @@ func TestConstrainFinalText_DoesNotMarkIncompleteWriteTaskAsPass(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequiredLabelOutput_PrefersLastCompleteBlock(t *testing.T) {
+	text := "RESULT: FAIL\n" +
+		"FILES: internal/proxy/bad.go\n" +
+		"TEST: 第一个块是脏数据。\n" +
+		"NOTE: 第一个块不应被采用。\n" +
+		"ID: RESULT: PASS FILES: internal/proxy/output_constraints_test.go TEST: 第二个块才是最终答案 NOTE: 只新增测试文件，未修改业务逻辑。"
+
+	got, missing := normalizeRequiredLabelOutput(text, []string{"RESULT", "FILES", "TEST", "NOTE"})
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want none", missing)
+	}
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 第二个块才是最终答案\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("normalized = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_RepairsInlineFourLabelSingleLine(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "ID: RESULT: PASS FILES: internal/proxy/output_constraints_test.go TEST: TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise passed successfully NOTE: Only added test file without modifying business logic"
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_RepairsMarkdownWrappedFinalAnswer(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "ID: ### Final Answer #### RESULT: PASS #### FILES: internal/proxy/output_constraints_test.go #### TEST: 测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise` 通过。 #### NOTE: 只新增了测试，未修改业务逻辑。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/proxy/output_constraints_test.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 只新增测试文件，未修改业务逻辑。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
 func TestConstrainFinalText_EmptyTextSynthesizesFilesAndNote(t *testing.T) {
 	task := "新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`，最后只输出四行：RESULT: PASS 或 FAIL；FILES: 路径；TEST: 说明；NOTE: 是否只新增测试。"
 	evidence := executionEvidence{

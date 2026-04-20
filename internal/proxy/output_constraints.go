@@ -23,6 +23,14 @@ var controlMarkupStripPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?is)<\/?function_call[^>]*>`),
 }
 
+var requiredLabelScaffoldPrefixPattern = regexp.MustCompile(`(?i)^(?:final answer|task_complete|id)\b[:\s-]*`)
+var requiredLabelResultValuePattern = regexp.MustCompile(`(?i)\b(PASS|FAIL)\b`)
+
+type requiredLabelEntry struct {
+	Label string
+	Value string
+}
+
 func enforceTaskOutputConstraints(task, text string, evidence executionEvidence, checkControlMarkup bool) (string, error) {
 	trimmed := strings.TrimSpace(text)
 	strictOutputGate := isStrictOutputGateEnabled()
@@ -110,36 +118,7 @@ func isStrictOutputGateEnabled() bool {
 }
 
 func normalizeRequiredLabelOutput(text string, labels []string) (string, []string) {
-	lines := strings.Split(text, "\n")
-	found := make(map[string]string, len(labels))
-	for _, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" {
-			continue
-		}
-		line = strings.TrimSpace(taskBulletPrefixPattern.ReplaceAllString(line, ""))
-		for _, label := range labels {
-			prefix := label + ":"
-			if !strings.HasPrefix(line, prefix) {
-				continue
-			}
-			if _, exists := found[label]; exists {
-				break
-			}
-			value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-			value = sanitizeRequiredLabelValue(label, value)
-			if value == "" {
-				break
-			}
-			if value == "" {
-				found[label] = prefix
-			} else {
-				found[label] = prefix + " " + value
-			}
-			break
-		}
-	}
-
+	found := selectRequiredLabelValues(text, labels)
 	missing := make([]string, 0, len(labels))
 	ordered := make([]string, 0, len(labels))
 	for _, label := range labels {
@@ -148,7 +127,7 @@ func normalizeRequiredLabelOutput(text string, labels []string) (string, []strin
 			missing = append(missing, label)
 			continue
 		}
-		ordered = append(ordered, value)
+		ordered = append(ordered, label+": "+value)
 	}
 	if len(missing) > 0 {
 		return "", missing
@@ -157,40 +136,129 @@ func normalizeRequiredLabelOutput(text string, labels []string) (string, []strin
 }
 
 func extractRequiredLabelValues(text string, labels []string) map[string]string {
+	return selectRequiredLabelValues(text, labels)
+}
+
+func selectRequiredLabelValues(text string, labels []string) map[string]string {
+	entries := extractRequiredLabelEntries(text, labels)
+	if len(entries) == 0 {
+		return nil
+	}
+	best := selectLastCompleteRequiredLabelBlock(entries, labels)
+	if len(best) == len(labels) {
+		return best
+	}
 	values := make(map[string]string, len(labels))
-	lines := strings.Split(text, "\n")
-	for _, rawLine := range lines {
-		line := strings.TrimSpace(rawLine)
-		if line == "" {
-			continue
-		}
-		line = strings.TrimSpace(taskBulletPrefixPattern.ReplaceAllString(line, ""))
-		for _, label := range labels {
-			prefix := label + ":"
-			if !strings.HasPrefix(line, prefix) {
-				continue
-			}
-			if _, exists := values[label]; exists {
-				break
-			}
-			value := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-			value = sanitizeRequiredLabelValue(label, value)
-			if value == "" {
-				break
-			}
-			values[label] = value
-			break
-		}
+	for _, entry := range entries {
+		values[entry.Label] = entry.Value
 	}
 	return values
 }
 
-func sanitizeRequiredLabelValue(label, value string) string {
+func extractRequiredLabelEntries(text string, labels []string) []requiredLabelEntry {
+	if strings.TrimSpace(text) == "" || len(labels) == 0 {
+		return nil
+	}
+	allowed := make(map[string]string, len(labels))
+	for _, label := range labels {
+		allowed[strings.ToUpper(strings.TrimSpace(label))] = label
+	}
+	matches := taskOutputLabelPattern.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	entries := make([]requiredLabelEntry, 0, len(matches))
+	for i, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+		rawLabel := strings.ToUpper(strings.TrimSpace(text[match[2]:match[3]]))
+		label, ok := allowed[rawLabel]
+		if !ok {
+			continue
+		}
+		valueStart := match[1]
+		valueEnd := len(text)
+		for j := i + 1; j < len(matches); j++ {
+			if len(matches[j]) < 4 {
+				continue
+			}
+			nextLabel := strings.ToUpper(strings.TrimSpace(text[matches[j][2]:matches[j][3]]))
+			if _, ok := allowed[nextLabel]; !ok {
+				continue
+			}
+			valueEnd = matches[j][0]
+			break
+		}
+		value := sanitizeRequiredLabelValue(label, text[valueStart:valueEnd])
+		if value == "" {
+			continue
+		}
+		entries = append(entries, requiredLabelEntry{
+			Label: label,
+			Value: value,
+		})
+	}
+	return entries
+}
+
+func selectLastCompleteRequiredLabelBlock(entries []requiredLabelEntry, labels []string) map[string]string {
+	if len(entries) == 0 || len(labels) == 0 {
+		return nil
+	}
+	var best map[string]string
+	for start := 0; start < len(entries); start++ {
+		if !strings.EqualFold(entries[start].Label, labels[0]) {
+			continue
+		}
+		candidate := make(map[string]string, len(labels))
+		nextLabelIdx := 0
+		for i := start; i < len(entries) && nextLabelIdx < len(labels); i++ {
+			if !strings.EqualFold(entries[i].Label, labels[nextLabelIdx]) {
+				continue
+			}
+			candidate[labels[nextLabelIdx]] = entries[i].Value
+			nextLabelIdx++
+		}
+		if nextLabelIdx == len(labels) {
+			best = candidate
+		}
+	}
+	return best
+}
+
+func normalizeRequiredLabelSegment(label, value string) string {
 	trimmed := strings.TrimSpace(value)
+	trimChars := "#>*`-: \t\r\n"
+	if strings.EqualFold(strings.TrimSpace(label), "README") {
+		trimChars = ">*`-: \t\r\n"
+	}
+	for trimmed != "" {
+		next := strings.TrimSpace(trimmed)
+		next = strings.TrimLeft(next, trimChars)
+		next = requiredLabelScaffoldPrefixPattern.ReplaceAllString(next, "")
+		next = strings.TrimSpace(next)
+		next = strings.TrimRight(next, trimChars)
+		if next == trimmed {
+			break
+		}
+		trimmed = next
+	}
+	return strings.TrimSpace(strings.Join(strings.Fields(trimmed), " "))
+}
+
+func sanitizeRequiredLabelValue(label, value string) string {
+	trimmed := normalizeRequiredLabelSegment(label, value)
 	if trimmed == "" {
 		return ""
 	}
 	switch strings.ToUpper(strings.TrimSpace(label)) {
+	case "RESULT":
+		match := requiredLabelResultValuePattern.FindStringSubmatch(trimmed)
+		if len(match) < 2 {
+			return ""
+		}
+		return strings.ToUpper(strings.TrimSpace(match[1]))
 	case "CONSTRAINT", "EVIDENCE", "README", "TOOLP", "TEST", "NOTE":
 		lower := strings.ToLower(trimmed)
 		noiseMarkers := []string{
@@ -220,6 +288,7 @@ func sanitizeRequiredLabelValue(label, value string) string {
 				return ""
 			}
 		}
+		return trimmed
 	case "FILES":
 		matches := dedupePreserveOrder(taskFilePathPattern.FindAllString(trimmed, -1))
 		if len(matches) == 0 {

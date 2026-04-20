@@ -31,6 +31,25 @@ func TestExtractWriteTargetFiles_OnlyReturnsMutationTargets(t *testing.T) {
 	}
 }
 
+func TestExtractWriteTargetFiles_OnlyReturnsMutationTargetsFromSingleLineSteps(t *testing.T) {
+	task := "请在当前仓库完成一个真实但边界清晰的测试补强任务：1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。 2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。 3) 执行命令：go test ./internal/proxy"
+
+	got := extractWriteTargetFiles(task)
+	want := []string{"internal/proxy/output_constraints_test.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractWriteTargetFiles mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestExtractWriteTargetFiles_ReadOnlyInlineStepsReturnEmpty(t *testing.T) {
+	task := "在当前仓库执行只读核验任务：1) 运行 `sed -n '1,80p' internal/proxy/task_intent.go`；2) 运行 `go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation`；3) 不要修改文件；4) 最后只输出两行。"
+
+	got := extractWriteTargetFiles(task)
+	if len(got) != 0 {
+		t.Fatalf("extractWriteTargetFiles = %#v, want empty for read-only task", got)
+	}
+}
+
 func TestExtractBestActionableTaskBlock_PrefersConcreteTaskOverRepositoryGuidelines(t *testing.T) {
 	text := "## Repository Guidelines\n" +
 		"提交前扫描命令：rg -n \"#\\[test\\]|#\\[cfg\\(test\\)\\]\" src/ -g \"*.rs\"\n\n" +
@@ -45,6 +64,37 @@ func TestExtractBestActionableTaskBlock_PrefersConcreteTaskOverRepositoryGuideli
 	}
 	if strings.Contains(got, "rg -n") {
 		t.Fatalf("best actionable block should exclude repository guideline command pollution, got: %q", got)
+	}
+}
+
+func TestExtractBestActionableTaskBlock_PrefersMinimalPromptOverRepositoryGuidelines(t *testing.T) {
+	text := "## Repository Guidelines\n" +
+		"## Project Structure & Module Organization\n" +
+		"## Build, Test, and Development Commands\n" +
+		"- `make test`：执行 `go test -v -race ./...`\n\n" +
+		"只回答 ok"
+
+	got := extractBestActionableTaskBlock(text)
+	if got != "只回答 ok" {
+		t.Fatalf("best actionable block = %q, want simple prompt", got)
+	}
+}
+
+func TestStableActionableUserTask_PrefersLatestSimplePromptOverOlderRepositoryGuidelines(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role: "user",
+			Content: "## Repository Guidelines\n" +
+				"## Project Structure & Module Organization\n" +
+				"## Build, Test, and Development Commands\n" +
+				"- `make test`：执行 `go test -v -race ./...`",
+		},
+		{Role: "user", Content: "只回答 ok"},
+	}
+
+	got := stableActionableUserTask(messages)
+	if got != "只回答 ok" {
+		t.Fatalf("stable actionable task = %q, want latest simple prompt", got)
 	}
 }
 
@@ -283,6 +333,51 @@ func TestApplyExecutionPolicyToParseResult_PendingWriteRewritesReadOnlyToNextCom
 		PendingWrite:  true,
 		RequiredFiles: []string{"internal/proxy/output_constraints_test.go"},
 		NextCommand:   nextCommand,
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	command := parsedCallCommand(t, got.calls[0])
+	if command != nextCommand {
+		t.Fatalf("rewritten command = %q, want %q", command, nextCommand)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_PendingWriteAfterRealWriteRewritesReadOnlyToNextCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "继续读文件。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,200p' 'internal/proxy/output_constraints.go'\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	nextCommand := "go test ./internal/proxy"
+	policy := executionPolicy{
+		Enabled:              true,
+		RequireTool:          true,
+		PendingWrite:         true,
+		RequiredFiles:        []string{"internal/proxy/output_constraints_test.go"},
+		RequiredCommands:     []string{"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'", "go test ./internal/proxy"},
+		AllRequiredFilesSeen: true,
+		HasWriteObserved:     true,
+		NextCommand:          nextCommand,
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	command := parsedCallCommand(t, got.calls[0])
+	if command != nextCommand {
+		t.Fatalf("rewritten command = %q, want %q", command, nextCommand)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesSequentialExecDriftToNextCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "继续验证。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./internal/proxy\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	nextCommand := buildReadFileCommand("README.md")
+	policy := executionPolicy{
+		Enabled:     true,
+		RequireTool: true,
+		NextCommand: nextCommand,
 	}
 
 	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})

@@ -22,6 +22,7 @@ type executionPolicy struct {
 	RequiredCommands     []string
 	RequiredFiles        []string
 	AllRequiredFilesSeen bool
+	HasWriteObserved     bool
 	SeenCommands         []string
 	ForceSingleToolCall  bool
 	AllowTruncateToMax   bool
@@ -58,7 +59,7 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 	signals := collectExecutionHistorySignals(historyItems)
 	requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
 	allMentionedFiles := dedupePreserveOrder(taskFilePathPattern.FindAllString(task, -1))
-	requiredFiles := allMentionedFiles
+	var requiredFiles []string
 	sequenceFiles := allMentionedFiles
 	if needsWrite := taskLikelyNeedsWrite(task); needsWrite {
 		writeTargets := dedupePreserveOrder(extractWriteTargetFiles(task))
@@ -91,6 +92,7 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 	policy.EmptyFiles = emptyFiles
 	policy.RepeatedScaffold = repeatedScaffold
 	policy.AllRequiredFilesSeen = allRequiredFilesSeen(signals.Commands, requiredFiles)
+	policy.HasWriteObserved = signals.WriteCalls > 0
 	policy.SeenCommands = dedupePreserveOrder(signals.Commands)
 	policy.PendingWrite = pendingWrite
 	switch {
@@ -289,6 +291,15 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 				result.candidateFound = true
 			}
 		}
+		if shouldRewriteSequentialExecCallsToNext(result.calls, policy.NextCommand) {
+			if synthetic, ok := buildSyntheticExecCommandCall(policy.NextCommand, toolCatalog, constraints.RequiredTool); ok {
+				result.calls = []parsedToolCall{synthetic}
+				result.err = nil
+				result.visibleText = ""
+				result.mode = toolProtocolModeAIActionsTool
+				result.candidateFound = true
+			}
+		}
 		return result
 	}
 
@@ -347,6 +358,9 @@ func shouldBlockReadOnlyDuringPendingWrite(policy executionPolicy) bool {
 	if len(policy.EmptyFiles) > 0 || len(policy.RepeatedScaffold) > 0 {
 		return true
 	}
+	if policy.HasWriteObserved {
+		return false
+	}
 	return policy.AllRequiredFilesSeen
 }
 
@@ -379,6 +393,29 @@ func shouldRewriteReadOnlyCallsToNext(calls []parsedToolCall, nextCommand string
 		}
 	}
 	return allReadOnly && !matchedNext
+}
+
+func shouldRewriteSequentialExecCallsToNext(calls []parsedToolCall, nextCommand string) bool {
+	next := strings.TrimSpace(nextCommand)
+	if next == "" || len(calls) == 0 {
+		return false
+	}
+	allSequentialExec := true
+	matchedNext := false
+	for _, call := range calls {
+		name, command, ok := parsedToolCallInvocation(call)
+		if !ok || name != "exec_command" {
+			return false
+		}
+		if hasSatisfiedRequiredCommand([]string{command}, next) {
+			matchedNext = true
+		}
+		if !(isReadOnlyCommand(command) || isTestCommand(command) || isGuardFailureCommand(command)) {
+			allSequentialExec = false
+			break
+		}
+	}
+	return allSequentialExec && !matchedNext
 }
 
 func callsAdvanceNextRequiredCommand(calls []parsedToolCall, nextCommand string, seenCommands []string) bool {
@@ -612,6 +649,17 @@ func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, style
 	resolveCommandDone := func(command string) bool {
 		if hasSatisfiedRequiredCommand(signals.SuccessfulCommands, command) {
 			return true
+		}
+		if isReadOnlyCommand(command) {
+			if hasSatisfiedRequiredCommand(signals.FailedCommands, command) {
+				return false
+			}
+			if hasSatisfiedRequiredCommand(signals.CommandsWithResult, command) {
+				return true
+			}
+			if hasSatisfiedRequiredCommand(signals.Commands, command) {
+				return true
+			}
 		}
 		// Backward-compatible fallback for environments that do not emit success flags.
 		if len(signals.SuccessfulCommands) == 0 {
@@ -1003,7 +1051,21 @@ func inferTestCommandOutputSuccess(text string) *bool {
 		return nil
 	}
 
-	lines := strings.Split(trimmed, "\n")
+	if inferred := inferSingleLineTestSuccess(trimmed); inferred != nil {
+		return inferred
+	}
+
+	if wrapped := extractWrappedCommandOutput(trimmed); wrapped != "" {
+		if inferred := inferSingleLineTestSuccess(wrapped); inferred != nil {
+			return inferred
+		}
+	}
+
+	return nil
+}
+
+func inferSingleLineTestSuccess(text string) *bool {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
 	if len(lines) != 1 {
 		return nil
 	}
@@ -1022,6 +1084,45 @@ func inferTestCommandOutputSuccess(text string) *bool {
 	default:
 		return nil
 	}
+}
+
+func extractWrappedCommandOutput(text string) string {
+	lower := strings.ToLower(text)
+	idx := strings.LastIndex(lower, "\noutput:")
+	markerLen := len("\noutput:")
+	if idx < 0 {
+		idx = strings.Index(lower, "output:")
+		markerLen = len("output:")
+	}
+	if idx < 0 {
+		return ""
+	}
+
+	payload := strings.TrimSpace(text[idx+markerLen:])
+	if payload == "" {
+		return ""
+	}
+
+	lines := strings.Split(payload, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lowerLine := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lowerLine, "chunk id:"),
+			strings.HasPrefix(lowerLine, "wall time:"),
+			strings.HasPrefix(lowerLine, "original token count:"),
+			strings.HasPrefix(lowerLine, "command:"),
+			strings.HasPrefix(lowerLine, "process exited with code"):
+			continue
+		default:
+			kept = append(kept, trimmed)
+		}
+	}
+	return strings.Join(kept, "\n")
 }
 
 func normalizeCommandForCompare(command string) string {

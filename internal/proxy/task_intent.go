@@ -89,6 +89,7 @@ var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
 var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only output|output only)\b[\s\S]*$`)
 var taskCommandTrailingConnectorPattern = regexp.MustCompile(`(?:\s|，|,|、|；|;)*(?:和|以及|及|and|then|然后)\s*$`)
+var taskInlineStepMarkerPattern = regexp.MustCompile(`(?:^|\s)(?:\d+[.)]|[（(]?\d+[）)])\s+`)
 
 func latestUserTask(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -122,7 +123,10 @@ func latestActionableUserTask(messages []ChatMessage) string {
 
 func stableActionableUserTask(messages []ChatMessage) string {
 	latest := latestActionableUserTask(messages)
-	if actionableTaskSpecificityScore(latest) >= 20 {
+	if latest == "" {
+		return latestUserTask(messages)
+	}
+	if !isWeakFollowupTask(latest) {
 		return latest
 	}
 
@@ -147,6 +151,39 @@ func stableActionableUserTask(messages []ChatMessage) string {
 		return best
 	}
 	return latest
+}
+
+func isWeakFollowupTask(task string) bool {
+	trimmed := strings.TrimSpace(task)
+	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	if isInstructionDocumentBlock(lower) {
+		return true
+	}
+	if actionableTaskSpecificityScore(trimmed) >= 20 {
+		return false
+	}
+	for _, marker := range []string{
+		"继续",
+		"继续推进",
+		"继续处理",
+		"继续完成",
+		"继续分析",
+		"继续优化",
+		"ok，那继续",
+		"ok, continue",
+		"continue",
+		"continue please",
+		"go on",
+		"keep going",
+	} {
+		if lower == marker {
+			return true
+		}
+	}
+	return false
 }
 
 func isToolResultSummaryMessage(text string) bool {
@@ -193,6 +230,9 @@ func actionableTaskBlockScore(block string) int {
 	if lower == "" {
 		return 0
 	}
+	if isInstructionDocumentBlock(lower) {
+		score -= 120
+	}
 	for _, marker := range []string{
 		"agents.md",
 		"repository guidelines",
@@ -215,6 +255,35 @@ func actionableTaskBlockScore(block string) int {
 		score -= 20
 	}
 	return score
+}
+
+func isInstructionDocumentBlock(lower string) bool {
+	if lower == "" {
+		return false
+	}
+	docMarkers := []string{
+		"# repository guidelines",
+		"## project structure & module organization",
+		"## build, test, and development commands",
+		"## coding style & naming conventions",
+		"## testing guidelines",
+		"## commit & pull request guidelines",
+		"## security & configuration tips",
+		"document requirements",
+		"recommended sections",
+		"任务工作流",
+		"质量红线",
+		"测试体系",
+		"仓库执行约束",
+		"附录：skills 使用规则",
+	}
+	matchCount := 0
+	for _, marker := range docMarkers {
+		if strings.Contains(lower, marker) {
+			matchCount++
+		}
+	}
+	return matchCount >= 2
 }
 
 func actionableTaskSpecificityScore(task string) int {
@@ -400,20 +469,63 @@ func extractStyleInspectionCommands(task string) []string {
 }
 
 func extractWriteTargetFiles(task string) []string {
-	lines := strings.Split(task, "\n")
+	if !taskLikelyNeedsWrite(task) {
+		return nil
+	}
+	segments := splitTaskActionSegments(task)
 	targets := make([]string, 0, 4)
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" {
-			continue
-		}
-		lower := strings.ToLower(trimmed)
+	for _, segment := range segments {
+		lower := strings.ToLower(segment)
 		if !containsAny(lower, taskWriteKeywords) {
 			continue
 		}
-		targets = append(targets, taskFilePathPattern.FindAllString(trimmed, -1)...)
+		targets = append(targets, taskFilePathPattern.FindAllString(segment, -1)...)
 	}
 	return dedupePreserveOrder(targets)
+}
+
+func splitTaskActionSegments(task string) []string {
+	lines := strings.Split(task, "\n")
+	segments := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		inline := splitInlineTaskSteps(line)
+		if len(inline) == 0 {
+			segments = append(segments, line)
+			continue
+		}
+		segments = append(segments, inline...)
+	}
+	return dedupePreserveOrder(segments)
+}
+
+func splitInlineTaskSteps(line string) []string {
+	matches := taskInlineStepMarkerPattern.FindAllStringIndex(line, -1)
+	if len(matches) <= 1 {
+		return []string{strings.TrimSpace(line)}
+	}
+	segments := make([]string, 0, len(matches))
+	for i, match := range matches {
+		start := match[0]
+		if start > 0 && line[start] == ' ' {
+			start++
+		}
+		end := len(line)
+		if i+1 < len(matches) {
+			end = matches[i+1][0]
+		}
+		segment := strings.TrimSpace(line[start:end])
+		if segment != "" {
+			segments = append(segments, segment)
+		}
+	}
+	if len(segments) == 0 {
+		return []string{strings.TrimSpace(line)}
+	}
+	return segments
 }
 
 func extractNamedGoTests(task string) []string {
