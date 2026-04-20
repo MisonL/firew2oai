@@ -84,8 +84,10 @@
 - **错误事件处理**: 正确保留并返回 Fireworks `type=error` 中的 404 明细
 - **Responses 多轮会话**: 支持 `previous_response_id` 以内存会话态串联多轮上下文
 
-### 兼容性验证
+### 兼容性验证（2026-04-20 更新）
 - ✅ 直连模式（Codex / OpenAI 客户端）
 - ✅ 中转模式（New API / One API）
 - ✅ 流式 + 非流式响应
-- ✅ 11 个可用模型通过测试
+- ✅ 当前 12 个启用模型均通过只读 Coding 审计任务
+- ⚠️ 真实写代码任务下，当前为 `7/12` 实际完成，`2/12` 严格四行收口
+- ⚠️ 最新结论见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`

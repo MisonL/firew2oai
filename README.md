@@ -13,16 +13,46 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 ## 当前验证状态
 
-核对日期：2026-04-19  
-验证范围：`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7`、`deepseek-v3p2`、`deepseek-v3p1`
+核对日期：2026-04-20  
+当前结论按任务类型区分，不再把 2026-04-19 的单轮双链路结果直接视为“当前整体可用”。
 
-| 链路 | commands_ok | turn_completed | format_ok | failed |
-|---|---:|---:|---:|---:|
-| direct | 6/6 | 6/6 | 6/6 | 0/6 |
-| newapi | 6/6 | 6/6 | 6/6 | 0/6 |
+### Codex 直连 firew2oai
+
+1. 只读 Coding 审计任务  
+   当前 12 个启用模型全部通过，证据目录：`/private/tmp/firew2oai-allmodels-latest2-20260419-233301`
+2. 真实写代码任务（新增测试文件 + 两次 `go test`）  
+   本轮复测结果：实际任务完成 `7/12`，严格四行收口 `2/12`，证据目录：`/private/tmp/firew2oai-writebench-postfix-20260420-094500`
+
+| 任务类型 | 范围 | 结果 |
+|---|---|---|
+| 只读审计 | 12 模型 | `12/12` 完成 |
+| 写代码任务 | 12 模型 | `7/12` 实际完成，`2/12` 严格收口 |
+
+写代码任务中，当前表现更稳定的模型是：
+
+- `qwen3-vl-30b-a3b-instruct`
+- `deepseek-v3p2`
+- `minimax-m2p5`
+- `llama-v3p3-70b-instruct`
+- `kimi-k2p5`
+- `glm-5`
+- `glm-4p7`
+
+仍未稳定通过真实写代码任务的模型：
+
+- `qwen3-vl-30b-a3b-thinking`
+- `qwen3-8b`
+- `gpt-oss-20b`
+- `gpt-oss-120b`
+- `deepseek-v3p1`（本轮出现执行波动）
+
+### New API / One API 中转
+
+2026-04-19 的 6 模型双链路复测在固定三步命令任务上通过，但该结果不代表当前版本在更复杂真实写代码任务下同样成立。最新更严格结论以 2026-04-20 直连矩阵为准。
 
 详细记录见：
 
+- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-19.md`
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-18.md`
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-17.md`
@@ -131,7 +161,7 @@ wire_api = "responses"
 4. 渠道密钥填写 firew2oai 的 API Key
 5. 如果同模型有多个渠道，提高 firew2oai 渠道优先级
 
-说明：2026-04-19 复测中，请求命中目标渠道 `channel_id=106`。
+说明：若走 New API / One API，多渠道同模型时应提高 `firew2oai` 渠道优先级；旧矩阵中已验证请求命中目标渠道 `channel_id=106`。
 
 ## 协议适配逻辑
 

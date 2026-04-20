@@ -60,7 +60,7 @@ func TestResponsesPromptMessages_InstructionsNotStored(t *testing.T) {
 		{Role: "user", Content: "second"},
 	}
 	tools := json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`)
-	prompt := buildResponsesPrompt(base, "be concise", current, tools, 0)
+	prompt := buildResponsesPrompt(base, "be concise", current, tools, 0, responsesPromptOptions{})
 
 	for _, want := range []string{
 		"<BASE_INSTRUCTIONS>",
@@ -79,6 +79,156 @@ func TestResponsesPromptMessages_InstructionsNotStored(t *testing.T) {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+func TestBuildResponsesPrompt_FinalizeCompactsMetaContext(t *testing.T) {
+	base := []ChatMessage{
+		{Role: "assistant", Content: "I've received the context handoff. What would you like me to work on?"},
+		{Role: "user", Content: "Tool result (call_id=abc)\nSuccess: true\nOutput:\n/Volumes/Work/code/firew2oai"},
+	}
+	current := []ChatMessage{
+		{Role: "developer", Content: "checkpoint handoff summary"},
+		{Role: "user", Content: "只输出四行：RESULT: PASS；CONSTRAINT: ...；EVIDENCE: ...；TEST: ..."},
+	}
+	tools := json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`)
+
+	prompt := buildResponsesPrompt(base, "be concise", current, tools, 0, responsesPromptOptions{
+		CompactForFinalize:  true,
+		SuppressMetaContext: true,
+	})
+
+	for _, want := range []string{
+		"<CURRENT_USER_TASK>",
+		"只输出四行",
+		"Finalize stage reached.",
+		"Use CURRENT_USER_TASK and EXECUTION_EVIDENCE to produce the final answer.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("compact finalize prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{
+		"<PREVIOUS_CONVERSATION>",
+		"<CURRENT_TURN_CONTEXT>",
+		"context handoff",
+		"checkpoint handoff summary",
+		"What would you like me to work on",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("compact finalize prompt should omit %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
+func TestBuildPendingWriteMutationHint_ListsMissingTargetsAndMutationTools(t *testing.T) {
+	policy := executionPolicy{
+		PendingWrite: true,
+		MissingFiles: []string{"internal/proxy/output_constraints_test.go"},
+	}
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_file":   {Name: "write_file", Type: "function", Structured: true},
+		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+	}
+
+	hint := buildPendingWriteMutationHint(policy, toolCatalog)
+	for _, want := range []string{
+		"<WRITE_MUTATION_HINT>",
+		"internal/proxy/output_constraints_test.go",
+		"write_file",
+		"apply_patch",
+		"Emit exactly one mutation tool call now.",
+	} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("write mutation hint missing %q:\n%s", want, hint)
+		}
+	}
+	if strings.Contains(hint, "exec_command") {
+		t.Fatalf("write mutation hint should not list non-mutation tools:\n%s", hint)
+	}
+}
+
+func TestBuildPendingWriteMutationHint_FallsBackToExecCommandWriteGuidance(t *testing.T) {
+	policy := executionPolicy{
+		PendingWrite:         true,
+		AllRequiredFilesSeen: true,
+		RequiredFiles:        []string{"internal/proxy/output_constraints_test.go"},
+		EmptyFiles:           []string{"internal/proxy/output_constraints_test.go"},
+		RepeatedScaffold:     []string{"internal/proxy/output_constraints_test.go"},
+	}
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+
+	hint := buildPendingWriteMutationHint(policy, toolCatalog)
+	for _, want := range []string{
+		"All required files have already been inspected.",
+		"These target files already exist but are still empty.",
+		"Repeated scaffold-only commands were already observed",
+		"Use exec_command with a shell write/edit command now.",
+		"Invalid now: pwd, ls, cat, sed -n, head, tail, rg, grep, or any other read-only command.",
+		"Emit exactly one exec_command call whose cmd mutates the target file now.",
+	} {
+		if !strings.Contains(hint, want) {
+			t.Fatalf("exec_command fallback write hint missing %q:\n%s", want, hint)
+		}
+	}
+}
+
+func TestPreferredPendingWriteTool_PrefersConcreteFileMutationBeforeApplyPatch(t *testing.T) {
+	got := preferredPendingWriteTool([]string{"apply_patch", "write_file", "append_file"})
+	if got != "write_file" {
+		t.Fatalf("preferredPendingWriteTool = %q, want write_file", got)
+	}
+}
+
+func TestBuildResponsesPrompt_UsesDeclaredFileToolNamesWhenAvailable(t *testing.T) {
+	tools := json.RawMessage(`[
+		{"type":"function","name":"read_file","description":"read file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}},
+		{"type":"function","name":"write_file","description":"write file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}}
+	]`)
+	prompt := buildResponsesPrompt(nil, "", []ChatMessage{{Role: "user", Content: "修改 internal/proxy/output_constraints.go"}}, tools, 1, responsesPromptOptions{})
+
+	if !strings.Contains(prompt, "If file tools are listed in AVAILABLE_TOOLS, use those exact names for file reads and writes.") {
+		t.Fatalf("prompt missing declared file tool guidance:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "Do not emit read_file/cat/list_files aliases; use exec_command with cmd instead.") {
+		t.Fatalf("prompt should not force exec_command when file tools are declared:\n%s", prompt)
+	}
+}
+
+func TestConstrainFinalText_MetaHandoffSynthesizesKnownLabels(t *testing.T) {
+	task := "读取 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，运行 go test ./internal/proxy 和 go test ./...，最终只输出四行：RESULT: PASS 或 FAIL；CONSTRAINT: 说明；EVIDENCE: 说明；TEST: 说明。"
+	text := "I've reviewed the handoff context. Ready to assist when you provide the specific task."
+	evidence := executionEvidence{
+		Commands: []string{
+			"sed -n '1,220p' internal/proxy/output_constraints.go",
+			"sed -n '1,220p' internal/proxy/execution_evidence.go",
+			"go test ./internal/proxy",
+			"go test ./...",
+		},
+		Outputs: []string{
+			"sed -n '1,220p' internal/proxy/output_constraints.go => success=true package proxy func enforceTaskOutputConstraints(task, text string, evidence executionEvidence, checkControlMarkup bool)",
+			"sed -n '1,220p' internal/proxy/execution_evidence.go => success=true package proxy func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence",
+			"go test ./internal/proxy => success=true ok",
+			"go test ./... => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	for _, want := range []string{
+		"RESULT: PASS",
+		"CONSTRAINT:",
+		"EVIDENCE:",
+		"TEST:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("constrained text missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(strings.ToLower(got), "handoff") {
+		t.Fatalf("constrained text should not leak handoff meta text:\n%s", got)
 	}
 }
 
@@ -783,6 +933,44 @@ func TestHandleResponses_NonStreamRequiredLabelsMissingSynthesizesLabels(t *test
 	}
 }
 
+func TestHandleResponses_NonStreamNoisyRequiredLabelsAreRewritten(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"RESULT: PASS\\nCONSTRAINT: Chunk ID: 123abc Wall time: 0.0000 seconds Process exited with code 0 Output: package proxy ...\\nEVIDENCE: Chunk ID: 456def Wall time: 0.0000 seconds Process exited with code 0 Output: package proxy ...\\nTEST: 全部测试通过\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"glm-5","stream":false,"input":"你是资深 Go 工程师。请执行一个真实编码排障任务（只读分析，不修改文件）：最终只输出四行：RESULT: PASS 或 FAIL；CONSTRAINT: 一句话说明 output_constraints 这一层的核心职责；EVIDENCE: 一句话说明 execution_evidence 这一层的核心职责；TEST: 一句话给出测试是否通过与关键结果。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	var item ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[0], &item); err != nil {
+		t.Fatalf("decode output item: %v", err)
+	}
+	got := item.Content[0].Text
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("final text lines = %d, want 4, text=%q", len(lines), got)
+	}
+	if got != "RESULT: PASS\nCONSTRAINT: 负责对最终输出文本执行标签约束校验、控制标记清理与严格门禁拦截。\nEVIDENCE: 负责从历史消息中提取已执行命令与工具输出摘要，构建可追溯的执行证据块。\nTEST: 全部测试通过" {
+		t.Fatalf("final text = %q", got)
+	}
+}
+
 func TestHandleResponses_NonStreamRequiredLabelsEmptySynthesizesLabels(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -952,7 +1140,7 @@ func TestSynthesizeRequiredLabelOutput_FromEvidence(t *testing.T) {
 			"go test ./internal/proxy => success=true ok",
 		},
 	}
-	got, ok := synthesizeRequiredLabelOutput(text, labels, evidence)
+	got, ok := synthesizeRequiredLabelOutput("", text, labels, evidence)
 	if !ok {
 		t.Fatal("synthesizeRequiredLabelOutput returned ok=false, want true")
 	}
@@ -968,5 +1156,74 @@ func TestSynthesizeRequiredLabelOutput_FromEvidence(t *testing.T) {
 	}
 	if !strings.HasPrefix(lines[2], "TOOLP: ") {
 		t.Fatalf("line3 = %q, want TOOLP label", lines[2])
+	}
+}
+
+func TestConstrainFinalText_RepairsMalformedFilesAndNoteLabelsFromTask(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy\n\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: <PASS 或 FAIL>\n" +
+		"FILES: <修改的文件路径，若只改一个就写一个>\n" +
+		"TEST: <一句话说明测试结果>\n" +
+		"NOTE: <一句话说明是否只新增测试且未改业务逻辑>"
+	text := "ID: I'll start by reading the existing files to understand the code structure and testing style.\n" +
+		"RESULT: PASS\n" +
+		"FILES: I'll start by reading the existing files to understand the code structure and testing style.\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: I'll start by reading the existing files to understand the code structure and testing style."
+	evidence := executionEvidence{
+		Commands: []string{
+			"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5",
+			"sed -n '1,200p' 'internal/proxy/output_constraints.go'",
+			"python3 -c 'from pathlib import Path; Path(\"internal/proxy/output_constraints_test.go\").write_text(\"package proxy\\n\", encoding='\"'\"'utf-8'\"'\"')'",
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("line count = %d, want 4, text=%q", len(lines), got)
+	}
+	if lines[1] != "FILES: internal/proxy/output_constraints_test.go" {
+		t.Fatalf("FILES line = %q", lines[1])
+	}
+	if lines[3] != "NOTE: 只新增测试文件，未修改业务逻辑。" {
+		t.Fatalf("NOTE line = %q", lines[3])
+	}
+}
+
+func TestConstrainFinalText_EmptyTextSynthesizesFilesAndNote(t *testing.T) {
+	task := "新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`，最后只输出四行：RESULT: PASS 或 FAIL；FILES: 路径；TEST: 说明；NOTE: 是否只新增测试。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+			"go test ./internal/proxy",
+		},
+		Outputs: []string{
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok",
+			"go test ./internal/proxy => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, "", evidence, true)
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: internal/proxy/output_constraints_test.go",
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。",
+		"NOTE: 只新增测试文件，未修改业务逻辑。",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("constrained text missing %q:\n%s", want, got)
+		}
 	}
 }

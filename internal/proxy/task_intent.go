@@ -1,7 +1,9 @@
 package proxy
 
 import (
+	"path"
 	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -25,6 +27,25 @@ var taskPlainResponseKeywords = []string{
 var taskWriteKeywords = []string{
 	"edit", "modify", "update", "fix", "patch", "implement", "add", "create", "write", "change", "refactor",
 	"修改", "修复", "新增", "添加", "实现", "重构", "优化", "完善", "补充",
+}
+
+var taskReadOnlyMarkers = []string{
+	"read-only",
+	"readonly",
+	"without modifying",
+	"without changes",
+	"do not modify",
+	"don't modify",
+	"no file changes",
+	"只读",
+	"不修改",
+	"不要修改",
+	"无需修改",
+	"不改文件",
+	"不修改文件",
+	"不要改文件",
+	"仅读",
+	"只做分析",
 }
 
 var taskShellCommandPrefixes = []string{
@@ -57,13 +78,16 @@ var taskShellCommandPrefixes = []string{
 }
 
 var taskFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql)`)
+var taskTestStyleGlobPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+\*_test\.go`)
 var taskCommandLinePattern = regexp.MustCompile(`(?im)^\s*(?:[-*]|\d+[.)])?\s*((?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^\n]*)$`)
-var taskInlineCommandPattern = regexp.MustCompile(`(?i)\b(?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^,\n。；;]*`)
 var taskCommandLabelPattern = regexp.MustCompile(`(?i)(?:执行命令|run command|execute command)\s*[:：]`)
 var taskTrailingBulletSuffixPattern = regexp.MustCompile(`\s+[（(]?\d+[.)）]\s*$`)
+var taskCommandTrailingStepPattern = regexp.MustCompile(`\s+\d+[.)][\s\S]*$`)
 var taskBacktickPattern = regexp.MustCompile("`([^`\\n]+)`")
+var goTestNamePattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*\b`)
 var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
+var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only output|output only)\b[\s\S]*$`)
 
 func latestUserTask(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -90,9 +114,38 @@ func latestActionableUserTask(messages []ChatMessage) string {
 		if isToolResultSummaryMessage(text) {
 			continue
 		}
-		return text
+		return extractBestActionableTaskBlock(text)
 	}
 	return latestUserTask(messages)
+}
+
+func stableActionableUserTask(messages []ChatMessage) string {
+	latest := latestActionableUserTask(messages)
+	if actionableTaskSpecificityScore(latest) >= 20 {
+		return latest
+	}
+
+	best := latest
+	bestScore := actionableTaskSpecificityScore(latest)
+	for i := len(messages) - 1; i >= 0; i-- {
+		if !strings.EqualFold(messages[i].Role, "user") {
+			continue
+		}
+		text := strings.TrimSpace(messages[i].Content)
+		if text == "" || isToolResultSummaryMessage(text) {
+			continue
+		}
+		candidate := extractBestActionableTaskBlock(text)
+		score := actionableTaskBlockScore(candidate)
+		if score > bestScore {
+			best = candidate
+			bestScore = score
+		}
+	}
+	if strings.TrimSpace(best) != "" {
+		return best
+	}
+	return latest
 }
 
 func isToolResultSummaryMessage(text string) bool {
@@ -101,6 +154,85 @@ func isToolResultSummaryMessage(text string) bool {
 		return false
 	}
 	return strings.HasPrefix(lower, "tool result") || strings.HasPrefix(lower, "tool output")
+}
+
+func extractBestActionableTaskBlock(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	best := trimmed
+	bestScore := actionableTaskBlockScore(trimmed)
+	for _, block := range splitTaskBlocks(trimmed) {
+		score := actionableTaskBlockScore(block)
+		if score > bestScore {
+			best = block
+			bestScore = score
+		}
+	}
+	return strings.TrimSpace(best)
+}
+
+func splitTaskBlocks(text string) []string {
+	parts := strings.Split(text, "\n\n")
+	blocks := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		blocks = append(blocks, part)
+	}
+	return blocks
+}
+
+func actionableTaskBlockScore(block string) int {
+	score := actionableTaskSpecificityScore(block)
+	lower := strings.ToLower(strings.TrimSpace(block))
+	if lower == "" {
+		return 0
+	}
+	for _, marker := range []string{
+		"agents.md",
+		"repository guidelines",
+		"任务工作流",
+		"质量红线",
+		"测试体系",
+		"工程质量基线",
+		"附录：skills 使用规则",
+		"schema-sensitive",
+		"rust/python",
+	} {
+		if strings.Contains(lower, marker) {
+			score -= 40
+		}
+	}
+	if strings.Contains(lower, "请在当前仓库完成") || strings.Contains(lower, "最后只输出") {
+		score += 20
+	}
+	if strings.Count(block, "\n") >= 12 {
+		score -= 20
+	}
+	return score
+}
+
+func actionableTaskSpecificityScore(task string) int {
+	trimmed := strings.TrimSpace(task)
+	if trimmed == "" {
+		return 0
+	}
+
+	score := 0
+	score += len(dedupePreserveOrder(taskFilePathPattern.FindAllString(trimmed, -1))) * 20
+	score += len(dedupePreserveOrder(extractRequiredCommands(trimmed))) * 15
+	score += len(dedupePreserveOrder(extractRequiredOutputLabels(trimmed))) * 10
+	if taskLikelyNeedsWrite(trimmed) {
+		score += 10
+	}
+	if taskLikelyNeedsTools(trimmed) {
+		score += 5
+	}
+	return score
 }
 
 func taskLikelyNeedsTools(task string) bool {
@@ -138,7 +270,11 @@ func taskLikelyNeedsWrite(task string) bool {
 	if trimmed == "" {
 		return false
 	}
-	return containsAny(strings.ToLower(trimmed), taskWriteKeywords)
+	lower := strings.ToLower(trimmed)
+	if containsAny(lower, taskReadOnlyMarkers) {
+		return false
+	}
+	return containsAny(lower, taskWriteKeywords)
 }
 
 func containsAny(text string, keywords []string) bool {
@@ -218,7 +354,7 @@ func extractRequiredCommands(task string) []string {
 		if len(match) < 2 {
 			continue
 		}
-		cmd := strings.TrimSpace(match[1])
+		cmd := stripTaskCommandTrailingDirectives(strings.TrimSpace(match[1]))
 		if isLikelyTaskShellCommand(cmd) {
 			commands = append(commands, cmd)
 		}
@@ -229,24 +365,58 @@ func extractRequiredCommands(task string) []string {
 		if len(match) < 2 {
 			continue
 		}
-		cmd := strings.TrimSpace(match[1])
+		cmd := stripTaskCommandTrailingDirectives(strings.TrimSpace(match[1]))
 		if cmd != "" {
 			commands = append(commands, cmd)
 		}
 	}
 
-	for _, match := range taskInlineCommandPattern.FindAllString(task, -1) {
-		cmd := strings.TrimSpace(match)
-		cmd = strings.Trim(cmd, "`")
-		cmd = strings.TrimRight(cmd, "。；;，,`")
-		if cmd == "" {
+	commands = append(commands, extractInlineCommands(task)...)
+	return commands
+}
+
+func extractStyleInspectionCommands(task string) []string {
+	matches := dedupePreserveOrder(taskTestStyleGlobPattern.FindAllString(task, -1))
+	if len(matches) == 0 {
+		return nil
+	}
+
+	commands := make([]string, 0, len(matches))
+	for _, glob := range matches {
+		glob = strings.TrimSpace(glob)
+		if glob == "" {
 			continue
 		}
-		if isLikelyTaskShellCommand(cmd) {
-			commands = append(commands, cmd)
+		dir := strings.TrimSpace(path.Dir(glob))
+		pattern := strings.TrimSpace(path.Base(glob))
+		if dir == "" || dir == "." || pattern == "" {
+			continue
 		}
+		cmd := "find " + shellQuoteSingle(dir) + " -maxdepth 1 -name " + shellQuoteSingle(pattern) + " | sort | head -n 5"
+		commands = append(commands, cmd)
 	}
-	return commands
+	return dedupePreserveOrder(commands)
+}
+
+func extractWriteTargetFiles(task string) []string {
+	lines := strings.Split(task, "\n")
+	targets := make([]string, 0, 4)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		if !containsAny(lower, taskWriteKeywords) {
+			continue
+		}
+		targets = append(targets, taskFilePathPattern.FindAllString(trimmed, -1)...)
+	}
+	return dedupePreserveOrder(targets)
+}
+
+func extractNamedGoTests(task string) []string {
+	return dedupePreserveOrder(goTestNamePattern.FindAllString(task, -1))
 }
 
 func normalizeTaskCommandCandidate(line string) string {
@@ -263,6 +433,8 @@ func normalizeTaskCommandCandidate(line string) string {
 		}
 	}
 	candidate = strings.TrimRight(candidate, "。；;，,")
+	candidate = stripTaskCommandTrailingDirectives(candidate)
+	candidate = sanitizeExecCommandText(candidate)
 	return strings.TrimSpace(candidate)
 }
 
@@ -285,6 +457,7 @@ func extractLabeledCommands(task string) []string {
 		}
 		segment = strings.TrimSpace(taskTrailingBulletSuffixPattern.ReplaceAllString(segment, ""))
 		segment = strings.TrimRight(segment, "。；;，,`")
+		segment = stripTaskCommandTrailingDirectives(segment)
 		segment = strings.TrimSpace(segment)
 		if segment == "" {
 			continue
@@ -294,6 +467,126 @@ func extractLabeledCommands(task string) []string {
 		}
 	}
 	return commands
+}
+
+func stripTaskCommandTrailingDirectives(command string) string {
+	trimmed := strings.TrimSpace(command)
+	if trimmed == "" {
+		return ""
+	}
+
+	trimmed = strings.TrimSpace(taskCommandTrailingStepPattern.ReplaceAllString(trimmed, ""))
+
+	for _, marker := range []string{
+		" 最终只输出",
+		" 完成后只输出",
+		" 最后只输出",
+		" 只输出",
+		" 最终仅输出",
+		" 完成后仅输出",
+		" 仅输出",
+	} {
+		if idx := strings.Index(trimmed, marker); idx >= 0 {
+			return strings.TrimSpace(trimmed[:idx])
+		}
+	}
+
+	if loc := taskCommandTrailingDirectivePattern.FindStringIndex(trimmed); loc != nil {
+		return strings.TrimSpace(trimmed[:loc[0]])
+	}
+	return trimmed
+}
+
+func extractInlineCommands(task string) []string {
+	lower := strings.ToLower(task)
+	if strings.TrimSpace(lower) == "" {
+		return nil
+	}
+
+	type span struct {
+		start int
+	}
+	spans := make([]span, 0, 8)
+	for _, prefix := range taskShellCommandPrefixes {
+		search := 0
+		needle := strings.ToLower(prefix)
+		for {
+			idx := strings.Index(lower[search:], needle)
+			if idx < 0 {
+				break
+			}
+			start := search + idx
+			search = start + len(needle)
+			if !isInlineCommandBoundary(lower, start, needle) {
+				continue
+			}
+			spans = append(spans, span{start: start})
+		}
+	}
+	if len(spans) == 0 {
+		return nil
+	}
+
+	sort.Slice(spans, func(i, j int) bool { return spans[i].start < spans[j].start })
+	starts := make([]int, 0, len(spans))
+	last := -1
+	for _, item := range spans {
+		if item.start == last {
+			continue
+		}
+		starts = append(starts, item.start)
+		last = item.start
+	}
+
+	commands := make([]string, 0, len(starts))
+	for i, start := range starts {
+		end := len(task)
+		if i+1 < len(starts) && starts[i+1] < end {
+			end = starts[i+1]
+		}
+		if punct := strings.IndexAny(task[start:end], "\n。；;"); punct >= 0 {
+			end = start + punct
+		}
+		cmd := strings.TrimSpace(task[start:end])
+		cmd = strings.Trim(cmd, "`")
+		cmd = stripTaskCommandTrailingDirectives(cmd)
+		cmd = strings.TrimRight(cmd, "，,`")
+		cmd = strings.TrimSpace(cmd)
+		if isLikelyTaskShellCommand(cmd) {
+			commands = append(commands, cmd)
+		}
+	}
+	return commands
+}
+
+func isInlineCommandBoundary(text string, start int, prefix string) bool {
+	if start > 0 {
+		prev := text[start-1]
+		if (prev >= 'a' && prev <= 'z') || (prev >= '0' && prev <= '9') || prev == '_' {
+			return false
+		}
+	}
+
+	switch prefix {
+	case "ls":
+		next := start + len(prefix)
+		if next < len(text) {
+			ch := text[next]
+			if ch != ' ' && ch != '\t' && ch != '-' && ch != '\n' {
+				return false
+			}
+		}
+	case "pwd", "tree":
+		next := start + len(prefix)
+		if next < len(text) {
+			ch := text[next]
+			if (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_' {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func isLikelyTaskShellCommand(text string) bool {

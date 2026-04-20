@@ -413,10 +413,15 @@ func formatToolOutputSummary(callID string, success *bool, text string) string {
 	return builder.String()
 }
 
-func buildResponsesPrompt(base []ChatMessage, instructions string, current []ChatMessage, tools json.RawMessage, maxToolCalls int) string {
+type responsesPromptOptions struct {
+	CompactForFinalize  bool
+	SuppressMetaContext bool
+}
+
+func buildResponsesPrompt(base []ChatMessage, instructions string, current []ChatMessage, tools json.RawMessage, maxToolCalls int, options responsesPromptOptions) string {
 	contextMessages, fallbackTask := splitCurrentTurnMessages(current)
 	combined := append(cloneMessages(base), current...)
-	currentTask := latestActionableUserTask(combined)
+	currentTask := stableActionableUserTask(combined)
 	if currentTask == "" {
 		currentTask = fallbackTask
 	} else if strings.TrimSpace(fallbackTask) != "" && strings.TrimSpace(fallbackTask) != strings.TrimSpace(currentTask) {
@@ -424,7 +429,13 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		contextMessages = append(contextMessages, ChatMessage{Role: "user", Content: fallbackTask})
 	}
 	toolInstructions := summarizeResponsesTools(tools)
+	toolCatalog := buildResponseToolCatalog(tools)
 	requiresToolLoop := toolInstructions != "" && taskLikelyNeedsTools(currentTask)
+	baseMessages := cloneMessages(base)
+	if options.SuppressMetaContext || options.CompactForFinalize {
+		baseMessages = filterPromptMetaMessages(baseMessages)
+		contextMessages = filterPromptMetaMessages(contextMessages)
+	}
 
 	var builder strings.Builder
 	builder.Grow(4096)
@@ -438,6 +449,11 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 	builder.WriteString("If CURRENT_USER_TASK defines an exact output format, follow it exactly and output nothing extra.\n")
 	builder.WriteString("If the current task is a simple text request, answer with the exact result and do not inspect the workspace.\n")
 	builder.WriteString("If CURRENT_USER_TASK names specific files or commands, call tools for those targets first and avoid unrelated exploration.\n")
+	if options.CompactForFinalize {
+		builder.WriteString("Finalize stage reached. Ignore handoff, checkpoint, and readiness chatter from prior turns.\n")
+		builder.WriteString("Use CURRENT_USER_TASK and EXECUTION_EVIDENCE to produce the final answer.\n")
+		builder.WriteString("Do not acknowledge session state or ask what task to work on.\n")
+	}
 	if requiresToolLoop {
 		builder.WriteString("CURRENT_USER_TASK requires real workspace execution. Emit tool calls before any final answer text.\n")
 		builder.WriteString("Do not stop after read-only inspection when the task still requires edits or tests.\n")
@@ -451,7 +467,7 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString("\n</CURRENT_USER_TASK>\n")
 	}
 	if toolInstructions != "" {
-		appendToolProtocolInstructions(&builder, true, maxToolCalls)
+		appendToolProtocolInstructionsForCatalog(&builder, true, maxToolCalls, toolCatalog)
 	}
 
 	if instructions = strings.TrimSpace(instructions); instructions != "" {
@@ -459,12 +475,12 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString(instructions)
 		builder.WriteString("\n</BASE_INSTRUCTIONS>\n")
 	}
-	if len(base) > 0 {
+	if !options.CompactForFinalize && len(baseMessages) > 0 {
 		builder.WriteString("\n<PREVIOUS_CONVERSATION>\n")
-		builder.WriteString(messagesToPrompt(base))
+		builder.WriteString(messagesToPrompt(baseMessages))
 		builder.WriteString("\n</PREVIOUS_CONVERSATION>\n")
 	}
-	if len(contextMessages) > 0 {
+	if !options.CompactForFinalize && len(contextMessages) > 0 {
 		builder.WriteString("\n<CURRENT_TURN_CONTEXT>\n")
 		builder.WriteString(messagesToPrompt(contextMessages))
 		builder.WriteString("\n</CURRENT_TURN_CONTEXT>\n")
@@ -475,6 +491,64 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString("\n</AVAILABLE_TOOLS>\n")
 	}
 	return builder.String()
+}
+
+func filterPromptMetaMessages(messages []ChatMessage) []ChatMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	filtered := make([]ChatMessage, 0, len(messages))
+	for _, msg := range messages {
+		if isPromptMetaNoiseMessage(msg) {
+			continue
+		}
+		filtered = append(filtered, msg)
+	}
+	return filtered
+}
+
+func isPromptMetaNoiseMessage(msg ChatMessage) bool {
+	text := strings.TrimSpace(msg.Content)
+	if text == "" {
+		return false
+	}
+	if isToolResultSummaryMessage(text) || strings.Contains(text, "Assistant requested tool") {
+		return false
+	}
+
+	lower := strings.ToLower(text)
+	metaMarkers := []string{
+		"context handoff",
+		"handoff summary",
+		"checkpoint handoff",
+		"checkpoint compaction",
+		"compaction request",
+		"fresh session",
+		"no prior work in progress",
+		"no active task context",
+		"previous model",
+		"ready to assist",
+		"ready to help",
+		"provide the specific task",
+		"what would you like me to work on",
+		"what would you like me to work on?",
+		"what task would you like",
+		"ongoing work",
+		"reviewed the handoff",
+		"received the context handoff",
+		"received the context checkpoint handoff",
+		"交接",
+		"检查点",
+		"准备好协助",
+		"提供具体任务",
+		"你想让我做什么",
+	}
+	for _, marker := range metaMarkers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func summarizeResponsesTools(raw json.RawMessage) string {
@@ -930,6 +1004,144 @@ func buildToolChoiceInstructions(toolChoice json.RawMessage) string {
 	}
 }
 
+func buildPendingWriteMutationHint(policy executionPolicy, toolCatalog map[string]responseToolDescriptor) string {
+	if !policy.PendingWrite || len(toolCatalog) == 0 {
+		return ""
+	}
+
+	mutationTools := availableMutationToolNames(toolCatalog)
+	var b strings.Builder
+	b.WriteString("\n<WRITE_MUTATION_HINT>\n")
+	b.WriteString("This task still requires a real file mutation before final output.\n")
+	if len(policy.MissingFiles) > 0 {
+		b.WriteString("Missing target files that should be created now:\n")
+		for _, filePath := range policy.MissingFiles {
+			b.WriteString("- ")
+			b.WriteString(filePath)
+			b.WriteByte('\n')
+		}
+	}
+	if len(policy.EmptyFiles) > 0 {
+		b.WriteString("These target files already exist but are still empty. Repeating scaffold-only commands is not enough:\n")
+		for _, filePath := range policy.EmptyFiles {
+			b.WriteString("- ")
+			b.WriteString(filePath)
+			b.WriteByte('\n')
+		}
+	}
+	if len(policy.RepeatedScaffold) > 0 {
+		b.WriteString("Repeated scaffold-only commands were already observed for these files. Do not run mkdir/touch again:\n")
+		for _, filePath := range policy.RepeatedScaffold {
+			b.WriteString("- ")
+			b.WriteString(filePath)
+			b.WriteByte('\n')
+		}
+	}
+	if len(mutationTools) > 0 {
+		b.WriteString("Available mutation tools:\n")
+		for _, name := range mutationTools {
+			b.WriteString("- ")
+			b.WriteString(name)
+			b.WriteByte('\n')
+		}
+		b.WriteString("Do not call sed/cat/read_file/list_files again for already inspected or missing targets. Emit exactly one mutation tool call now.\n")
+	} else if _, ok := toolCatalog["exec_command"]; ok {
+		if policy.AllRequiredFilesSeen {
+			b.WriteString("All required files have already been inspected.\n")
+		}
+		b.WriteString("No dedicated file mutation tool is declared. Use exec_command with a shell write/edit command now.\n")
+		b.WriteString("Valid exec_command patterns include cat > file <<'EOF', python - <<'PY', perl -0pi -e, or printf ... > file.\n")
+		b.WriteString("Invalid now: pwd, ls, cat, sed -n, head, tail, rg, grep, or any other read-only command.\n")
+		b.WriteString("Emit exactly one exec_command call whose cmd mutates the target file now.\n")
+	} else {
+		return ""
+	}
+	b.WriteString("</WRITE_MUTATION_HINT>\n")
+	return b.String()
+}
+
+func availableMutationToolNames(toolCatalog map[string]responseToolDescriptor) []string {
+	if len(toolCatalog) == 0 {
+		return nil
+	}
+
+	preferred := []string{
+		"apply_patch",
+		"write_file",
+		"edit_file",
+		"replace_in_file",
+		"append_file",
+		"create_file",
+	}
+	names := make([]string, 0, len(preferred))
+	seen := make(map[string]struct{}, len(preferred))
+	for _, name := range preferred {
+		if _, ok := toolCatalog[name]; !ok {
+			continue
+		}
+		names = append(names, name)
+		seen[name] = struct{}{}
+	}
+	for name := range toolCatalog {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		if !isMutationToolName(name) {
+			continue
+		}
+		names = append(names, name)
+	}
+	return names
+}
+
+func preferredPendingWriteTool(preferredMutationTools []string) string {
+	if len(preferredMutationTools) == 0 {
+		return ""
+	}
+
+	for _, candidate := range []string{
+		"write_file",
+		"edit_file",
+		"replace_in_file",
+		"append_file",
+		"create_file",
+		"apply_patch",
+	} {
+		for _, name := range preferredMutationTools {
+			if name == candidate {
+				return candidate
+			}
+		}
+	}
+	return preferredMutationTools[0]
+}
+
+func summarizeTaskForLog(task string) string {
+	normalized := strings.Join(strings.Fields(strings.TrimSpace(task)), " ")
+	if normalized == "" {
+		return ""
+	}
+	return truncateString(normalized, 260)
+}
+
+func compactCommandsForLog(commands []string) []string {
+	if len(commands) == 0 {
+		return nil
+	}
+	compacted := make([]string, 0, len(commands))
+	for _, command := range commands {
+		normalized := strings.Join(strings.Fields(strings.TrimSpace(command)), " ")
+		if normalized == "" {
+			continue
+		}
+		compacted = append(compacted, truncateString(normalized, 160))
+	}
+	if len(compacted) == 0 {
+		return nil
+	}
+	return compacted
+}
+
 func writeResponsesMessageAdded(writeAndFlushEvent func(string, any) bool, responseID, messageID string) bool {
 	if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
 		Type:        "response.output_item.added",
@@ -1031,7 +1243,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", "%s", err.Error())
 		return
 	}
-	currentTask := latestActionableUserTask(promptMessages)
+	currentTask := stableActionableUserTask(promptMessages)
 	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
 	policyHistoryItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
 	executionEvidence := buildExecutionEvidence(policyHistoryItems)
@@ -1045,9 +1257,15 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		maxToolCalls = 1
 	}
 	promptTools := toolsForPrompt(req.Tools, effectiveToolChoice)
-	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, promptTools, maxToolCalls)
+	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, promptTools, maxToolCalls, responsesPromptOptions{
+		CompactForFinalize:  disableToolsForFinalize,
+		SuppressMetaContext: len(toolCatalog) > 0 && taskLikelyNeedsTools(currentTask),
+	})
 	if policyBlock := buildExecutionPolicyPromptBlock(executionPolicy); policyBlock != "" {
 		prompt += policyBlock
+	}
+	if writeHint := buildPendingWriteMutationHint(executionPolicy, toolCatalog); writeHint != "" {
+		prompt += writeHint
 	}
 	if evidenceBlock := buildExecutionEvidencePromptBlock(executionEvidence); evidenceBlock != "" {
 		prompt += evidenceBlock
@@ -1055,12 +1273,24 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	toolConstraints := toolProtocolConstraints{
 		RequiredTool:       toolChoice.RequiredTool,
 		RequireTool:        toolChoice.RequireTool || executionPolicy.RequireTool,
+		PreferredToolNames: nil,
 		MaxCalls:           maxToolCalls,
 		AllowTruncateToMax: executionPolicy.AllowTruncateToMax,
+	}
+	if executionPolicy.PendingWrite && toolChoice.RequiredTool == "" && !toolChoice.DisableTools {
+		preferredMutationTools := availableMutationToolNames(toolCatalog)
+		toolConstraints.PreferredToolNames = preferredMutationTools
+		if executionPolicy.AllRequiredFilesSeen {
+			if forced := preferredPendingWriteTool(preferredMutationTools); forced != "" {
+				toolConstraints.RequiredTool = forced
+				toolConstraints.RequireTool = true
+			}
+		}
 	}
 	if disableToolsForFinalize {
 		toolConstraints.RequiredTool = ""
 		toolConstraints.RequireTool = false
+		toolConstraints.PreferredToolNames = nil
 	}
 	toolChoiceInstructions := buildToolChoiceInstructions(req.ToolChoice)
 	if toolChoiceInstructions == "" && autoRequireTool && executionPolicy.RequireTool {
@@ -1097,6 +1327,14 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"execution_stage", executionPolicy.Stage,
 		"execution_read_loop", executionPolicy.ReadLoop,
 		"execution_next_command", executionPolicy.NextCommand,
+		"task_summary", summarizeTaskForLog(currentTask),
+		"task_write_targets", extractWriteTargetFiles(currentTask),
+		"task_required_commands", compactCommandsForLog(executionPolicy.RequiredCommands),
+		"execution_required_files", executionPolicy.RequiredFiles,
+		"execution_missing_files", executionPolicy.MissingFiles,
+		"execution_empty_files", executionPolicy.EmptyFiles,
+		"execution_repeated_scaffold", executionPolicy.RepeatedScaffold,
+		"execution_pending_write", executionPolicy.PendingWrite,
 		"execution_disable_tools", disableToolsForFinalize,
 	)
 
@@ -1218,6 +1456,10 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 						"execution_stage", executionPolicy.Stage,
 						"execution_read_loop", executionPolicy.ReadLoop,
 						"execution_next_command", executionPolicy.NextCommand,
+						"task_summary", summarizeTaskForLog(currentTask),
+						"execution_required_files", executionPolicy.RequiredFiles,
+						"execution_empty_files", executionPolicy.EmptyFiles,
+						"execution_repeated_scaffold", executionPolicy.RepeatedScaffold,
 						"error", toolProtocolErrorString(parseResult.err),
 					)
 					if parseResult.err == nil && len(parseResult.calls) > 0 {
@@ -1335,6 +1577,10 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				"execution_stage", executionPolicy.Stage,
 				"execution_read_loop", executionPolicy.ReadLoop,
 				"execution_next_command", executionPolicy.NextCommand,
+				"task_summary", summarizeTaskForLog(currentTask),
+				"execution_required_files", executionPolicy.RequiredFiles,
+				"execution_empty_files", executionPolicy.EmptyFiles,
+				"execution_repeated_scaffold", executionPolicy.RepeatedScaffold,
 				"error", toolProtocolErrorString(parseResult.err),
 			)
 			if parseResult.err == nil && len(parseResult.calls) > 0 {
@@ -1502,6 +1748,10 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 			"execution_stage", executionPolicy.Stage,
 			"execution_read_loop", executionPolicy.ReadLoop,
 			"execution_next_command", executionPolicy.NextCommand,
+			"task_summary", summarizeTaskForLog(currentTask),
+			"execution_required_files", executionPolicy.RequiredFiles,
+			"execution_empty_files", executionPolicy.EmptyFiles,
+			"execution_repeated_scaffold", executionPolicy.RepeatedScaffold,
 			"error", toolProtocolErrorString(parseResult.err),
 		)
 		if parseResult.err == nil && len(parseResult.calls) > 0 {

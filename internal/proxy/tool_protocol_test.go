@@ -55,6 +55,7 @@ func TestBuildResponsesPrompt_UsesAIActionsProtocol(t *testing.T) {
 		[]ChatMessage{{Role: "user", Content: "列出目录并读取 README.md"}},
 		json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`),
 		0,
+		responsesPromptOptions{},
 	)
 
 	for _, want := range []string{
@@ -85,6 +86,7 @@ func TestBuildResponsesPrompt_MaxCallsOneIncludesSingleStepGuidance(t *testing.T
 		[]ChatMessage{{Role: "user", Content: "先读 README 再读 tool_protocol"}},
 		json.RawMessage(`[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]`),
 		1,
+		responsesPromptOptions{},
 	)
 
 	if !strings.Contains(prompt, "calls array must contain exactly one item") {
@@ -139,6 +141,7 @@ func TestBuildResponsesPrompt_ToolChoiceNoneDoesNotExposeTools(t *testing.T) {
 		[]ChatMessage{{Role: "user", Content: "只回答结果"}},
 		nil,
 		0,
+		responsesPromptOptions{},
 	)
 	if strings.Contains(prompt, "<AVAILABLE_TOOLS>") || strings.Contains(prompt, "<<<AI_ACTIONS_V1>>>") {
 		t.Fatalf("prompt without tools should not expose tool protocol:\n%s", prompt)
@@ -324,6 +327,106 @@ func TestParseToolCallOutputs_AIActionsBlock_RecoversFromTrailingNarration(t *te
 	}
 	if !strings.Contains(string(result.calls[0].item), `"name":"exec_command"`) {
 		t.Fatalf("item tool name mismatch: %s", string(result.calls[0].item))
+	}
+}
+
+func TestParseToolCallOutputs_RecoversValidToolBlockFromMultipleAIActionsBlocks(t *testing.T) {
+	text := "先读源码。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"internal/proxy/output_constraints.go\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n再创建测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"write_file\",\"arguments\":{\"path\":\"internal/proxy/output_constraints_test.go\",\"content\":\"package proxy\"}}]}\n<<<END_AI_ACTIONS_V1>>>\nRESULT: PASS"
+	result := parseToolCallOutputs(
+		text,
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+			"write_file":   {Name: "write_file", Type: "function", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"write_file"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `\"path\":\"internal/proxy/output_constraints_test.go\"`) {
+		t.Fatalf("item missing write target path: %s", item)
+	}
+}
+
+func TestParseToolCallOutputsWithConstraints_PrefersMutationBlockBeforeTrailingFinal(t *testing.T) {
+	text := "先读源码。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"read_file\",\"arguments\":{\"path\":\"internal/proxy/output_constraints.go\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n再创建测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"write_file\",\"arguments\":{\"path\":\"internal/proxy/output_constraints_test.go\",\"content\":\"package proxy\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n运行验证。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./internal/proxy\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n完成。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputsWithConstraints(
+		text,
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+			"write_file":   {Name: "write_file", Type: "function", Structured: true},
+		},
+		toolProtocolConstraints{
+			RequireTool:        true,
+			PreferredToolNames: []string{"write_file", "apply_patch"},
+		},
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"write_file"`) {
+		t.Fatalf("expected recovered mutation tool call, got: %s", item)
+	}
+}
+
+func TestParseToolCallOutputsWithConstraints_PrefersApplyPatchBlockWhenItIsRequiredMutationTool(t *testing.T) {
+	text := "先查看文件。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,200p' internal/proxy/output_constraints.go\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n再修改测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"apply_patch\",\"input\":\"*** Begin Patch\\n*** Add File: internal/proxy/output_constraints_test.go\\n+package proxy\\n*** End Patch\"}]}\n<<<END_AI_ACTIONS_V1>>>\n完成。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputsWithConstraints(
+		text,
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+			"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+		},
+		toolProtocolConstraints{
+			RequireTool:        true,
+			RequiredTool:       "apply_patch",
+			PreferredToolNames: []string{"apply_patch"},
+		},
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"apply_patch"`) {
+		t.Fatalf("expected recovered apply_patch call, got: %s", item)
+	}
+}
+
+func TestParseToolCallOutputsWithConstraints_RecoversLastToolBlockWhenTailIsFinal(t *testing.T) {
+	text := "先读 README。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"head -n 5 README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n再跑测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./internal/proxy\"}}]}\n<<<END_AI_ACTIONS_V1>>>\n完成。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputsWithConstraints(
+		text,
+		map[string]responseToolDescriptor{
+			"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		},
+		toolProtocolConstraints{RequireTool: true},
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if got := parsedCallCommand(t, result.calls[0]); got != "go test ./internal/proxy" {
+		t.Fatalf("expected last valid tool block, got command %q", got)
 	}
 }
 
@@ -821,6 +924,24 @@ func TestExtractAIActionsBlock_AcceptsCompatStartMarker(t *testing.T) {
 	}
 }
 
+func TestParseToolCallOutputs_RepairsMissingCallBraceInAIActions(t *testing.T) {
+	text := "开始执行。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}]}\n<<<END_AI_ACTIONS_V1>>>"
+	allowedTools := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+
+	result := parseToolCallOutputs(text, allowedTools, "")
+	if result.err != nil {
+		t.Fatalf("parseToolCallOutputs error = %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("len(result.calls) = %d, want 1", len(result.calls))
+	}
+	if cmd := parsedCallCommand(t, result.calls[0]); cmd != "pwd" {
+		t.Fatalf("cmd = %q, want pwd", cmd)
+	}
+}
+
 func TestHandleResponses_NonStreamAIActionsBlock_FinalModeStripsControlBlock(t *testing.T) {
 	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -947,8 +1068,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_ActionTaskSynthesizesNextToolCa
 		t.Fatalf("tool name = %q, want exec_command; raw=%s", name, string(resp.Output[0]))
 	}
 	argsText, _ := item["arguments"].(string)
-	if !strings.Contains(argsText, "go test ./internal/proxy") {
-		t.Fatalf("synthetic command should prioritize required test command, got arguments=%q", argsText)
+	if !strings.Contains(argsText, "internal/proxy/responses.go") {
+		t.Fatalf("synthetic command should prioritize reading the target file before verification, got arguments=%q", argsText)
 	}
 	if !strings.Contains(capturedPrompt, "<TASK_COMPLETION_GATE>") {
 		t.Fatalf("action task prompt missing completion gate:\n%s", capturedPrompt)
@@ -956,7 +1077,7 @@ func TestHandleResponses_NonStreamAIActionsBlock_ActionTaskSynthesizesNextToolCa
 	if !strings.Contains(capturedPrompt, "<EXECUTION_POLICY>") {
 		t.Fatalf("action task prompt missing execution policy block:\n%s", capturedPrompt)
 	}
-	if !strings.Contains(capturedPrompt, "go test ./internal/proxy") {
+	if !strings.Contains(capturedPrompt, "internal/proxy/responses.go") {
 		t.Fatalf("action task prompt missing soft tool guidance:\n%s", capturedPrompt)
 	}
 }

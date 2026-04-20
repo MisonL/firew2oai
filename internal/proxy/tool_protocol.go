@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"strings"
 )
 
@@ -44,6 +45,7 @@ type parsedToolCallBatchResult struct {
 type toolProtocolConstraints struct {
 	RequiredTool       string
 	RequireTool        bool
+	PreferredToolNames []string
 	MaxCalls           int
 	AllowTruncateToMax bool
 }
@@ -57,11 +59,19 @@ func buildParsedToolOutputItems(calls []parsedToolCall) []json.RawMessage {
 }
 
 func appendToolProtocolInstructions(builder *strings.Builder, supportsCustom bool, maxCalls int) {
+	appendToolProtocolInstructionsForCatalog(builder, supportsCustom, maxCalls, nil)
+}
+
+func appendToolProtocolInstructionsForCatalog(builder *strings.Builder, supportsCustom bool, maxCalls int, toolCatalog map[string]responseToolDescriptor) {
 	builder.WriteString("If you need tools, put the machine-readable control block at the very end of your reply.\n")
 	builder.WriteString("Emit exactly one AI_ACTIONS block per reply.\n")
 	builder.WriteString("Use only tool names listed in AVAILABLE_TOOLS. Never invent or rename a tool.\n")
 	builder.WriteString("If the tool is exec_command, arguments must be exactly an object containing cmd, for example {\"cmd\":\"pwd\"}.\n")
-	builder.WriteString("Do not emit read_file/cat/list_files aliases; use exec_command with cmd instead.\n")
+	if shouldForceExecCommandAliases(toolCatalog) {
+		builder.WriteString("Do not emit read_file/cat/list_files aliases; use exec_command with cmd instead.\n")
+	} else {
+		builder.WriteString("If file tools are listed in AVAILABLE_TOOLS, use those exact names for file reads and writes.\n")
+	}
 	builder.WriteString("After each tool result, continue CURRENT_USER_TASK. If it is not complete, emit another tool call instead of mode final.\n")
 	builder.WriteString("Never ask for a new task when CURRENT_USER_TASK is already provided.\n")
 	if maxCalls == 1 {
@@ -86,6 +96,18 @@ func appendToolProtocolInstructions(builder *strings.Builder, supportsCustom boo
 	builder.WriteString("{\"mode\":\"final\"}\n")
 	builder.WriteString(aiActionsEndMarker)
 	builder.WriteByte('\n')
+}
+
+func shouldForceExecCommandAliases(toolCatalog map[string]responseToolDescriptor) bool {
+	if len(toolCatalog) == 0 {
+		return true
+	}
+	for _, name := range []string{"read_file", "list_files", "write_file", "edit_file", "replace_in_file", "append_file", "create_file"} {
+		if _, ok := toolCatalog[name]; ok {
+			return false
+		}
+	}
+	return true
 }
 
 func extractAIActionsBlock(text string) (aiActionsBlock, bool) {
@@ -128,17 +150,126 @@ func findAIActionsStartMarker(text string) (int, string) {
 	return start, marker
 }
 
+func findNextAIActionsStartMarker(text string) (int, string) {
+	for i := 0; i < len(text); i++ {
+		for _, candidate := range []string{aiActionsStartMarker, aiActionsCompatStartMarker} {
+			if strings.HasPrefix(text[i:], candidate) {
+				return i, candidate
+			}
+		}
+	}
+	return -1, ""
+}
+
 func parseToolCallOutputs(text string, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallBatchResult {
 	return parseToolCallOutputsWithConstraints(text, allowedTools, toolProtocolConstraints{RequiredTool: requiredTool})
 }
 
 func parseToolCallOutputsWithConstraints(text string, allowedTools map[string]responseToolDescriptor, constraints toolProtocolConstraints) parsedToolCallBatchResult {
 	if block, ok := extractAIActionsBlock(text); ok {
-		return applyToolProtocolConstraints(parseAIActionsToolCallOutputs(block, allowedTools, constraints.RequiredTool), constraints)
+		primary := applyToolProtocolConstraints(parseAIActionsToolCallOutputs(block, allowedTools, constraints.RequiredTool), constraints)
+		if recovered, ok := recoverToolCallsFromAIActionsBlocks(text, allowedTools, constraints); ok && shouldPreferRecoveredBatch(primary, recovered, constraints) {
+			return recovered
+		}
+		return primary
+	}
+	if recovered, ok := recoverToolCallsFromAIActionsBlocks(text, allowedTools, constraints); ok {
+		return recovered
 	}
 
 	legacy := parseLegacyToolCallOutputs(text, allowedTools, constraints.RequiredTool)
 	return applyToolProtocolConstraints(legacy, constraints)
+}
+
+func recoverToolCallsFromAIActionsBlocks(text string, allowedTools map[string]responseToolDescriptor, constraints toolProtocolConstraints) (parsedToolCallBatchResult, bool) {
+	blocks := extractSequentialAIActionsBlocks(text)
+	if len(blocks) == 0 {
+		return parsedToolCallBatchResult{}, false
+	}
+
+	valid := make([]parsedToolCallBatchResult, 0, len(blocks))
+	var lastErr *parsedToolCallBatchResult
+	for _, block := range blocks {
+		result := parseAIActionsToolCallOutputs(block, allowedTools, constraints.RequiredTool)
+		result = applyToolProtocolConstraints(result, constraints)
+		if len(result.calls) > 0 {
+			valid = append(valid, result)
+			continue
+		}
+		if result.err != nil {
+			copied := result
+			lastErr = &copied
+		}
+	}
+	if preferred, ok := selectPreferredRecoveredBatch(valid, constraints); ok {
+		return preferred, true
+	}
+	if lastErr != nil {
+		return *lastErr, true
+	}
+	return parsedToolCallBatchResult{}, false
+}
+
+func shouldPreferRecoveredBatch(primary, recovered parsedToolCallBatchResult, constraints toolProtocolConstraints) bool {
+	if len(recovered.calls) == 0 {
+		return false
+	}
+	if len(primary.calls) == 0 {
+		return true
+	}
+	if parsedCallsContainPreferredTool(recovered.calls, constraints.PreferredToolNames) && !parsedCallsContainPreferredTool(primary.calls, constraints.PreferredToolNames) {
+		return true
+	}
+	if parsedCallsContainMutationTool(recovered.calls) && !parsedCallsContainMutationTool(primary.calls) {
+		return true
+	}
+	return false
+}
+
+func selectPreferredRecoveredBatch(valid []parsedToolCallBatchResult, constraints toolProtocolConstraints) (parsedToolCallBatchResult, bool) {
+	if len(valid) == 0 {
+		return parsedToolCallBatchResult{}, false
+	}
+	if len(constraints.PreferredToolNames) > 0 {
+		for _, result := range valid {
+			if parsedCallsContainPreferredTool(result.calls, constraints.PreferredToolNames) {
+				return result, true
+			}
+		}
+	}
+	for _, result := range valid {
+		if parsedCallsContainMutationTool(result.calls) {
+			return result, true
+		}
+	}
+	return valid[len(valid)-1], true
+}
+
+func extractSequentialAIActionsBlocks(text string) []aiActionsBlock {
+	blocks := make([]aiActionsBlock, 0, 2)
+	cursor := 0
+	for cursor < len(text) {
+		start, marker := findNextAIActionsStartMarker(text[cursor:])
+		if start < 0 || marker == "" {
+			break
+		}
+		start += cursor
+		payloadStart := start + len(marker)
+		end := strings.Index(text[payloadStart:], aiActionsEndMarker)
+		if end < 0 {
+			break
+		}
+		end += payloadStart
+		payload := strings.TrimSpace(text[payloadStart:end])
+		if payload != "" {
+			blocks = append(blocks, aiActionsBlock{
+				VisibleText: strings.TrimSpace(text[:start]),
+				JSONText:    payload,
+			})
+		}
+		cursor = end + len(aiActionsEndMarker)
+	}
+	return blocks
 }
 
 func parseAIActionsToolCallOutputs(block aiActionsBlock, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallBatchResult {
@@ -190,6 +321,12 @@ func decodeAIActionsEnvelope(jsonText string) (aiActionsEnvelope, error) {
 	if decodeErr == nil {
 		return envelope, nil
 	}
+	repaired := repairAIActionsJSON(jsonText)
+	if repaired != jsonText {
+		if err := json.Unmarshal([]byte(repaired), &envelope); err == nil {
+			return envelope, nil
+		}
+	}
 
 	// Some upstream models append non-JSON narration inside the marker block.
 	extracted, ok := extractJSONObject(jsonText)
@@ -200,6 +337,48 @@ func decodeAIActionsEnvelope(jsonText string) (aiActionsEnvelope, error) {
 		return aiActionsEnvelope{}, err
 	}
 	return envelope, nil
+}
+
+func repairAIActionsJSON(jsonText string) string {
+	arrayClose := strings.LastIndex(jsonText, "]")
+	if arrayClose < 0 {
+		return jsonText
+	}
+
+	curlyDepth := 0
+	inString := false
+	escaped := false
+	for i := 0; i < arrayClose; i++ {
+		ch := jsonText[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			curlyDepth++
+		case '}':
+			if curlyDepth > 0 {
+				curlyDepth--
+			}
+		}
+	}
+	if inString || curlyDepth <= 1 {
+		return jsonText
+	}
+	return jsonText[:arrayClose] + strings.Repeat("}", curlyDepth-1) + jsonText[arrayClose:]
 }
 
 func applyToolProtocolConstraints(result parsedToolCallBatchResult, constraints toolProtocolConstraints) parsedToolCallBatchResult {
@@ -504,6 +683,18 @@ func buildReadFileCommand(path string) string {
 
 func buildListFilesCommand(path string) string {
 	return "ls -la -- " + shellQuoteSingle(path)
+}
+
+func buildCreateMissingFileCommand(filePath string) string {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return ""
+	}
+	dir := strings.TrimSpace(path.Dir(filePath))
+	if dir == "" || dir == "." {
+		return "touch " + shellQuoteSingle(filePath)
+	}
+	return "mkdir -p -- " + shellQuoteSingle(dir) + " && touch " + shellQuoteSingle(filePath)
 }
 
 func normalizeExecCommandArguments(args any, sourceToolName string) (any, bool) {
