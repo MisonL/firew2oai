@@ -36,3 +36,12 @@
 - 禁止使用未声明工具名，例如 `read_file`、`Read`、`list_files`、`run_command`、`run_terminal_cmd`。如果需要这些能力，必须改写为当前会话内可用工具。
 - 收到工具错误或 `Codex adapter error` 后，先修正同一工具调用的名称和参数，再继续任务；不要向用户反问，不要把错误当成最终答案。
 - 在复杂任务中，先执行必要的只读工具调用获取证据，再输出结论；禁止编造文件内容、行号或审计结论。
+
+## Codex Usage Notes
+当前仓库对 Codex 的主适配目标是 `/v1/responses`，新增协议兼容改动、回归测试和真实链路验证都以该接口为准。
+
+- 只读型 Coding 审计任务当前已经稳定，真实写代码任务不能默认假设“所有模型都稳定可用”。
+- 2026-04-20 的最新矩阵结论见 [docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md](/Volumes/Work/code/firew2oai/docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md)；当前应以该文档和 `README.md` 为准，不要沿用更早的口头结论。
+- 走 `new-api -> firew2oai` 正式链路时，如同模型存在多渠道，必须先确认 `firew2oai` 渠道优先级最高，否则测试结果不能代表本项目适配效果。
+- 与 Codex 兼容性直接相关的高风险边界仍集中在 `apply_patch`、`tool_choice`、四行收口和 finalize 收口稳定性，修改这些路径后必须补对应回归测试。
+- 如果模型未按协议产出工具块、错误把自述文本写进 `FILES`/`NOTE`、或在 finalize 阶段漂移，优先视为模型能力或协议收口问题，先查 `internal/proxy/` 下的协议适配与测试，再下结论。
