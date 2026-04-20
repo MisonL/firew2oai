@@ -48,7 +48,20 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 ### New API / One API 中转
 
-2026-04-19 的 6 模型双链路复测在固定三步命令任务上通过，但该结果不代表当前版本在更复杂真实写代码任务下同样成立。最新更严格结论以 2026-04-20 直连矩阵为准。
+2026-04-20 又补跑了一轮正式 `new-api -> firew2oai` 链路下的同口径真实写代码任务，证据目录：`/private/tmp/firew2oai-writebench-newapi-prod-20260420-101500`
+
+| 任务类型 | 范围 | 结果 |
+|---|---|---|
+| 写代码任务 | 12 模型 | `8/12` 实际完成，`4/12` 严格收口 |
+
+正式中转链路下，当前严格成功模型是：
+
+- `qwen3-vl-30b-a3b-instruct`
+- `llama-v3p3-70b-instruct`
+- `deepseek-v3p2`
+- `deepseek-v3p1`
+
+与同日直连相比，这轮正式 `new-api` 中转没有劣化整体表现，且 `llama-v3p3-70b-instruct`、`deepseek-v3p1` 的结果更好。
 
 详细记录见：
 
