@@ -61,37 +61,15 @@
 - [x] D4: Docker 非 root — appuser
 - [x] D5: Docker 日志限制 — 10MB × 3
 
-## 2026-04-17 修复记录
+## 当前维护口径
 
-### 问题发现
-- **kimi 模型 502 错误**: Fireworks 上游对部分 kimi 模型返回 404
-- **原因**: Fireworks 平台已下架 kimi-k2-thinking、kimi-k2-instruct-0905
-- **状态**: 2026-04-17 复验时 kimi-k2p5 连续 3 次成功；minimax-m2p1 仍不可用
-- **更新**: README 已更新可用模型列表
+历史测试记录不再沉淀在 CSE 审计文档中。当前可用模型以 `internal/config/config.go` 为准，最后一次真实链路测试情况见：
 
-### 当前可用模型（12个）
-✅ qwen3-vl-30b-a3b-thinking, qwen3-vl-30b-a3b-instruct, qwen3-8b  
-✅ minimax-m2p5, llama-v3p3-70b-instruct, kimi-k2p5（间歇性）  
-✅ gpt-oss-20b, gpt-oss-120b, glm-5, glm-4p7  
-✅ deepseek-v3p2, deepseek-v3p1  
-
-### 不可用模型（4个）
-❌ minimax-m2p1, kimi-k2-thinking, kimi-k2-instruct-0905, cogito-671b-v2-p1
+- `README.md`
+- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`
 
 ### 架构优化（CSE 弹性设计）
 - **Authorization 转发**: transport 层现在正确转发客户端 Authorization header 到上游
 - **弹性 SSE 处理**: 上游返回内容但没有 `done` 事件时，仍返回 200 而非 502
 - **错误事件处理**: 正确保留并返回 Fireworks `type=error` 中的 404 明细
 - **Responses 多轮会话**: 支持 `previous_response_id` 以内存会话态串联多轮上下文
-
-### 兼容性验证（2026-04-20 更新）
-- ✅ 直连模式（Codex / OpenAI 客户端）
-- ✅ 中转模式（New API / One API）
-- ✅ 流式 + 非流式响应
-- ✅ 当前 12 个启用模型均通过只读 Coding 审计任务
-- ⚠️ 真实写代码任务下，当前为 `7/12` 实际完成，`2/12` 严格四行收口
-- ⚠️ 正式 `new-api -> firew2oai` 链路复测为 `8/12` 实际完成，`4/12` 严格四行收口
-- ✅ 晚间补丁修复了“部分测试输出被误判成功后提前 finalize”的执行策略误差
-- ✅ 修复后，`deepseek-v3p1` 不再出现该类 finalize 误判
-- ✅ 修复后，正式 `new-api -> firew2oai` 链路下其余 10 个模型均通过最小多轮工具任务
-- ⚠️ 最新结论见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`

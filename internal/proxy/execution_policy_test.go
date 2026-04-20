@@ -740,6 +740,36 @@ func TestBuildSeedGoTestFunction_UsesConcreteEmptyStringAssertionWhenTaskProvide
 	}
 }
 
+func TestBuildSeedGoTestFunction_ReturnsEmptyWhenTaskLacksConcreteAssertion(t *testing.T) {
+	task := "新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。"
+
+	got := buildSeedGoTestFunction(task, "TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise")
+	if got != "" {
+		t.Fatalf("seed test body = %q, want empty when no concrete assertion can be inferred", got)
+	}
+}
+
+func TestBuildSeedWriteCommand_ReturnsEmptyWhenTaskLacksConcreteAssertion(t *testing.T) {
+	task := "请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy"
+
+	signals := executionHistorySignals{
+		Commands: []string{
+			"sed -n '1,120p' 'internal/proxy/output_constraints.go'",
+		},
+		CommandOutputs: map[string]string{
+			"sed -n '1,120p' 'internal/proxy/output_constraints.go'": "package proxy\n",
+		},
+	}
+
+	got := buildSeedWriteCommand(task, []string{"internal/proxy/output_constraints_test.go"}, signals)
+	if got != "" {
+		t.Fatalf("seed write command = %q, want empty when no concrete assertion can be inferred", got)
+	}
+}
+
 func TestHasSatisfiedReadForFile_RequiresObservedResultWhenAvailable(t *testing.T) {
 	if hasSatisfiedReadForFile(
 		nil,
@@ -1017,6 +1047,64 @@ func TestBuildExecutionPolicy_ReadOnlyTaskFinalizesAfterAllRequiredCommands(t *t
 	}
 }
 
+func TestBuildExecutionPolicy_FinalizesWhenToolHistoryOnlyExistsAsSummaryMessages(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n" +
+		"3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n" +
+		"4) 执行命令：go test ./internal/proxy"
+
+	rawItems := []any{
+		map[string]any{
+			"type":    "message",
+			"role":    "assistant",
+			"content": "Assistant requested tool: exec_command (call_id=call_write)\nTool payload:\n{\"cmd\":\"python3 -c 'from pathlib import Path; Path(\\\"internal/proxy/output_constraints_test.go\\\").write_text(\\\"package proxy\\\", encoding=\\\"utf-8\\\")'\"}",
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": "Tool result (call_id=call_write)\nSuccess: true\nOutput:\n",
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "assistant",
+			"content": "Assistant requested tool: exec_command (call_id=call_test_one)\nTool payload:\n{\"cmd\":\"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\"}",
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": "Tool result (call_id=call_test_one)\nSuccess: true\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.015s",
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "assistant",
+			"content": "Assistant requested tool: exec_command (call_id=call_test_all)\nTool payload:\n{\"cmd\":\"go test ./internal/proxy\"}",
+		},
+		map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": "Tool result (call_id=call_test_all)\nSuccess: true\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t12.124s",
+		},
+	}
+
+	history := make([]json.RawMessage, 0, len(rawItems))
+	for _, item := range rawItems {
+		raw, ok := normalizeRawResponseInputItem(item)
+		if !ok {
+			t.Fatalf("normalizeRawResponseInputItem returned ok=false for %#v", item)
+		}
+		history = append(history, raw)
+	}
+
+	policy := buildExecutionPolicy("glm-5", task, history, true, false, true)
+	if policy.Stage != "finalize" {
+		t.Fatalf("stage = %q, want finalize; policy=%+v", policy.Stage, policy)
+	}
+	if policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = true, want false after summarized write and tests completed: %+v", policy)
+	}
+}
+
 func TestBuildExecutionPolicy_ReadOnlyCodingTaskDoesNotStickInExecute(t *testing.T) {
 	task := "你是资深 Go 工程师。请执行一个真实编码排障任务（只读分析，不修改文件）：\n1) 执行 `sed -n '1,220p' internal/proxy/output_constraints.go`\n2) 执行 `sed -n '1,220p' internal/proxy/execution_evidence.go`\n3) 执行 `go test ./internal/proxy`\n4) 执行 `go test ./...`\n完成后只输出四行。"
 	history := historyExecCommandItems(
@@ -1080,7 +1168,7 @@ func TestBuildExecutionPolicy_ReadOnlyCodingTaskAdvancesAfterSeenReadCommandWith
 	}
 }
 
-func TestBuildExecutionPolicy_ReadOnlyInlinePromptFinalizesWithoutRequiredFiles(t *testing.T) {
+func TestBuildExecutionPolicy_ReadOnlyInlinePromptFinalizesWithMentionedFiles(t *testing.T) {
 	task := "在当前仓库执行只读核验任务：1) 运行 `sed -n '1,80p' internal/proxy/task_intent.go`；2) 运行 `go test ./internal/proxy -run TestStableActionableUserTask_PrefersEarlierSpecificPromptOverWeakContinuation`；3) 不要修改文件；4) 最后只输出两行。"
 	history := historyExecCommandItems(
 		"sed -n '1,80p' internal/proxy/task_intent.go",
@@ -1094,8 +1182,29 @@ func TestBuildExecutionPolicy_ReadOnlyInlinePromptFinalizesWithoutRequiredFiles(
 	if policy.RequireTool {
 		t.Fatalf("policy.RequireTool = true, want false after read-only required commands are done: %+v", policy)
 	}
-	if len(policy.RequiredFiles) != 0 {
-		t.Fatalf("policy.RequiredFiles = %#v, want empty for read-only inline prompt", policy.RequiredFiles)
+	wantFiles := []string{"internal/proxy/task_intent.go"}
+	if !reflect.DeepEqual(policy.RequiredFiles, wantFiles) {
+		t.Fatalf("policy.RequiredFiles = %#v, want %#v for read-only inline prompt", policy.RequiredFiles, wantFiles)
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyNaturalPromptRequiresMentionedFilesFirst(t *testing.T) {
+	task := "只读分析 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，执行 go test ./internal/proxy 和 go test ./...。最后只输出四行：RESULT、CONSTRAINT、EVIDENCE、TEST。不要修改文件。"
+
+	policy := buildExecutionPolicy("glm-5", task, nil, true, false, true)
+	if policy.Stage != "explore" {
+		t.Fatalf("stage = %q, want explore; policy=%+v", policy.Stage, policy)
+	}
+	wantFiles := []string{
+		"internal/proxy/output_constraints.go",
+		"internal/proxy/execution_evidence.go",
+	}
+	if !reflect.DeepEqual(policy.RequiredFiles, wantFiles) {
+		t.Fatalf("policy.RequiredFiles = %#v, want %#v", policy.RequiredFiles, wantFiles)
+	}
+	wantNext := buildReadFileCommand("internal/proxy/output_constraints.go")
+	if policy.NextCommand != wantNext {
+		t.Fatalf("policy.NextCommand = %q, want %q; policy=%+v", policy.NextCommand, wantNext, policy)
 	}
 }
 
@@ -1142,6 +1251,29 @@ func TestBuildExecutionPolicyPromptBlock_FinalizeIncludesNoToolGuidance(t *testi
 	}
 	if !strings.Contains(block, "Do not emit AI_ACTIONS mode tool.") {
 		t.Fatalf("finalize policy block missing no-tool instruction:\n%s", block)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_FinalizeStageIgnoresUnexpectedToolCall(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "RESULT: PASS\nTEST: 所需验证已完成。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./...\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled: true,
+		Stage:   "finalize",
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 0 {
+		t.Fatalf("len(got.calls) = %d, want 0 in finalize stage", len(got.calls))
+	}
+	if got.visibleText != "RESULT: PASS\nTEST: 所需验证已完成。" {
+		t.Fatalf("visibleText = %q", got.visibleText)
 	}
 }
 

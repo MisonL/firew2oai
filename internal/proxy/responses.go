@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -192,11 +194,18 @@ func buildInputMessageItem(role, text string) json.RawMessage {
 func normalizeRawResponseInputItem(item any) (json.RawMessage, bool) {
 	switch value := item.(type) {
 	case string:
-		if strings.TrimSpace(value) == "" {
+		text := strings.TrimSpace(value)
+		if text == "" {
 			return nil, false
+		}
+		if raw, ok := normalizeToolSummaryStringItem(text); ok {
+			return raw, true
 		}
 		return buildInputMessageItem("user", value), true
 	case map[string]any:
+		if raw, ok := normalizeToolSummaryMessageItem(value); ok {
+			return raw, true
+		}
 		data, err := json.Marshal(value)
 		if err != nil {
 			return nil, false
@@ -205,6 +214,50 @@ func normalizeRawResponseInputItem(item any) (json.RawMessage, bool) {
 	default:
 		return nil, false
 	}
+}
+
+func normalizeToolSummaryStringItem(text string) (json.RawMessage, bool) {
+	if match := assistantToolSummaryPattern.FindStringSubmatch(text); len(match) != 0 {
+		call := map[string]any{
+			"type": "function_call",
+			"name": strings.TrimSpace(match[1]),
+		}
+		if callID := strings.TrimSpace(match[2]); callID != "" {
+			call["call_id"] = callID
+		}
+		if payload := strings.TrimSpace(match[3]); payload != "" {
+			call["arguments"] = payload
+		}
+		data, err := json.Marshal(call)
+		if err != nil {
+			return nil, false
+		}
+		return json.RawMessage(data), true
+	}
+
+	callID, success, outputText, ok := parseToolResultSummary(text)
+	if !ok {
+		return nil, false
+	}
+	output := map[string]any{}
+	if success != nil {
+		output["success"] = *success
+	}
+	if resultText := strings.TrimSpace(outputText); resultText != "" {
+		output["content"] = resultText
+	}
+	callOutput := map[string]any{
+		"type":   "function_call_output",
+		"output": output,
+	}
+	if callID = strings.TrimSpace(callID); callID != "" {
+		callOutput["call_id"] = callID
+	}
+	data, err := json.Marshal(callOutput)
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(data), true
 }
 
 func rawItemsToMessages(items []json.RawMessage) []ChatMessage {
@@ -411,6 +464,132 @@ func formatToolOutputSummary(callID string, success *bool, text string) string {
 		builder.WriteString(text)
 	}
 	return builder.String()
+}
+
+var assistantToolSummaryPattern = regexp.MustCompile(`(?s)^Assistant requested tool:\s*([A-Za-z0-9_:-]+)(?:\s+\(call_id=([^)]+)\))?\s*(?:\nTool payload:\n([\s\S]*))?$`)
+var toolResultCallIDPattern = regexp.MustCompile(`\(\s*call_id=([^)]+)\s*\)`)
+
+func normalizeToolSummaryMessageItem(item map[string]any) (json.RawMessage, bool) {
+	role, _ := item["role"].(string)
+	if !isActionableTaskMessageRole(role) && !strings.EqualFold(strings.TrimSpace(role), "assistant") {
+		return nil, false
+	}
+
+	var text string
+	switch content := item["content"].(type) {
+	case string:
+		text = content
+	case []any:
+		text = extractTextParts(content)
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, false
+	}
+
+	if strings.EqualFold(strings.TrimSpace(role), "assistant") {
+		match := assistantToolSummaryPattern.FindStringSubmatch(text)
+		if len(match) == 0 {
+			return nil, false
+		}
+		call := map[string]any{
+			"type": "function_call",
+			"name": strings.TrimSpace(match[1]),
+		}
+		if callID := strings.TrimSpace(match[2]); callID != "" {
+			call["call_id"] = callID
+		}
+		if payload := strings.TrimSpace(match[3]); payload != "" {
+			call["arguments"] = payload
+		}
+		data, err := json.Marshal(call)
+		if err != nil {
+			return nil, false
+		}
+		return json.RawMessage(data), true
+	}
+
+	if !strings.EqualFold(strings.TrimSpace(role), "user") {
+		return nil, false
+	}
+	callID, success, outputText, ok := parseToolResultSummary(text)
+	if !ok {
+		return nil, false
+	}
+	output := map[string]any{}
+	if success != nil {
+		output["success"] = *success
+	}
+	if resultText := strings.TrimSpace(outputText); resultText != "" {
+		output["content"] = resultText
+	}
+	callOutput := map[string]any{
+		"type":   "function_call_output",
+		"output": output,
+	}
+	if callID = strings.TrimSpace(callID); callID != "" {
+		callOutput["call_id"] = callID
+	}
+	data, err := json.Marshal(callOutput)
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(data), true
+}
+
+func parseToolResultSummary(text string) (string, *bool, string, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || !strings.HasPrefix(strings.ToLower(trimmed), "tool result") {
+		return "", nil, "", false
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	header := strings.TrimSpace(lines[0])
+	callID := ""
+	if match := toolResultCallIDPattern.FindStringSubmatch(header); len(match) >= 2 {
+		callID = strings.TrimSpace(match[1])
+	}
+
+	var success *bool
+	outputLines := make([]string, 0, len(lines))
+	outputStarted := false
+	for _, rawLine := range lines[1:] {
+		line := strings.TrimSpace(rawLine)
+		if line == "" && !outputStarted {
+			continue
+		}
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "success:"):
+			value := strings.TrimSpace(line[len("Success:"):])
+			if value != "" {
+				succeeded := strings.EqualFold(value, "true")
+				success = &succeeded
+			}
+		case strings.HasPrefix(lower, "exit code:"):
+			value := strings.TrimSpace(line[len("Exit code:"):])
+			if code, err := strconv.Atoi(value); err == nil {
+				succeeded := code == 0
+				success = &succeeded
+			}
+		case strings.HasPrefix(lower, "output:"):
+			outputStarted = true
+			remainder := strings.TrimSpace(line[len("Output:"):])
+			if remainder != "" {
+				outputLines = append(outputLines, remainder)
+			}
+		default:
+			if outputStarted {
+				outputLines = append(outputLines, rawLine)
+			}
+		}
+	}
+
+	output := strings.TrimSpace(strings.Join(outputLines, "\n"))
+	if callID == "" && success == nil && output == "" {
+		return "", nil, "", false
+	}
+	return callID, success, output, true
 }
 
 type responsesPromptOptions struct {
@@ -1356,7 +1535,6 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"execution_pending_write", executionPolicy.PendingWrite,
 		"execution_disable_tools", disableToolsForFinalize,
 	)
-
 	if req.Stream {
 		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 		return

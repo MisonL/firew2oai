@@ -14,118 +14,34 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 ## 当前验证状态
 
 核对日期：2026-04-20  
-当前结论按任务类型区分，不再把 2026-04-19 的单轮双链路结果直接视为“当前整体可用”。
+当前 README 只保留最后一次验证情况；历史矩阵和早期复测记录已从仓库文档中移除。
 
-### Codex 直连 firew2oai
+### 最后一次真实链路验证
 
-1. 只读 Coding 审计任务  
-   当前 12 个启用模型全部通过，证据目录：`/private/tmp/firew2oai-allmodels-latest2-20260419-233301`
-2. 真实写代码任务（新增测试文件 + 两次 `go test`）  
-   本轮复测结果：实际任务完成 `7/12`，严格四行收口 `2/12`，证据目录：`/private/tmp/firew2oai-writebench-postfix-20260420-094500`
+| 项目 | 结果 |
+|---|---|
+| 链路 | `Codex -> new-api -> firew2oai` |
+| 模型 | `glm-5` |
+| 任务 | 只读分析 `internal/proxy/output_constraints.go`、`internal/proxy/execution_evidence.go`，执行 `go test ./internal/proxy` 与 `go test ./...`，最终输出 `RESULT/CONSTRAINT/EVIDENCE/TEST` |
+| 证据文件 | `/tmp/firew2oai-compare-newapi-glm5.jsonl` |
+| 结果 | `PASS` |
 
-| 任务类型 | 范围 | 结果 |
-|---|---|---|
-| 只读审计 | 12 模型 | `12/12` 完成 |
-| 写代码任务 | 12 模型 | `7/12` 实际完成，`2/12` 严格收口 |
+验证结论：
 
-写代码任务中，当前表现更稳定的模型是：
-
-- `qwen3-vl-30b-a3b-instruct`
-- `deepseek-v3p2`
-- `minimax-m2p5`
-- `llama-v3p3-70b-instruct`
-- `kimi-k2p5`
-- `glm-5`
-- `glm-4p7`
-
-仍未稳定通过真实写代码任务的模型：
-
-- `qwen3-vl-30b-a3b-thinking`
-- `qwen3-8b`
-- `gpt-oss-20b`
-- `gpt-oss-120b`
-- `deepseek-v3p1`（本轮出现执行波动）
-
-### New API / One API 中转
-
-2026-04-20 又补跑了一轮正式 `new-api -> firew2oai` 链路下的同口径真实写代码任务，证据目录：`/private/tmp/firew2oai-writebench-newapi-prod-20260420-101500`
-
-| 任务类型 | 范围 | 结果 |
-|---|---|---|
-| 写代码任务 | 12 模型 | `8/12` 实际完成，`4/12` 严格收口 |
-
-正式中转链路下，当前严格成功模型是：
-
-- `qwen3-vl-30b-a3b-instruct`
-- `llama-v3p3-70b-instruct`
-- `deepseek-v3p2`
-- `deepseek-v3p1`
-
-与同日直连相比，这轮正式 `new-api` 中转没有劣化整体表现，且 `llama-v3p3-70b-instruct`、`deepseek-v3p1` 的结果更好。
-
-### 2026-04-20 晚间补充复核
-
-本日又补了一次执行策略修正：当模型只返回了部分测试输出时，不再把该轮误判为“测试已成功”，从而避免过早进入 finalize。对应代码位于：
-
-- `internal/proxy/execution_policy.go`
-- `internal/proxy/execution_policy_test.go`
+- 第 1 轮读取 `internal/proxy/output_constraints.go`
+- 第 2 轮读取 `internal/proxy/execution_evidence.go`
+- 第 3 轮执行 `go test ./internal/proxy`
+- 第 4 轮执行 `go test ./...`
+- 第 5 轮进入 `execution_stage=finalize`
+- 最终返回规范四行 `RESULT/CONSTRAINT/EVIDENCE/TEST`
+- finalize 阶段未再重复触发工具调用
 
 本地回归验证：
 
 - `go test ./internal/proxy`
 - `go test ./...`
 
-补丁后结论：
-
-- `deepseek-v3p1` 已消除“第二条测试输出未完整回收却提前 finalize”的适配层误差
-- 正式 `new-api -> firew2oai` 链路下，其余 10 个模型在“最小多轮工具任务”中全部完成真实 `command_execution` 并 PASS
-- 该结论只说明多轮工具链路已通，不等同于真实写代码任务也都稳定可用
-
-当前按真实写代码任务主口径，可粗分为三档：
-
-- 第一梯队：`deepseek-v3p2`、`deepseek-v3p1`、`qwen3-vl-30b-a3b-instruct`、`llama-v3p3-70b-instruct`
-- 第二梯队：`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7`
-- 第三梯队：`qwen3-8b`、`qwen3-vl-30b-a3b-thinking`、`gpt-oss-20b`、`gpt-oss-120b`
-
-### 2026-04-20 深夜增量复测
-
-本轮又继续修正了三类 Codex 适配误差：
-
-- 同一句任务里的多条验证命令被错误粘成一条，导致 `taskCompletionSatisfied(...)` 误判未完成
-- 模型最终文本里自带的 `RESULT: FAIL` / `TEST: ...失败` 会反向污染适配层推断
-- 探索阶段预期失败的读文件结果，会污染最终 `RESULT/TEST`
-
-对应代码位于：
-
-- `internal/proxy/task_intent.go`
-- `internal/proxy/output_constraints.go`
-- `internal/proxy/execution_policy.go`
-
-本地回归验证：
-
-- `go test ./internal/proxy`
-- `go test ./...`
-
-基于当前最新代码，对第二梯队同一真实写代码任务做了单模型复测，证据目录：
-
-- `minimax-m2p5`：`/private/tmp/firew2oai-stage4-driver-20260420-130112/minimax-m2p5.json`
-- `kimi-k2p5`：`/private/tmp/firew2oai-kimi-single-rerun-20260420-131621/kimi-k2p5.json`
-- `glm-5`：`/private/tmp/firew2oai-glm5-single-rerun-20260420-131447/glm-5.json`
-- `glm-4p7`：`/private/tmp/firew2oai-glm4p7-single-20260420-131040/glm-4p7.json`
-
-当前增量结论：
-
-- `minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7` 均已在该真实写代码任务上完成写文件、执行两条 `go test`，并最终返回 `PASS`
-- 第二梯队此前确认的几处问题，已被验证主要属于适配层误差，而不是任务本身无法闭环
-- 剩余不稳定性主要来自上游扰动，例如本轮仍观察到 `502 upstream_failed`、`upstream returned status 500`、`tls: bad record MAC`
-- 这组增量复测只覆盖第二梯队与单一真实任务，不等同于“当前 12 模型全量矩阵已全部按最新代码重跑”
-
-详细记录见：
-
-- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`
-- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-19.md`
-- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-18.md`
-- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-17.md`
+详细记录见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`。
 
 ## 快速开始
 
@@ -231,7 +147,7 @@ wire_api = "responses"
 4. 渠道密钥填写 firew2oai 的 API Key
 5. 如果同模型有多个渠道，提高 firew2oai 渠道优先级
 
-说明：若走 New API / One API，多渠道同模型时应提高 `firew2oai` 渠道优先级；旧矩阵中已验证请求命中目标渠道 `channel_id=106`。
+说明：若走 New API / One API，多渠道同模型时应提高 `firew2oai` 渠道优先级；测试时必须通过网关日志确认请求命中目标渠道。
 
 ## 协议适配逻辑
 

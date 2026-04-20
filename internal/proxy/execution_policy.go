@@ -67,6 +67,8 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 			requiredFiles = writeTargets
 			sequenceFiles = append(filterOutFiles(allMentionedFiles, writeTargets), writeTargets...)
 		}
+	} else {
+		requiredFiles = append(requiredFiles, allMentionedFiles...)
 	}
 	styleCommands := dedupePreserveOrder(extractStyleInspectionCommands(task))
 	needsWrite := taskLikelyNeedsWrite(task)
@@ -206,6 +208,12 @@ func buildExecutionPolicyPromptBlock(policy executionPolicy) string {
 }
 
 func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy executionPolicy, toolCatalog map[string]responseToolDescriptor, constraints toolProtocolConstraints) parsedToolCallBatchResult {
+	if policy.Enabled && policy.Stage == "finalize" && !policy.RequireTool && constraints.RequiredTool == "" && len(result.calls) > 0 {
+		result.calls = nil
+		result.err = nil
+		result.candidateFound = true
+		return result
+	}
 	if !policy.Enabled || !policy.RequireTool || constraints.RequiredTool != "" {
 		return result
 	}
@@ -324,6 +332,9 @@ func buildPendingWriteGuardCommand(policy executionPolicy, calls []parsedToolCal
 		}
 		if name == "exec_command" {
 			if isTestCommand(command) {
+				if next := strings.TrimSpace(policy.NextCommand); next != "" {
+					return next
+				}
 				return buildExecFailureCommand("Codex adapter guard: previous test run already failed after the last write; modify target files before rerunning tests: " + strings.Join(policy.RequiredFiles, ", "))
 			}
 			if isReadOnlyCommand(command) && shouldBlockReadOnlyDuringPendingWrite(policy) {
@@ -707,6 +718,18 @@ func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, style
 		return ""
 	}
 
+	if !needsWrite {
+		for _, filePath := range requiredFiles {
+			if hasExplicitReadCommandForFile(requiredCommands, filePath) {
+				continue
+			}
+			if hasSeenReadForFile(signals.Commands, filePath) {
+				continue
+			}
+			return buildReadFileCommand(filePath)
+		}
+	}
+
 	for _, command := range requiredCommands {
 		if resolveCommandDone(command) {
 			continue
@@ -728,6 +751,22 @@ func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, style
 		return ""
 	}
 	return ""
+}
+
+func hasExplicitReadCommandForFile(requiredCommands []string, filePath string) bool {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return false
+	}
+	for _, command := range requiredCommands {
+		if !isReadOnlyCommand(command) {
+			continue
+		}
+		if strings.Contains(command, filePath) {
+			return true
+		}
+	}
+	return false
 }
 
 func chooseRepairReadTarget(requiredFiles []string, signals executionHistorySignals) string {
@@ -790,7 +829,11 @@ func buildSeedWriteCommand(task string, requiredFiles []string, signals executio
 	content.WriteString(packageName)
 	content.WriteString("\n\nimport \"testing\"\n")
 	for _, testName := range testNames {
-		content.WriteString(buildSeedGoTestFunction(task, testName))
+		testFn := buildSeedGoTestFunction(task, testName)
+		if testFn == "" {
+			return ""
+		}
+		content.WriteString(testFn)
 	}
 	pythonCode := "from pathlib import Path; Path(" + strconv.Quote(targetFile) + ").write_text(" + strconv.Quote(content.String()) + ", encoding='utf-8')"
 	return "python3 -c " + shellQuoteSingle(pythonCode)
@@ -811,9 +854,7 @@ func buildSeedGoTestFunction(task, testName string) string {
 		b.WriteString("}\n")
 		return b.String()
 	}
-	b.WriteString("\tt.Fatal(\"TODO: implement test\")\n")
-	b.WriteString("}\n")
-	return b.String()
+	return ""
 }
 
 var goCallPattern = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*\([^\n]*\))`)
@@ -1059,6 +1100,9 @@ func inferTestCommandOutputSuccess(text string) *bool {
 		if inferred := inferSingleLineTestSuccess(wrapped); inferred != nil {
 			return inferred
 		}
+		if inferred := inferMultiLineTestSuccess(wrapped); inferred != nil {
+			return inferred
+		}
 	}
 
 	return nil
@@ -1084,6 +1128,47 @@ func inferSingleLineTestSuccess(text string) *bool {
 	default:
 		return nil
 	}
+}
+
+func inferMultiLineTestSuccess(text string) *bool {
+	lines := strings.Split(strings.TrimSpace(text), "\n")
+	if len(lines) <= 1 {
+		return nil
+	}
+
+	recognized := 0
+	successful := 0
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "? ") || strings.HasPrefix(lower, "?\t"):
+			recognized++
+			if strings.Contains(lower, "[no test files]") {
+				successful++
+			}
+		case strings.HasPrefix(lower, "ok ") || strings.HasPrefix(lower, "ok\t"),
+			strings.HasPrefix(lower, "pass ") || strings.HasPrefix(lower, "pass\t"),
+			lower == "pass":
+			recognized++
+			successful++
+		case strings.Contains(lower, "--- fail"),
+			strings.Contains(lower, " fail"),
+			strings.Contains(lower, "panic:"),
+			strings.Contains(lower, "error:"),
+			strings.Contains(lower, "build failed"):
+			failed := false
+			return &failed
+		}
+	}
+	if recognized == 0 || successful == 0 || recognized != successful {
+		return nil
+	}
+	succeeded := true
+	return &succeeded
 }
 
 func extractWrappedCommandOutput(text string) string {

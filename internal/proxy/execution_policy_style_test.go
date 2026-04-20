@@ -50,6 +50,33 @@ func TestExtractWriteTargetFiles_ReadOnlyInlineStepsReturnEmpty(t *testing.T) {
 	}
 }
 
+func TestExtractRequiredOutputLabels_InferPlainUppercaseList(t *testing.T) {
+	task := "读取 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，运行 go test ./internal/proxy 和 go test ./...，最终只输出四行：RESULT、CONSTRAINT、EVIDENCE、TEST。"
+
+	got := extractRequiredOutputLabels(task)
+	want := []string{"RESULT", "CONSTRAINT", "EVIDENCE", "TEST"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractRequiredOutputLabels mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestChooseNextExecutionCommandWithStyles_ReadOnlyTaskPrefersImplicitFileRead(t *testing.T) {
+	requiredCommands := []string{
+		"go test ./internal/proxy",
+		"go test ./...",
+	}
+	requiredFiles := []string{
+		"internal/proxy/output_constraints.go",
+		"internal/proxy/execution_evidence.go",
+	}
+
+	got := chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, executionHistorySignals{}, false)
+	want := buildReadFileCommand("internal/proxy/output_constraints.go")
+	if got != want {
+		t.Fatalf("next command = %q, want %q", got, want)
+	}
+}
+
 func TestExtractBestActionableTaskBlock_PrefersConcreteTaskOverRepositoryGuidelines(t *testing.T) {
 	text := "## Repository Guidelines\n" +
 		"提交前扫描命令：rg -n \"#\\[test\\]|#\\[cfg\\(test\\)\\]\" src/ -g \"*.rs\"\n\n" +
@@ -95,6 +122,60 @@ func TestStableActionableUserTask_PrefersLatestSimplePromptOverOlderRepositoryGu
 	got := stableActionableUserTask(messages)
 	if got != "只回答 ok" {
 		t.Fatalf("stable actionable task = %q, want latest simple prompt", got)
+	}
+}
+
+func TestStableActionableUserTask_IgnoresAgentsAndEnvironmentContextBlocks(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role: "user",
+			Content: "# AGENTS.md instructions for /Volumes/Work/code/firew2oai\n\n" +
+				"<INSTRUCTIONS>\n" +
+				"## 1. 核心原则\n" +
+				"- Debug-First\n" +
+				"- 事实优先\n" +
+				"</INSTRUCTIONS>\n\n" +
+				"<environment_context>\n" +
+				"  <cwd>/Volumes/Work/code/firew2oai</cwd>\n" +
+				"  <current_date>2026-04-20</current_date>\n" +
+				"  <timezone>Asia/Shanghai</timezone>\n" +
+				"</environment_context>",
+		},
+		{
+			Role:    "user",
+			Content: "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。\n3) 执行命令：go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\n4) 执行命令：go test ./internal/proxy",
+		},
+		{Role: "user", Content: "继续推进"},
+	}
+
+	got := stableActionableUserTask(messages)
+	if !strings.Contains(got, "internal/proxy/output_constraints_test.go") {
+		t.Fatalf("stable actionable task should preserve concrete task instead of context blocks, got: %q", got)
+	}
+	if strings.Contains(got, "<environment_context>") || strings.Contains(got, "# AGENTS.md instructions") {
+		t.Fatalf("stable actionable task should exclude AGENTS/environment context blocks, got: %q", got)
+	}
+}
+
+func TestStableActionableUserTask_UsesDeveloperTaskWhenUserMessageIsOnlyEnvironmentContext(t *testing.T) {
+	messages := []ChatMessage{
+		{
+			Role: "user",
+			Content: "<environment_context>\n" +
+				"  <cwd>/Volumes/Work/code/firew2oai</cwd>\n" +
+				"  <current_date>2026-04-20</current_date>\n" +
+				"</environment_context>",
+		},
+		{
+			Role:    "developer",
+			Content: "请在当前仓库完成一个真实但边界清晰的测试补强任务：1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。 2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 `TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise`。 3) 执行命令：go test ./internal/proxy",
+		},
+		{Role: "user", Content: "继续推进"},
+	}
+
+	got := stableActionableUserTask(messages)
+	if !strings.Contains(got, "internal/proxy/output_constraints_test.go") {
+		t.Fatalf("stable actionable task should use developer task when user message is only environment context, got: %q", got)
 	}
 }
 
@@ -407,6 +488,28 @@ func TestApplyExecutionPolicyToParseResult_PendingWriteBlocksRepeatedFailedTestR
 	}
 	if want := "modify target files before rerunning tests"; !containsNormalized(command, want) {
 		t.Fatalf("guard command = %q, want message containing %q", command, want)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_PendingWriteAfterFailedTestRewritesRetryToRepairRead(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "继续跑测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	nextCommand := "sed -n '1,200p' 'internal/proxy/output_constraints_test.go'"
+	policy := executionPolicy{
+		Enabled:       true,
+		RequireTool:   true,
+		PendingWrite:  true,
+		RequiredFiles: []string{"internal/proxy/output_constraints_test.go"},
+		NextCommand:   nextCommand,
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	command := parsedCallCommand(t, got.calls[0])
+	if command != nextCommand {
+		t.Fatalf("rewritten command = %q, want %q", command, nextCommand)
 	}
 }
 

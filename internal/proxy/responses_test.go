@@ -257,6 +257,99 @@ func TestResponseInputToMessages_ToolOutput(t *testing.T) {
 	}
 }
 
+func TestNormalizeToolSummaryMessageItem_ParsesExitCodeStyleToolResult(t *testing.T) {
+	item := map[string]any{
+		"role":    "user",
+		"content": "Tool result (call_id=call_test_all)\nCommand: go test ./...\nExit code: 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s",
+	}
+
+	raw, ok := normalizeToolSummaryMessageItem(item)
+	if !ok {
+		t.Fatal("normalizeToolSummaryMessageItem = false, want true")
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode normalized raw: %v", err)
+	}
+	if decoded["type"] != "function_call_output" {
+		t.Fatalf("type = %v, want function_call_output", decoded["type"])
+	}
+	if decoded["call_id"] != "call_test_all" {
+		t.Fatalf("call_id = %v, want call_test_all", decoded["call_id"])
+	}
+	output, _ := decoded["output"].(map[string]any)
+	if output == nil {
+		t.Fatalf("output = %#v, want object", decoded["output"])
+	}
+	if output["success"] != true {
+		t.Fatalf("success = %#v, want true", output["success"])
+	}
+	if !strings.Contains(output["content"].(string), "ok") {
+		t.Fatalf("content = %#v, want go test output", output["content"])
+	}
+}
+
+func TestNormalizeRawResponseInputItem_StringToolSummariesBecomeRawHistoryItems(t *testing.T) {
+	callRaw, ok := normalizeRawResponseInputItem("Assistant requested tool: exec_command (call_id=call_test_all)\nTool payload:\n{\"cmd\":\"go test ./...\"}")
+	if !ok {
+		t.Fatal("assistant summary normalize ok = false, want true")
+	}
+	var call map[string]any
+	if err := json.Unmarshal(callRaw, &call); err != nil {
+		t.Fatalf("decode call raw: %v", err)
+	}
+	if call["type"] != "function_call" {
+		t.Fatalf("call type = %v, want function_call", call["type"])
+	}
+
+	resultRaw, ok := normalizeRawResponseInputItem("Tool result (call_id=call_test_all)\nExit code: 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s")
+	if !ok {
+		t.Fatal("tool result normalize ok = false, want true")
+	}
+	var result map[string]any
+	if err := json.Unmarshal(resultRaw, &result); err != nil {
+		t.Fatalf("decode result raw: %v", err)
+	}
+	if result["type"] != "function_call_output" {
+		t.Fatalf("result type = %v, want function_call_output", result["type"])
+	}
+	output, _ := result["output"].(map[string]any)
+	if output == nil || output["success"] != true {
+		t.Fatalf("output = %#v, want success=true", result["output"])
+	}
+}
+
+func TestBuildExecutionEvidence_InfersSuccessFromGoTestOutputWithoutExplicitFlag(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_test","arguments":"{\"cmd\":\"go test ./internal/proxy\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_test","output":"ok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s"}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	if len(evidence.Outputs) != 1 {
+		t.Fatalf("len(evidence.Outputs) = %d, want 1", len(evidence.Outputs))
+	}
+	if !strings.Contains(evidence.Outputs[0], "success=true") {
+		t.Fatalf("evidence output = %q, want inferred success=true", evidence.Outputs[0])
+	}
+}
+
+func TestBuildExecutionEvidence_InfersSuccessFromWrappedMultiLineGoTestOutput(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_test_all","arguments":"{\"cmd\":\"go test ./...\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_test_all","output":"Chunk ID: 81328a\nWall time: 0.1076 seconds\nProcess exited with code 0\nOriginal token count: 88\nOutput:\n?   \tgithub.com/mison/firew2oai/cmd/server\t[no test files]\nok  \tgithub.com/mison/firew2oai/internal/config\t(cached)\nok  \tgithub.com/mison/firew2oai/internal/proxy\t(cached)\nok  \tgithub.com/mison/firew2oai/internal/tokenauth\t(cached)\nok  \tgithub.com/mison/firew2oai/internal/transport\t(cached)\nok  \tgithub.com/mison/firew2oai/internal/whitelist\t(cached)"}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	if len(evidence.Outputs) != 1 {
+		t.Fatalf("len(evidence.Outputs) = %d, want 1", len(evidence.Outputs))
+	}
+	if !strings.Contains(evidence.Outputs[0], "success=true") {
+		t.Fatalf("evidence output = %q, want inferred success=true", evidence.Outputs[0])
+	}
+}
+
 func TestParseToolCallOutput_Function(t *testing.T) {
 	result := parseToolCallOutput(
 		"```json\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}}\n```",
@@ -674,6 +767,45 @@ func TestHandleResponses_StreamFunctionToolCall(t *testing.T) {
 	}
 	if strings.Contains(bodyText, "response.output_text.delta") {
 		t.Fatalf("tool-call stream should not emit text deltas:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_StreamToolFinalOutputIsConstrained(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"ID: I'll start by reading the relevant files to understand the code structure and testing style.\\nRESULT: PASS\\nREADME: # firew2oai\\nTOOLP: go test ./internal/proxy ok\\n<<<AI_ACTIONS_V1>>>\\n{\\\"mode\\\":\\\"final\\\"}\\n<<<END_AI_ACTIONS_V1>>>\"}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"glm-5","stream":true,"input":"你在真实 Go 项目中执行任务。最终只输出三行：RESULT: PASS 或 FAIL；README: 简述；TOOLP: 工具策略。","tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	want := "\"text\":\"RESULT: PASS\\nREADME: # firew2oai\\nTOOLP: go test ./internal/proxy ok\""
+	if !strings.Contains(bodyText, want) {
+		t.Fatalf("stream body missing constrained final text %q:\n%s", want, bodyText)
+	}
+	if strings.Contains(bodyText, "ID: I'll start by reading the relevant files") {
+		t.Fatalf("stream body should not leak raw prefix chatter:\n%s", bodyText)
 	}
 }
 

@@ -64,6 +64,13 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 			callID, _ := item["call_id"].(string)
 			command := strings.TrimSpace(callIDToCommand[callID])
 			text, success := extractToolOutputText(item["output"])
+			if success == nil {
+				if isTestCommand(command) {
+					success = inferTestCommandOutputSuccess(text)
+				} else {
+					success = inferToolOutputSuccess(text)
+				}
+			}
 			if strings.TrimSpace(text) == "" {
 				if encoded, err := json.Marshal(item["output"]); err == nil {
 					text = string(encoded)

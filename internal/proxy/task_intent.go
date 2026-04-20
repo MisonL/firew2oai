@@ -86,6 +86,7 @@ var taskCommandTrailingStepPattern = regexp.MustCompile(`\s+\d+[.)][\s\S]*$`)
 var taskBacktickPattern = regexp.MustCompile("`([^`\\n]+)`")
 var goTestNamePattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*\b`)
 var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
+var taskPlainOutputLabelListPattern = regexp.MustCompile(`(?i)(?:只输出|only output|output only)[^A-Z\n]{0,40}([A-Z][A-Z0-9_]{1,24}(?:\s*[、，,;；/]\s*[A-Z][A-Z0-9_]{1,24}){1,7})`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
 var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only output|output only)\b[\s\S]*$`)
 var taskCommandTrailingConnectorPattern = regexp.MustCompile(`(?:\s|，|,|、|；|;)*(?:和|以及|及|and|then|然后)\s*$`)
@@ -106,7 +107,7 @@ func latestUserTask(messages []ChatMessage) string {
 
 func latestActionableUserTask(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if !strings.EqualFold(messages[i].Role, "user") {
+		if !isActionableTaskMessageRole(messages[i].Role) {
 			continue
 		}
 		text := strings.TrimSpace(messages[i].Content)
@@ -133,7 +134,7 @@ func stableActionableUserTask(messages []ChatMessage) string {
 	best := latest
 	bestScore := actionableTaskSpecificityScore(latest)
 	for i := len(messages) - 1; i >= 0; i-- {
-		if !strings.EqualFold(messages[i].Role, "user") {
+		if !isActionableTaskMessageRole(messages[i].Role) {
 			continue
 		}
 		text := strings.TrimSpace(messages[i].Content)
@@ -151,6 +152,15 @@ func stableActionableUserTask(messages []ChatMessage) string {
 		return best
 	}
 	return latest
+}
+
+func isActionableTaskMessageRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "user", "developer":
+		return true
+	default:
+		return false
+	}
 }
 
 func isWeakFollowupTask(task string) bool {
@@ -233,6 +243,9 @@ func actionableTaskBlockScore(block string) int {
 	if isInstructionDocumentBlock(lower) {
 		score -= 120
 	}
+	if isEnvironmentContextBlock(lower) {
+		score -= 160
+	}
 	for _, marker := range []string{
 		"agents.md",
 		"repository guidelines",
@@ -262,6 +275,9 @@ func isInstructionDocumentBlock(lower string) bool {
 		return false
 	}
 	docMarkers := []string{
+		"# agents.md instructions for",
+		"<instructions>",
+		"</instructions>",
 		"# repository guidelines",
 		"## project structure & module organization",
 		"## build, test, and development commands",
@@ -279,6 +295,27 @@ func isInstructionDocumentBlock(lower string) bool {
 	}
 	matchCount := 0
 	for _, marker := range docMarkers {
+		if strings.Contains(lower, marker) {
+			matchCount++
+		}
+	}
+	return matchCount >= 2
+}
+
+func isEnvironmentContextBlock(lower string) bool {
+	if lower == "" {
+		return false
+	}
+	markers := []string{
+		"<environment_context>",
+		"</environment_context>",
+		"<cwd>",
+		"<current_date>",
+		"<timezone>",
+		"<subagents>",
+	}
+	matchCount := 0
+	for _, marker := range markers {
 		if strings.Contains(lower, marker) {
 			matchCount++
 		}
@@ -809,7 +846,33 @@ func extractRequiredOutputLabels(task string) []string {
 			labels = append(labels, label)
 		}
 	}
+	if len(labels) == 0 {
+		labels = append(labels, extractPlainRequiredOutputLabels(task)...)
+	}
 	return labels
+}
+
+func extractPlainRequiredOutputLabels(task string) []string {
+	match := taskPlainOutputLabelListPattern.FindStringSubmatch(task)
+	if len(match) < 2 {
+		return nil
+	}
+	fields := strings.FieldsFunc(strings.TrimSpace(match[1]), func(r rune) bool {
+		switch r {
+		case '、', '，', ',', ';', '；', '/':
+			return true
+		default:
+			return false
+		}
+	})
+	labels := make([]string, 0, len(fields))
+	for _, field := range fields {
+		label := strings.TrimSpace(field)
+		if label != "" {
+			labels = append(labels, label)
+		}
+	}
+	return dedupePreserveOrder(labels)
 }
 
 func dedupePreserveOrder(values []string) []string {
