@@ -565,14 +565,22 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			signals.CommandsWithResult = append(signals.CommandsWithResult, command)
 			text, success := extractToolOutputText(item["output"])
 			if success == nil {
-				success = inferToolOutputSuccess(text)
+				if isTestCommand(command) {
+					success = inferTestCommandOutputSuccess(text)
+				} else {
+					success = inferToolOutputSuccess(text)
+				}
 			}
 			if isReadOnlyCommand(command) {
 				if filePath := strings.TrimSpace(taskFilePathPattern.FindString(command)); filePath != "" && pos > 0 {
 					signals.ReadResultPosByFile[filePath] = pos
 				}
 			}
-			if success == nil || *success {
+			successful := success == nil || *success
+			if isTestCommand(command) {
+				successful = success != nil && *success
+			}
+			if successful {
 				signals.SuccessfulCommands = append(signals.SuccessfulCommands, command)
 				if strings.TrimSpace(text) != "" {
 					signals.CommandOutputs[command] = text
@@ -983,6 +991,37 @@ func inferToolOutputSuccess(text string) *bool {
 		}
 	}
 	return nil
+}
+
+func inferTestCommandOutputSuccess(text string) *bool {
+	if inferred := inferToolOutputSuccess(text); inferred != nil {
+		return inferred
+	}
+
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) != 1 {
+		return nil
+	}
+
+	lower := strings.ToLower(strings.TrimSpace(lines[0]))
+	switch {
+	case strings.HasPrefix(lower, "ok\t"),
+		strings.HasPrefix(lower, "ok "),
+		strings.HasPrefix(lower, "pass\t"),
+		strings.HasPrefix(lower, "pass "),
+		strings.Contains(lower, "test result: ok"),
+		strings.Contains(lower, " passed in "),
+		strings.HasSuffix(lower, " passed"):
+		succeeded := true
+		return &succeeded
+	default:
+		return nil
+	}
 }
 
 func normalizeCommandForCompare(command string) string {

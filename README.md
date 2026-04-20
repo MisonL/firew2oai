@@ -63,6 +63,30 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 与同日直连相比，这轮正式 `new-api` 中转没有劣化整体表现，且 `llama-v3p3-70b-instruct`、`deepseek-v3p1` 的结果更好。
 
+### 2026-04-20 晚间补充复核
+
+本日又补了一次执行策略修正：当模型只返回了部分测试输出时，不再把该轮误判为“测试已成功”，从而避免过早进入 finalize。对应代码位于：
+
+- `internal/proxy/execution_policy.go`
+- `internal/proxy/execution_policy_test.go`
+
+本地回归验证：
+
+- `go test ./internal/proxy`
+- `go test ./...`
+
+补丁后结论：
+
+- `deepseek-v3p1` 已消除“第二条测试输出未完整回收却提前 finalize”的适配层误差
+- 正式 `new-api -> firew2oai` 链路下，其余 10 个模型在“最小多轮工具任务”中全部完成真实 `command_execution` 并 PASS
+- 该结论只说明多轮工具链路已通，不等同于真实写代码任务也都稳定可用
+
+当前按真实写代码任务主口径，可粗分为三档：
+
+- 第一梯队：`deepseek-v3p2`、`deepseek-v3p1`、`qwen3-vl-30b-a3b-instruct`、`llama-v3p3-70b-instruct`
+- 第二梯队：`minimax-m2p5`、`kimi-k2p5`、`glm-5`、`glm-4p7`
+- 第三梯队：`qwen3-8b`、`qwen3-vl-30b-a3b-thinking`、`gpt-oss-20b`、`gpt-oss-120b`
+
 详细记录见：
 
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`

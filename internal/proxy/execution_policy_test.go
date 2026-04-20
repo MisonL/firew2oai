@@ -558,6 +558,45 @@ func TestInferToolOutputSuccess_RecognizesMissingFileError(t *testing.T) {
 	}
 }
 
+func TestInferTestCommandOutputSuccess_RecognizesSingleLineGoTestOK(t *testing.T) {
+	got := inferTestCommandOutputSuccess("ok\tgithub.com/mison/firew2oai/internal/proxy\t0.321s")
+	if got == nil || !*got {
+		t.Fatalf("inferTestCommandOutputSuccess should return true for single-line go test ok, got %#v", got)
+	}
+}
+
+func TestInferTestCommandOutputSuccess_DoesNotAssumeSuccessForPartialMultiLineOutput(t *testing.T) {
+	got := inferTestCommandOutputSuccess("ok\tgithub.com/mison/firew2oai/internal/config\t(cached)\nok\tgithub.com/mison/firew2oai/internal/tokenauth\t(cached)")
+	if got != nil {
+		t.Fatalf("inferTestCommandOutputSuccess should return nil for partial multi-line output, got %#v", got)
+	}
+}
+
+func TestCollectExecutionHistorySignals_DoesNotMarkPartialTestOutputAsSuccessful(t *testing.T) {
+	args, _ := json.Marshal(map[string]any{"cmd": "go test ./..."})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "exec_command",
+			"call_id":   "call_1",
+			"arguments": string(args),
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_1",
+			"output":  "ok\tgithub.com/mison/firew2oai/internal/config\t(cached)\nok\tgithub.com/mison/firew2oai/internal/tokenauth\t(cached)\n",
+		}),
+	}
+
+	signals := collectExecutionHistorySignals(history)
+	if len(signals.SuccessfulCommands) != 0 {
+		t.Fatalf("SuccessfulCommands = %#v, want empty for partial test output", signals.SuccessfulCommands)
+	}
+	if !reflect.DeepEqual(signals.CommandsWithResult, []string{"go test ./..."}) {
+		t.Fatalf("CommandsWithResult = %#v, want recorded test command", signals.CommandsWithResult)
+	}
+}
+
 func TestCollectExecutionHistorySignals_ScaffoldCreateDoesNotCountAsWrite(t *testing.T) {
 	args, _ := json.Marshal(map[string]any{"cmd": "mkdir -p -- 'internal/proxy' && touch 'internal/proxy/output_constraints_test.go'"})
 	history := []json.RawMessage{
@@ -936,6 +975,35 @@ func TestBuildExecutionPolicy_ReadOnlyCodingTaskDoesNotStickInExecute(t *testing
 	}
 	if policy.RequireTool {
 		t.Fatalf("policy.RequireTool = true, want false after read-only task completed: %+v", policy)
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyCodingTaskKeepsVerifyWhenFinalTestOutputIsPartial(t *testing.T) {
+	task := "你是资深 Go 工程师。请执行一个真实编码排障任务（只读分析，不修改文件）：\n1) 执行 `sed -n '1,220p' internal/proxy/output_constraints.go`\n2) 执行 `sed -n '1,220p' internal/proxy/execution_evidence.go`\n3) 执行 `go test ./internal/proxy`\n4) 执行 `go test ./...`\n完成后只输出四行。"
+	readOneArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,220p' internal/proxy/output_constraints.go"})
+	readTwoArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,220p' internal/proxy/execution_evidence.go"})
+	testOneArgs, _ := json.Marshal(map[string]any{"cmd": "go test ./internal/proxy"})
+	testAllArgs, _ := json.Marshal(map[string]any{"cmd": "go test ./..."})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": string(readOneArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package proxy", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_2", "arguments": string(readTwoArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_2", "output": map[string]any{"content": "package proxy", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "test_1", "arguments": string(testOneArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "test_1", "output": map[string]any{"content": "ok\tgithub.com/mison/firew2oai/internal/proxy\t0.321s"}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "test_all", "arguments": string(testAllArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "test_all", "output": map[string]any{"content": "ok\tgithub.com/mison/firew2oai/internal/config\t(cached)\nok\tgithub.com/mison/firew2oai/internal/tokenauth\t(cached)\n"}}),
+	}
+
+	policy := buildExecutionPolicy("deepseek-v3p1", task, history, true, false, true)
+	if policy.Stage != "verify" {
+		t.Fatalf("stage = %q, want verify; policy=%+v", policy.Stage, policy)
+	}
+	if !policy.RequireTool {
+		t.Fatalf("policy.RequireTool = false, want true while final test output is partial: %+v", policy)
+	}
+	if strings.TrimSpace(policy.NextCommand) == "" {
+		t.Fatalf("policy.NextCommand = empty, want a follow-up tool step while final test output is partial")
 	}
 }
 

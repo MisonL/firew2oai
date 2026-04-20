@@ -97,6 +97,33 @@
 2. `apply_patch` 工具恢复  
    - 当尾部还有 `mode=final` 时，优先恢复前面的 mutation block
 
+## 2026-04-20 晚间补丁补充
+
+当日又补了一处执行策略误差修复：
+
+1. 测试命令成功判定收紧  
+   - 对 `go test`、`pytest` 等测试命令，不再把“输出不完整但暂未显式失败”的情况视为成功
+   - 仅在命中明确成功信号时，才允许把该轮测试记为成功
+2. finalize 前置误判收敛  
+   - 修复前：模型可能在第二条测试输出尚未完整回收时，被适配层误判为“验证完成”，随后提前进入 finalize
+   - 修复后：这类场景会继续停留在 verify/execute，而不是过早结束
+
+对应文件：
+
+- `internal/proxy/execution_policy.go`
+- `internal/proxy/execution_policy_test.go`
+
+对应本地验证：
+
+- `go test ./internal/proxy`
+- `go test ./...`
+
+修复后的增量结论：
+
+- `deepseek-v3p1` 先前那类“第二条测试未收完整却提前 finalize”的问题，确认属于适配层误差，当前已消除
+- 正式 `new-api -> firew2oai` 链路下，另外 10 个模型在最小多轮工具任务中全部 PASS
+- 但这批 PASS 仅代表多轮工具链路已通，不应直接上升为“真实写代码任务全部可用”
+
 ## 结论
 
 截至 2026-04-20，`firew2oai -> Codex` 在只读 Coding 审计任务上已经稳定；而在真实写代码任务上，当前结论应收紧为：
