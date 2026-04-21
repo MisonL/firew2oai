@@ -490,11 +490,21 @@ func taskCompletionSatisfied(task string, evidence executionEvidence) bool {
 		return hasExecutionEvidence(evidence)
 	}
 	for _, command := range requiredCommands {
-		if !hasSuccessfulCommandEvidence(evidence, command) {
+		if !hasSatisfiedCommandEvidence(evidence, command) {
 			return false
 		}
 	}
 	return true
+}
+
+func hasSatisfiedCommandEvidence(evidence executionEvidence, target string) bool {
+	if isTestCommand(target) {
+		return hasSuccessfulCommandEvidence(evidence, target)
+	}
+	if hasFailedCommandEvidence(evidence, target) {
+		return false
+	}
+	return hasObservedCommandEvidence(evidence, target)
 }
 
 func hasSuccessfulCommandEvidence(evidence executionEvidence, target string) bool {
@@ -507,6 +517,41 @@ func hasSuccessfulCommandEvidence(evidence executionEvidence, target string) boo
 		if !strings.Contains(lower, "success=true") {
 			continue
 		}
+		if strings.Contains(normalizeCommandForCompare(output), targetKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasFailedCommandEvidence(evidence executionEvidence, target string) bool {
+	targetKey := normalizeCommandForCompare(target)
+	if targetKey == "" {
+		return false
+	}
+	for _, output := range evidence.Outputs {
+		lower := strings.ToLower(strings.TrimSpace(output))
+		if !strings.Contains(lower, "success=false") {
+			continue
+		}
+		if strings.Contains(normalizeCommandForCompare(output), targetKey) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasObservedCommandEvidence(evidence executionEvidence, target string) bool {
+	targetKey := normalizeCommandForCompare(target)
+	if targetKey == "" {
+		return false
+	}
+	for _, command := range evidence.Commands {
+		if strings.Contains(normalizeCommandForCompare(command), targetKey) {
+			return true
+		}
+	}
+	for _, output := range evidence.Outputs {
 		if strings.Contains(normalizeCommandForCompare(output), targetKey) {
 			return true
 		}

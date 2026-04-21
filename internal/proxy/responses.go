@@ -148,7 +148,11 @@ func responseInputToMessagesAndItems(input json.RawMessage) ([]ChatMessage, []js
 			return nil, nil, errors.New("input is required")
 		}
 		messages = append(messages, ChatMessage{Role: "user", Content: v})
-		items = append(items, buildInputMessageItem("user", v))
+		if normalized := normalizeRawResponseInputItems(v); len(normalized) > 0 {
+			items = append(items, normalized...)
+		} else {
+			items = append(items, buildInputMessageItem("user", v))
+		}
 	case []any:
 		for _, item := range v {
 			extracted := extractInputMessages(item)
@@ -156,8 +160,8 @@ func responseInputToMessagesAndItems(input json.RawMessage) ([]ChatMessage, []js
 				continue
 			}
 			messages = append(messages, extracted...)
-			if rawItem, ok := normalizeRawResponseInputItem(item); ok {
-				items = append(items, rawItem)
+			if rawItems := normalizeRawResponseInputItems(item); len(rawItems) > 0 {
+				items = append(items, rawItems...)
 			}
 		}
 	default:
@@ -192,31 +196,106 @@ func buildInputMessageItem(role, text string) json.RawMessage {
 }
 
 func normalizeRawResponseInputItem(item any) (json.RawMessage, bool) {
+	items := normalizeRawResponseInputItems(item)
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items[len(items)-1], true
+}
+
+func normalizeRawResponseInputItems(item any) []json.RawMessage {
 	switch value := item.(type) {
 	case string:
 		text := strings.TrimSpace(value)
 		if text == "" {
-			return nil, false
+			return nil
 		}
-		if raw, ok := normalizeToolSummaryStringItem(text); ok {
-			return raw, true
+		if raws := normalizeToolSummaryStringItems(text); len(raws) > 0 {
+			return raws
 		}
-		return buildInputMessageItem("user", value), true
+		return []json.RawMessage{buildInputMessageItem("user", value)}
 	case map[string]any:
-		if raw, ok := normalizeToolSummaryMessageItem(value); ok {
-			return raw, true
+		if raws := normalizeStructuredToolOutputItems(value); len(raws) > 0 {
+			return raws
+		}
+		if raws := normalizeToolSummaryMessageItems(value); len(raws) > 0 {
+			return raws
 		}
 		data, err := json.Marshal(value)
 		if err != nil {
-			return nil, false
+			return nil
 		}
-		return json.RawMessage(data), true
+		return []json.RawMessage{json.RawMessage(data)}
 	default:
-		return nil, false
+		return nil
 	}
 }
 
+func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
+	typ, _ := item["type"].(string)
+	if typ != "function_call_output" && typ != "custom_tool_call_output" {
+		return nil
+	}
+
+	text, embeddedSuccess := extractToolOutputText(item["output"])
+	callID, command, parsedSuccess, outputText, ok := parseToolResultSummaryDetails(text)
+	if !ok {
+		return nil
+	}
+
+	normalizedCallID, _ := item["call_id"].(string)
+	normalizedCallID = strings.TrimSpace(normalizedCallID)
+	if normalizedCallID == "" {
+		normalizedCallID = strings.TrimSpace(callID)
+	}
+
+	items := make([]json.RawMessage, 0, 2)
+	if raw := buildExecCommandHistoryItem(normalizedCallID, command); len(raw) > 0 {
+		items = append(items, raw)
+	}
+
+	success := parsedSuccess
+	if success == nil {
+		success = embeddedSuccess
+	}
+	content := strings.TrimSpace(outputText)
+	if content == "" {
+		content = strings.TrimSpace(text)
+	}
+
+	output := map[string]any{}
+	if success != nil {
+		output["success"] = *success
+	}
+	if content != "" {
+		output["content"] = content
+	}
+
+	callOutput := map[string]any{
+		"type":   typ,
+		"output": output,
+	}
+	if normalizedCallID != "" {
+		callOutput["call_id"] = normalizedCallID
+	}
+
+	data, err := json.Marshal(callOutput)
+	if err != nil {
+		return nil
+	}
+	items = append(items, json.RawMessage(data))
+	return items
+}
+
 func normalizeToolSummaryStringItem(text string) (json.RawMessage, bool) {
+	items := normalizeToolSummaryStringItems(text)
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items[len(items)-1], true
+}
+
+func normalizeToolSummaryStringItems(text string) []json.RawMessage {
 	if match := assistantToolSummaryPattern.FindStringSubmatch(text); len(match) != 0 {
 		call := map[string]any{
 			"type": "function_call",
@@ -230,14 +309,19 @@ func normalizeToolSummaryStringItem(text string) (json.RawMessage, bool) {
 		}
 		data, err := json.Marshal(call)
 		if err != nil {
-			return nil, false
+			return nil
 		}
-		return json.RawMessage(data), true
+		return []json.RawMessage{json.RawMessage(data)}
 	}
 
-	callID, success, outputText, ok := parseToolResultSummary(text)
+	callID, command, success, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
-		return nil, false
+		return nil
+	}
+
+	items := make([]json.RawMessage, 0, 2)
+	if raw := buildExecCommandHistoryItem(callID, command); len(raw) > 0 {
+		items = append(items, raw)
 	}
 	output := map[string]any{}
 	if success != nil {
@@ -255,9 +339,10 @@ func normalizeToolSummaryStringItem(text string) (json.RawMessage, bool) {
 	}
 	data, err := json.Marshal(callOutput)
 	if err != nil {
-		return nil, false
+		return nil
 	}
-	return json.RawMessage(data), true
+	items = append(items, json.RawMessage(data))
+	return items
 }
 
 func rawItemsToMessages(items []json.RawMessage) []ChatMessage {
@@ -470,9 +555,17 @@ var assistantToolSummaryPattern = regexp.MustCompile(`(?s)^Assistant requested t
 var toolResultCallIDPattern = regexp.MustCompile(`\(\s*call_id=([^)]+)\s*\)`)
 
 func normalizeToolSummaryMessageItem(item map[string]any) (json.RawMessage, bool) {
+	items := normalizeToolSummaryMessageItems(item)
+	if len(items) == 0 {
+		return nil, false
+	}
+	return items[len(items)-1], true
+}
+
+func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 	role, _ := item["role"].(string)
 	if !isActionableTaskMessageRole(role) && !strings.EqualFold(strings.TrimSpace(role), "assistant") {
-		return nil, false
+		return nil
 	}
 
 	var text string
@@ -484,13 +577,13 @@ func normalizeToolSummaryMessageItem(item map[string]any) (json.RawMessage, bool
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return nil, false
+		return nil
 	}
 
 	if strings.EqualFold(strings.TrimSpace(role), "assistant") {
 		match := assistantToolSummaryPattern.FindStringSubmatch(text)
 		if len(match) == 0 {
-			return nil, false
+			return nil
 		}
 		call := map[string]any{
 			"type": "function_call",
@@ -504,17 +597,21 @@ func normalizeToolSummaryMessageItem(item map[string]any) (json.RawMessage, bool
 		}
 		data, err := json.Marshal(call)
 		if err != nil {
-			return nil, false
+			return nil
 		}
-		return json.RawMessage(data), true
+		return []json.RawMessage{json.RawMessage(data)}
 	}
 
 	if !strings.EqualFold(strings.TrimSpace(role), "user") {
-		return nil, false
+		return nil
 	}
-	callID, success, outputText, ok := parseToolResultSummary(text)
+	callID, command, success, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
-		return nil, false
+		return nil
+	}
+	items := make([]json.RawMessage, 0, 2)
+	if raw := buildExecCommandHistoryItem(callID, command); len(raw) > 0 {
+		items = append(items, raw)
 	}
 	output := map[string]any{}
 	if success != nil {
@@ -532,15 +629,21 @@ func normalizeToolSummaryMessageItem(item map[string]any) (json.RawMessage, bool
 	}
 	data, err := json.Marshal(callOutput)
 	if err != nil {
-		return nil, false
+		return nil
 	}
-	return json.RawMessage(data), true
+	items = append(items, json.RawMessage(data))
+	return items
 }
 
 func parseToolResultSummary(text string) (string, *bool, string, bool) {
+	callID, _, success, output, ok := parseToolResultSummaryDetails(text)
+	return callID, success, output, ok
+}
+
+func parseToolResultSummaryDetails(text string) (string, string, *bool, string, bool) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" || !strings.HasPrefix(strings.ToLower(trimmed), "tool result") {
-		return "", nil, "", false
+		return "", "", nil, "", false
 	}
 
 	lines := strings.Split(trimmed, "\n")
@@ -550,6 +653,7 @@ func parseToolResultSummary(text string) (string, *bool, string, bool) {
 		callID = strings.TrimSpace(match[1])
 	}
 
+	command := ""
 	var success *bool
 	outputLines := make([]string, 0, len(lines))
 	outputStarted := false
@@ -560,6 +664,8 @@ func parseToolResultSummary(text string) (string, *bool, string, bool) {
 		}
 		lower := strings.ToLower(line)
 		switch {
+		case strings.HasPrefix(lower, "command:"):
+			command = strings.TrimSpace(line[len("Command:"):])
 		case strings.HasPrefix(lower, "success:"):
 			value := strings.TrimSpace(line[len("Success:"):])
 			if value != "" {
@@ -586,10 +692,30 @@ func parseToolResultSummary(text string) (string, *bool, string, bool) {
 	}
 
 	output := strings.TrimSpace(strings.Join(outputLines, "\n"))
-	if callID == "" && success == nil && output == "" {
-		return "", nil, "", false
+	if callID == "" && command == "" && success == nil && output == "" {
+		return "", "", nil, "", false
 	}
-	return callID, success, output, true
+	return callID, command, success, output, true
+}
+
+func buildExecCommandHistoryItem(callID, command string) json.RawMessage {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		return nil
+	}
+	args, err := json.Marshal(map[string]any{"cmd": command})
+	if err != nil {
+		return nil
+	}
+	call := map[string]any{
+		"type":      "function_call",
+		"name":      "exec_command",
+		"arguments": string(args),
+	}
+	if callID = strings.TrimSpace(callID); callID != "" {
+		call["call_id"] = callID
+	}
+	return mustMarshalRawJSON(call)
 }
 
 type responsesPromptOptions struct {
@@ -981,16 +1107,6 @@ func buildHistoryItems(baseHistory, requestItems, outputItems []json.RawMessage)
 	return history
 }
 
-func shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted bool, resultLen int, scanErr error, attempt int, clientGone bool) bool {
-	if attempt > 0 {
-		return false
-	}
-	if clientGone || errors.Is(scanErr, context.Canceled) {
-		return false
-	}
-	return !doneReceived && !contentEmitted && resultLen == 0
-}
-
 func estimateResponseUsage(inputItems, outputItems []json.RawMessage) *ResponseUsage {
 	inputTokens := estimateMessagesTokenCount(rawItemsToMessages(inputItems))
 	outputTokens := estimateMessagesTokenCount(rawItemsToMessages(outputItems))
@@ -1378,6 +1494,17 @@ func writeResponsesMessageDone(writeAndFlushEvent func(string, any) bool, respon
 	})
 }
 
+func writeResponsesTextDelta(writeAndFlushEvent func(string, any) bool, responseID, messageID, text string) bool {
+	return writeAndFlushEvent("response.output_text.delta", ResponseOutputTextDeltaEvent{
+		Type:         "response.output_text.delta",
+		ResponseID:   responseID,
+		ItemID:       messageID,
+		OutputIndex:  0,
+		ContentIndex: 0,
+		Delta:        text,
+	})
+}
+
 func buildToolProtocolErrorMessage(err error, upstreamText string) string {
 	var builder strings.Builder
 	builder.WriteString("Codex adapter error: ")
@@ -1625,6 +1752,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	if !bufferForToolCalls && !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
 		return
 	}
+	delayRawTextDeltas := !bufferForToolCalls && len(extractRequiredOutputLabels(currentTask)) > 0
 
 	isThinking := config.IsThinkingModel(model)
 	var result strings.Builder
@@ -1710,6 +1838,11 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				}
 				finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 				outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
+				if delayRawTextDeltas && finalText != "" {
+					if !writeResponsesTextDelta(writeAndFlushEvent, responseID, messageID, finalText) {
+						return false
+					}
+				}
 				if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
 					return false
 				}
@@ -1730,22 +1863,29 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				if bufferForToolCalls {
 					return true
 				}
-				return writeAndFlushEvent("response.output_text.delta", ResponseOutputTextDeltaEvent{
-					Type:         "response.output_text.delta",
-					ResponseID:   responseID,
-					ItemID:       messageID,
-					OutputIndex:  0,
-					ContentIndex: 0,
-					Delta:        delta,
-				})
+				if delayRawTextDeltas {
+					return true
+				}
+				return writeResponsesTextDelta(writeAndFlushEvent, responseID, messageID, delta)
 			}
 			return true
 		})
 		_ = reader.Close()
 
-		if shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted, result.Len(), scanErr, attempt, clientGone) {
+		if p.upstreamEmptyRetry.shouldRetry(attempt, doneReceived, contentEmitted, result.Len(), scanErr, clientGone) {
+			delay := p.upstreamEmptyRetry.delay(attempt)
 			attempt++
-			slog.Warn("responses stream empty attempt, retrying once", "response_id", responseID, "attempt", attempt, "error", scanErr)
+			slog.Warn("responses stream empty attempt, retrying",
+				"response_id", responseID,
+				"attempt", attempt,
+				"max_retries", p.upstreamEmptyRetry.count,
+				"backoff", delay,
+				"error", scanErr,
+			)
+			if err := sleepWithContext(r.Context(), delay); err != nil {
+				scanErr = err
+				break
+			}
 			reader, err = openReader()
 			if err != nil {
 				scanErr = err
@@ -1817,6 +1957,9 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		}
 		finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
 		outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
+		if delayRawTextDeltas && finalText != "" {
+			writeResponsesTextDelta(writeAndFlushEvent, responseID, messageID, finalText)
+		}
 		writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
 		completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 		writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
@@ -1833,6 +1976,11 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
 		if bufferForToolCalls {
 			if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
+				return
+			}
+		}
+		if delayRawTextDeltas && finalText != "" {
+			if !writeResponsesTextDelta(writeAndFlushEvent, responseID, messageID, finalText) {
 				return
 			}
 		}
@@ -1894,9 +2042,20 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		})
 		_ = reader.Close()
 
-		if shouldRetryEmptyResponsesAttempt(doneReceived, contentEmitted, result.Len(), scanErr, attempt, false) {
+		if p.upstreamEmptyRetry.shouldRetry(attempt, doneReceived, contentEmitted, result.Len(), scanErr, false) {
+			delay := p.upstreamEmptyRetry.delay(attempt)
 			attempt++
-			slog.Warn("responses non-stream empty attempt, retrying once", "response_id", responseID, "attempt", attempt, "error", scanErr)
+			slog.Warn("responses non-stream empty attempt, retrying",
+				"response_id", responseID,
+				"attempt", attempt,
+				"max_retries", p.upstreamEmptyRetry.count,
+				"backoff", delay,
+				"error", scanErr,
+			)
+			if err := sleepWithContext(ctx, delay); err != nil {
+				scanErr = err
+				break
+			}
 			reader, err = openReader()
 			if err != nil {
 				scanErr = err

@@ -1,14 +1,18 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -82,8 +86,10 @@ func secChUADerived() (secChUA, secChUAPlatform string) {
 //  3. Headers: full Chrome browser header set (sec-ch-ua, sec-fetch-*, Accept-Language, etc.)
 //  4. Connection pooling: browser-like keep-alive with realistic idle timeouts
 type FireworksTransport struct {
-	client  *http.Client
-	timeout time.Duration // overall request timeout (for non-streaming scenarios)
+	client               *http.Client
+	timeout              time.Duration // overall request timeout (for non-streaming scenarios)
+	upstreamRetryCount   int
+	upstreamRetryBackoff time.Duration
 }
 
 // Timeout returns the configured overall request timeout.
@@ -91,8 +97,16 @@ func (t *FireworksTransport) Timeout() time.Duration {
 	return t.timeout
 }
 
-// New creates a new FireworksTransport with Chrome-mimicking TLS config and timeouts.
-func New(timeout time.Duration) *FireworksTransport {
+// NewWithRetry creates a new FireworksTransport with configurable retry behavior
+// for transient upstream failures before the first response byte is processed.
+func NewWithRetry(timeout time.Duration, retryCount int, retryBackoff time.Duration) *FireworksTransport {
+	if retryCount < 0 {
+		retryCount = 0
+	}
+	if retryBackoff < 0 {
+		retryBackoff = 0
+	}
+
 	// TLS config matching Chrome's JA3 fingerprint:
 	// - TLS 1.3 cipher suites in Chrome's preference order
 	// - TLS 1.2 fallback cipher suites
@@ -152,8 +166,15 @@ func New(timeout time.Duration) *FireworksTransport {
 			// via context deadline in StreamPost. ResponseHeaderTimeout above
 			// ensures we don't hang waiting for the first byte from upstream.
 		},
-		timeout: timeout,
+		timeout:              timeout,
+		upstreamRetryCount:   retryCount,
+		upstreamRetryBackoff: retryBackoff,
 	}
+}
+
+// New creates a new FireworksTransport with Chrome-mimicking TLS config and timeouts.
+func New(timeout time.Duration) *FireworksTransport {
+	return NewWithRetry(timeout, 0, 0)
 }
 
 // StreamPost sends a POST request with full Chrome browser fingerprint headers
@@ -168,6 +189,37 @@ func New(timeout time.Duration) *FireworksTransport {
 // ResponseHeaderTimeout (set during construction) ensures we don't hang
 // waiting for the first byte from upstream.
 func (t *FireworksTransport) StreamPost(ctx context.Context, url string, body io.Reader, authToken string) (io.ReadCloser, error) {
+	var payload []byte
+	var err error
+	if body != nil {
+		payload, err = io.ReadAll(body)
+		if err != nil {
+			return nil, fmt.Errorf("read request body: %w", err)
+		}
+	}
+	for attempt := 0; ; attempt++ {
+		reader := bytes.NewReader(payload)
+		resp, reqErr := t.streamPostOnce(ctx, url, reader, authToken)
+		if reqErr == nil {
+			return resp, nil
+		}
+		if !t.shouldRetryStreamPost(attempt, reqErr) {
+			return nil, reqErr
+		}
+		delay := t.retryDelayForError(attempt, reqErr)
+		slog.Warn("transient upstream failure before first byte, retrying",
+			"attempt", attempt+1,
+			"max_retries", t.upstreamRetryCount,
+			"backoff", delay,
+			"error", reqErr,
+		)
+		if err := sleepWithContext(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (t *FireworksTransport) streamPostOnce(ctx context.Context, url string, body io.Reader, authToken string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
@@ -209,13 +261,109 @@ func (t *FireworksTransport) StreamPost(ctx context.Context, url string, body io
 
 	resp, err := t.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("send request: %w", err)
+		return nil, transientSendRequestError{cause: err}
 	}
 
 	if resp.StatusCode != http.StatusOK {
+		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
 		resp.Body.Close()
-		return nil, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+		return nil, transientUpstreamError{statusCode: resp.StatusCode, retryAfter: retryAfter}
 	}
 
 	return resp.Body, nil
+}
+
+type transientUpstreamError struct {
+	statusCode int
+	retryAfter time.Duration
+}
+
+func (e transientUpstreamError) Error() string {
+	return fmt.Sprintf("upstream returned status %d", e.statusCode)
+}
+
+type transientSendRequestError struct {
+	cause error
+}
+
+func (e transientSendRequestError) Error() string {
+	return fmt.Sprintf("send request: %v", e.cause)
+}
+
+func (e transientSendRequestError) Unwrap() error {
+	return e.cause
+}
+
+func (t *FireworksTransport) shouldRetryStreamPost(attempt int, err error) bool {
+	if attempt >= t.upstreamRetryCount {
+		return false
+	}
+	if errorsIsContextTerminal(err) {
+		return false
+	}
+	var statusErr transientUpstreamError
+	if errors.As(err, &statusErr) {
+		switch statusErr.statusCode {
+		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+			return true
+		default:
+			return false
+		}
+	}
+	var sendErr transientSendRequestError
+	return errors.As(err, &sendErr)
+}
+
+func (t *FireworksTransport) retryDelayForError(attempt int, err error) time.Duration {
+	delay := t.upstreamRetryBackoff
+	if delay <= 0 {
+		delay = 0
+	} else {
+		delay = delay * time.Duration(1<<attempt)
+	}
+	var statusErr transientUpstreamError
+	if errors.As(err, &statusErr) && statusErr.retryAfter > delay {
+		delay = statusErr.retryAfter
+	}
+	return delay
+}
+
+func parseRetryAfter(raw string) time.Duration {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0
+	}
+	if seconds, err := strconv.Atoi(raw); err == nil && seconds >= 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	if when, err := http.ParseTime(raw); err == nil {
+		delay := time.Until(when)
+		if delay > 0 {
+			return delay
+		}
+	}
+	return 0
+}
+
+func sleepWithContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func errorsIsContextTerminal(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }

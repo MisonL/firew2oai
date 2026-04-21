@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -392,6 +393,45 @@ func TestHandleChatCompletions_StreamToolCall(t *testing.T) {
 	}
 	if strings.Contains(bodyText, `"content":"{\"type\":\"function_call\""`) {
 		t.Fatalf("tool-call stream should not leak raw text content:\n%s", bodyText)
+	}
+}
+
+func TestHandleChatCompletions_StreamEmptyUpstreamRetryDisabledEmitsTerminalChunk(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstreamAndRetryPolicy(transport.New(30*time.Second), "test", false, upstream.URL, 0, 0)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 1 {
+		t.Fatalf("upstream attempts = %d, want 1", attempts)
+	}
+	bodyText := rec.Body.String()
+	if !strings.Contains(bodyText, "upstream response ended without a completion signal") {
+		t.Fatalf("stream body missing terminal error text:\n%s", bodyText)
+	}
+	if !strings.Contains(bodyText, "data: [DONE]") {
+		t.Fatalf("stream body missing [DONE] terminator:\n%s", bodyText)
 	}
 }
 
@@ -1180,6 +1220,45 @@ func TestHandleNonStream_ContextCanceled(t *testing.T) {
 				t.Error("should not return 200 with content for canceled context")
 			}
 		}
+	}
+}
+
+func TestHandleNonStream_EmptyUpstreamRetriesConfiguredCount(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		current := atomic.AddInt32(&attempts, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if current < 3 {
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"retry-ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstreamAndRetryPolicy(transport.New(30*time.Second), "test", false, upstream.URL, 2, 0)
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 3 {
+		t.Fatalf("upstream attempts = %d, want 3", attempts)
+	}
+
+	var resp ChatCompletionResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := resp.Choices[0].Message.Content; got != "retry-ok" {
+		t.Fatalf("content = %q, want retry-ok", got)
 	}
 }
 

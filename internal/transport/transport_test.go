@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -37,6 +38,22 @@ func TestNew(t *testing.T) {
 	// The timeout parameter should be used as ResponseHeaderTimeout, not Client.Timeout
 	if transport.ResponseHeaderTimeout != 30*time.Second {
 		t.Errorf("ResponseHeaderTimeout = %v, want 30s", transport.ResponseHeaderTimeout)
+	}
+	if tp.upstreamRetryCount != 0 {
+		t.Errorf("upstreamRetryCount = %d, want 0 for backward-compatible New()", tp.upstreamRetryCount)
+	}
+}
+
+func TestNewWithRetry(t *testing.T) {
+	tp := NewWithRetry(30*time.Second, 2, 250*time.Millisecond)
+	if tp == nil {
+		t.Fatal("NewWithRetry returned nil")
+	}
+	if tp.upstreamRetryCount != 2 {
+		t.Fatalf("upstreamRetryCount = %d, want 2", tp.upstreamRetryCount)
+	}
+	if tp.upstreamRetryBackoff != 250*time.Millisecond {
+		t.Fatalf("upstreamRetryBackoff = %v, want 250ms", tp.upstreamRetryBackoff)
 	}
 }
 
@@ -85,6 +102,119 @@ func TestStreamPost_UpstreamNon200(t *testing.T) {
 	}
 }
 
+func TestStreamPost_RetriesTransientStatusBeforeSuccess(t *testing.T) {
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	tp := NewWithRetry(5*time.Second, 1, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reader, err := tp.StreamPost(ctx, ts.URL, bytes.NewReader([]byte("{}")), "")
+	if err != nil {
+		t.Fatalf("StreamPost error = %v, want nil", err)
+	}
+	defer reader.Close()
+
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestStreamPost_DoesNotRetryNonTransientStatus(t *testing.T) {
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ts.Close()
+
+	tp := NewWithRetry(5*time.Second, 3, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	_, err := tp.StreamPost(ctx, ts.URL, bytes.NewReader([]byte("{}")), "")
+	if err == nil {
+		t.Fatal("expected error for 404")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+}
+
+func TestStreamPost_RetriesSendRequestErrorOnce(t *testing.T) {
+	var attempts int
+	stall := make(chan struct{})
+	defer close(stall)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatal("server does not support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack failed: %v", err)
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	tp := NewWithRetry(5*time.Second, 1, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reader, err := tp.StreamPost(ctx, ts.URL, bytes.NewReader([]byte("{}")), "")
+	if err != nil {
+		t.Fatalf("StreamPost error = %v, want nil", err)
+	}
+	defer reader.Close()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestStreamPost_ContextCanceledDuringRetryBackoffReturnsContextError(t *testing.T) {
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer ts.Close()
+
+	tp := NewWithRetry(5*time.Second, 1, 200*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := tp.StreamPost(ctx, ts.URL, bytes.NewReader([]byte("{}")), "")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1 before cancellation interrupts retry", attempts)
+	}
+}
+
 func TestStreamPost_ContextCanceled(t *testing.T) {
 	// Use httptest.Server instead of relying on external network
 	stall := make(chan struct{})
@@ -119,10 +249,12 @@ func TestStreamPost_BodyClosedOnError(t *testing.T) {
 	if err == nil {
 		t.Error("expected error")
 	}
-	// Body should still be readable since StreamPost doesn't close it on creation error
-	_, readErr := io.ReadAll(body)
+	remaining, readErr := io.ReadAll(body)
 	if readErr != nil {
-		t.Errorf("body should still be readable: %v", readErr)
+		t.Errorf("body read after error failed: %v", readErr)
+	}
+	if len(remaining) != 0 {
+		t.Errorf("remaining bytes = %q, want empty because request body is buffered for retry support", string(remaining))
 	}
 }
 

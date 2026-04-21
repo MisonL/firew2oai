@@ -72,7 +72,7 @@ func TestValidModel_AllAvailableModels(t *testing.T) {
 }
 
 func TestLoad_Defaults(t *testing.T) {
-	for _, key := range []string{"PORT", "HOST", "API_KEY", "TIMEOUT", "LOG_LEVEL", "SHOW_THINKING", "CORS_ORIGINS", "RATE_LIMIT", "IP_WHITELIST", "TRUSTED_PROXY_COUNT"} {
+	for _, key := range []string{"PORT", "HOST", "API_KEY", "TIMEOUT", "UPSTREAM_RETRY_COUNT", "UPSTREAM_RETRY_BACKOFF_MS", "UPSTREAM_EMPTY_RETRY_COUNT", "UPSTREAM_EMPTY_RETRY_BACKOFF_MS", "LOG_LEVEL", "SHOW_THINKING", "CORS_ORIGINS", "RATE_LIMIT", "IP_WHITELIST", "TRUSTED_PROXY_COUNT"} {
 		unsetEnv(t, key)
 	}
 
@@ -88,6 +88,18 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 	if cfg.Timeout != defaultTimeout {
 		t.Errorf("default Timeout = %d, want %d", cfg.Timeout, defaultTimeout)
+	}
+	if cfg.UpstreamRetryCount != defaultUpstreamRetryCount {
+		t.Errorf("default UpstreamRetryCount = %d, want %d", cfg.UpstreamRetryCount, defaultUpstreamRetryCount)
+	}
+	if cfg.UpstreamRetryBackoffMS != defaultUpstreamRetryBackoffMS {
+		t.Errorf("default UpstreamRetryBackoffMS = %d, want %d", cfg.UpstreamRetryBackoffMS, defaultUpstreamRetryBackoffMS)
+	}
+	if cfg.UpstreamEmptyRetryCount != defaultUpstreamEmptyRetryCount {
+		t.Errorf("default UpstreamEmptyRetryCount = %d, want %d", cfg.UpstreamEmptyRetryCount, defaultUpstreamEmptyRetryCount)
+	}
+	if cfg.UpstreamEmptyRetryBackoffMS != defaultUpstreamEmptyRetryBackoffMS {
+		t.Errorf("default UpstreamEmptyRetryBackoffMS = %d, want %d", cfg.UpstreamEmptyRetryBackoffMS, defaultUpstreamEmptyRetryBackoffMS)
 	}
 	if cfg.LogLevel != "info" {
 		t.Errorf("default LogLevel = %q, want info", cfg.LogLevel)
@@ -113,6 +125,10 @@ func TestLoad_EnvOverride(t *testing.T) {
 	t.Setenv("PORT", "9999")
 	t.Setenv("API_KEY", "test-key")
 	t.Setenv("TIMEOUT", "300")
+	t.Setenv("UPSTREAM_RETRY_COUNT", "2")
+	t.Setenv("UPSTREAM_RETRY_BACKOFF_MS", "250")
+	t.Setenv("UPSTREAM_EMPTY_RETRY_COUNT", "3")
+	t.Setenv("UPSTREAM_EMPTY_RETRY_BACKOFF_MS", "400")
 	t.Setenv("SHOW_THINKING", "true")
 	t.Setenv("CORS_ORIGINS", "https://example.com")
 	t.Setenv("RATE_LIMIT", "100")
@@ -127,6 +143,18 @@ func TestLoad_EnvOverride(t *testing.T) {
 	}
 	if cfg.Timeout != 300 {
 		t.Errorf("Timeout = %d, want 300", cfg.Timeout)
+	}
+	if cfg.UpstreamRetryCount != 2 {
+		t.Errorf("UpstreamRetryCount = %d, want 2", cfg.UpstreamRetryCount)
+	}
+	if cfg.UpstreamRetryBackoffMS != 250 {
+		t.Errorf("UpstreamRetryBackoffMS = %d, want 250", cfg.UpstreamRetryBackoffMS)
+	}
+	if cfg.UpstreamEmptyRetryCount != 3 {
+		t.Errorf("UpstreamEmptyRetryCount = %d, want 3", cfg.UpstreamEmptyRetryCount)
+	}
+	if cfg.UpstreamEmptyRetryBackoffMS != 400 {
+		t.Errorf("UpstreamEmptyRetryBackoffMS = %d, want 400", cfg.UpstreamEmptyRetryBackoffMS)
 	}
 	if !cfg.ShowThinking {
 		t.Error("ShowThinking = false, want true")
@@ -189,6 +217,52 @@ func TestApplyFlags_ZeroTimeout(t *testing.T) {
 	cfg.ApplyFlags([]string{"prog", "-timeout", "0"})
 	if cfg.Timeout != 120 {
 		t.Errorf("Timeout = %d, want default 120 after zero flag", cfg.Timeout)
+	}
+}
+
+func TestApplyFlags_UpstreamRetryOverrides(t *testing.T) {
+	cfg := Load()
+	cfg.ApplyFlags([]string{
+		"prog",
+		"-upstream-retry-count", "4",
+		"-upstream-retry-backoff-ms", "123",
+		"-upstream-empty-retry-count", "2",
+		"-upstream-empty-retry-backoff-ms", "456",
+	})
+	if cfg.UpstreamRetryCount != 4 {
+		t.Errorf("UpstreamRetryCount = %d, want 4", cfg.UpstreamRetryCount)
+	}
+	if cfg.UpstreamRetryBackoffMS != 123 {
+		t.Errorf("UpstreamRetryBackoffMS = %d, want 123", cfg.UpstreamRetryBackoffMS)
+	}
+	if cfg.UpstreamEmptyRetryCount != 2 {
+		t.Errorf("UpstreamEmptyRetryCount = %d, want 2", cfg.UpstreamEmptyRetryCount)
+	}
+	if cfg.UpstreamEmptyRetryBackoffMS != 456 {
+		t.Errorf("UpstreamEmptyRetryBackoffMS = %d, want 456", cfg.UpstreamEmptyRetryBackoffMS)
+	}
+}
+
+func TestApplyFlags_NegativeUpstreamRetryValues(t *testing.T) {
+	cfg := Load()
+	cfg.ApplyFlags([]string{
+		"prog",
+		"-upstream-retry-count", "-1",
+		"-upstream-retry-backoff-ms", "-2",
+		"-upstream-empty-retry-count", "-3",
+		"-upstream-empty-retry-backoff-ms", "-4",
+	})
+	if cfg.UpstreamRetryCount != defaultUpstreamRetryCount {
+		t.Errorf("UpstreamRetryCount = %d, want default %d", cfg.UpstreamRetryCount, defaultUpstreamRetryCount)
+	}
+	if cfg.UpstreamRetryBackoffMS != defaultUpstreamRetryBackoffMS {
+		t.Errorf("UpstreamRetryBackoffMS = %d, want default %d", cfg.UpstreamRetryBackoffMS, defaultUpstreamRetryBackoffMS)
+	}
+	if cfg.UpstreamEmptyRetryCount != defaultUpstreamEmptyRetryCount {
+		t.Errorf("UpstreamEmptyRetryCount = %d, want default %d", cfg.UpstreamEmptyRetryCount, defaultUpstreamEmptyRetryCount)
+	}
+	if cfg.UpstreamEmptyRetryBackoffMS != defaultUpstreamEmptyRetryBackoffMS {
+		t.Errorf("UpstreamEmptyRetryBackoffMS = %d, want default %d", cfg.UpstreamEmptyRetryBackoffMS, defaultUpstreamEmptyRetryBackoffMS)
 	}
 }
 

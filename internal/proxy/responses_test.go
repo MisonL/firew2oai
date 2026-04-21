@@ -320,6 +320,80 @@ func TestNormalizeRawResponseInputItem_StringToolSummariesBecomeRawHistoryItems(
 	}
 }
 
+func TestNormalizeRawResponseInputItems_CommandStyleToolResultSynthesizesExecHistory(t *testing.T) {
+	raws := normalizeRawResponseInputItems("Tool result (call_id=call_test_all)\nCommand: go test ./...\nExit code: 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s")
+	if len(raws) != 2 {
+		t.Fatalf("len(raws) = %d, want 2", len(raws))
+	}
+
+	var call map[string]any
+	if err := json.Unmarshal(raws[0], &call); err != nil {
+		t.Fatalf("decode call raw: %v", err)
+	}
+	if call["type"] != "function_call" {
+		t.Fatalf("call type = %v, want function_call", call["type"])
+	}
+	if call["name"] != "exec_command" {
+		t.Fatalf("call name = %v, want exec_command", call["name"])
+	}
+	if call["call_id"] != "call_test_all" {
+		t.Fatalf("call_id = %v, want call_test_all", call["call_id"])
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(raws[1], &result); err != nil {
+		t.Fatalf("decode result raw: %v", err)
+	}
+	if result["type"] != "function_call_output" {
+		t.Fatalf("result type = %v, want function_call_output", result["type"])
+	}
+}
+
+func TestNormalizeRawResponseInputItems_StructuredToolOutputSummarySynthesizesExecHistory(t *testing.T) {
+	raws := normalizeRawResponseInputItems(map[string]any{
+		"type":    "function_call_output",
+		"call_id": "call_test_all",
+		"output": map[string]any{
+			"content": "Tool result (call_id=call_test_all)\nCommand: go test ./...\nExit code: 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s",
+		},
+	})
+	if len(raws) != 2 {
+		t.Fatalf("len(raws) = %d, want 2", len(raws))
+	}
+
+	var call map[string]any
+	if err := json.Unmarshal(raws[0], &call); err != nil {
+		t.Fatalf("decode call raw: %v", err)
+	}
+	if call["type"] != "function_call" {
+		t.Fatalf("call type = %v, want function_call", call["type"])
+	}
+	if call["name"] != "exec_command" {
+		t.Fatalf("call name = %v, want exec_command", call["name"])
+	}
+
+	var result map[string]any
+	if err := json.Unmarshal(raws[1], &result); err != nil {
+		t.Fatalf("decode result raw: %v", err)
+	}
+	if result["type"] != "function_call_output" {
+		t.Fatalf("result type = %v, want function_call_output", result["type"])
+	}
+	if result["call_id"] != "call_test_all" {
+		t.Fatalf("call_id = %v, want call_test_all", result["call_id"])
+	}
+	output, _ := result["output"].(map[string]any)
+	if output == nil {
+		t.Fatalf("output = %#v, want object", result["output"])
+	}
+	if output["success"] != true {
+		t.Fatalf("success = %#v, want true", output["success"])
+	}
+	if !strings.Contains(output["content"].(string), "github.com/mison/firew2oai/internal/proxy") {
+		t.Fatalf("content = %#v, want normalized go test output", output["content"])
+	}
+}
+
 func TestBuildExecutionEvidence_InfersSuccessFromGoTestOutputWithoutExplicitFlag(t *testing.T) {
 	history := []json.RawMessage{
 		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_test","arguments":"{\"cmd\":\"go test ./internal/proxy\"}"}`),
@@ -809,6 +883,48 @@ func TestHandleResponses_StreamToolFinalOutputIsConstrained(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_StreamRequiredLabelsDelayRawDeltasUntilConstrainedFinal(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"ID: I'll start by reading the existing source file and test files to understand the code structure and test style.\\nRESULT: PASS\\nFILES: internal/proxy/output_constraints_test.go\\nTEST: 已完成相关验证命令，未观察到明确失败信号。\\nNOTE: 只新增测试文件，未修改业务逻辑。\"}\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"glm-5","stream":true,"input":"你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：最终只输出四行：RESULT: PASS 或 FAIL；FILES: 路径；TEST: 说明；NOTE: 是否只新增测试。"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	bodyText := rec.Body.String()
+	wantDelta := `"delta":"RESULT: PASS\nFILES: internal/proxy/output_constraints_test.go\nTEST: 已完成相关验证命令，未观察到明确失败信号。\nNOTE: 任务尚未完成，仍缺少所需修改或验证步骤。"`
+	if !strings.Contains(bodyText, wantDelta) {
+		t.Fatalf("stream body missing constrained delta %q:\n%s", wantDelta, bodyText)
+	}
+	if strings.Contains(bodyText, `delta":"ID: I'll start`) {
+		t.Fatalf("stream body should not emit raw noisy delta:\n%s", bodyText)
+	}
+	if strings.Contains(bodyText, "ID: I'll start by reading the existing source file") {
+		t.Fatalf("stream body should not leak raw prefix chatter:\n%s", bodyText)
+	}
+}
+
 func TestHandleResponses_PreviousResponseIDWithToolOutput(t *testing.T) {
 	requests := make([]FireworksRequest, 0, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -948,6 +1064,41 @@ func TestHandleResponses_StreamEmptyUpstreamRetriesOnce(t *testing.T) {
 	}
 	if strings.Contains(bodyText, "upstream response ended without a completion signal") {
 		t.Fatalf("stream body should not return empty-stream terminal error after retry:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_StreamEmptyUpstreamRetryDisabledReturnsTerminalError(t *testing.T) {
+	var attempts int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&attempts, 1)
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			t.Fatal("upstream server doesn't support flushing")
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstreamAndRetryPolicy(transport.New(30*time.Second), "test", false, upstream.URL, 0, 0)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"deepseek-v3p2","input":"hello","stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if attempts != 1 {
+		t.Fatalf("upstream attempts = %d, want 1 when retry is disabled", attempts)
+	}
+	bodyText := rec.Body.String()
+	if !strings.Contains(bodyText, "upstream response ended without a completion signal") {
+		t.Fatalf("stream body missing terminal empty-stream error:\n%s", bodyText)
 	}
 }
 
@@ -1484,6 +1635,41 @@ func TestConstrainFinalText_DoesNotMarkIncompleteWriteTaskAsPass(t *testing.T) {
 		"FILES: internal/proxy/output_constraints_test.go\n" +
 		"TEST: 未完成任务要求的验证命令，当前不能判定测试通过。\n" +
 		"NOTE: 任务尚未完成，仍缺少所需修改或验证步骤。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_SearchCommandWithoutSuccessFlagStillAllowsPass(t *testing.T) {
+	task := "你是资深 Go 工程师。请完成一个需要先搜索再修复的真实 Coding 任务：\n" +
+		"1) 先执行命令：rg -n \"BuildTicketSummary|NormalizeTitle\" internal/codexfixture/searchfix。\n" +
+		"2) 阅读 internal/codexfixture/searchfix/summary.go 与 internal/codexfixture/searchfix/summary_test.go。\n" +
+		"3) 修改现有文件 internal/codexfixture/searchfix/summary.go，让 BuildTicketSummary 对 title 执行 strings.TrimSpace + strings.ToUpper，对 body 执行 strings.TrimSpace。\n" +
+		"4) 不要新增文件。\n" +
+		"5) 执行 go test ./internal/codexfixture/searchfix。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你新增或修改的文件；TEST: 测试结果；NOTE: 你完成的搜索与修复动作。"
+	text := "RESULT: FAIL\n" +
+		"FILES: internal/codexfixture/searchfix/summary.go\n" +
+		"TEST: 未完成任务要求的验证命令，当前不能判定测试通过。\n" +
+		"NOTE: 任务尚未完成，仍缺少所需修改或验证步骤。"
+	evidence := executionEvidence{
+		Commands: []string{
+			`rg -n "BuildTicketSummary|NormalizeTitle" internal/codexfixture/searchfix`,
+			"sed -n '1,200p' 'internal/codexfixture/searchfix/summary.go'",
+			"python3 -c 'exec(\"...\")'",
+			"go test ./internal/codexfixture/searchfix",
+		},
+		Outputs: []string{
+			`rg -n "BuildTicketSummary|NormalizeTitle" internal/codexfixture/searchfix => internal/codexfixture/searchfix/summary.go:3:func BuildTicketSummary(title, body string) string`,
+			"go test ./internal/codexfixture/searchfix => success=true ok",
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: internal/codexfixture/searchfix/summary.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 已完成所需文件修改，并保留任务范围内的业务逻辑边界。"
 	if got != want {
 		t.Fatalf("constrained text = %q, want %q", got, want)
 	}

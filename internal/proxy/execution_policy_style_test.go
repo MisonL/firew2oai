@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"encoding/json"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -50,11 +52,40 @@ func TestExtractWriteTargetFiles_ReadOnlyInlineStepsReturnEmpty(t *testing.T) {
 	}
 }
 
+func TestExtractWriteTargetFiles_FixExistingFileDoesNotCaptureReadOnlyTestReference(t *testing.T) {
+	task := "你是资深 Go 工程师。请修复一个真实但边界清晰的现有 bug：\n" +
+		"1) 阅读 internal/codexfixture/bugfix/port.go 与 internal/codexfixture/bugfix/port_test.go。\n" +
+		"2) 修复现有文件 internal/codexfixture/bugfix/port.go，使全部测试通过。\n" +
+		"3) 不要改包路径，不要新增无关文件。\n" +
+		"4) 执行 go test ./internal/codexfixture/bugfix。"
+
+	got := extractWriteTargetFiles(task)
+	want := []string{"internal/codexfixture/bugfix/port.go"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractWriteTargetFiles mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestExtractRequiredOutputLabels_InferPlainUppercaseList(t *testing.T) {
 	task := "读取 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，运行 go test ./internal/proxy 和 go test ./...，最终只输出四行：RESULT、CONSTRAINT、EVIDENCE、TEST。"
 
 	got := extractRequiredOutputLabels(task)
 	want := []string{"RESULT", "CONSTRAINT", "EVIDENCE", "TEST"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractRequiredOutputLabels mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestExtractRequiredOutputLabels_IgnoresIncidentalLabelsBeforeOutputSection(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise。\n" +
+		"3) 该测试需要断言 sanitizeRequiredLabelValue(\"CONSTRAINT\", \"Chunk ID: 123 Wall time: 0.000 seconds Process exited with code 0 Output: package proxy ...\") 返回空字符串。\n" +
+		"4) 执行 go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你新增或修改的文件；TEST: 测试结果；NOTE: 你完成的补强动作。"
+
+	got := extractRequiredOutputLabels(task)
+	want := []string{"RESULT", "FILES", "TEST", "NOTE"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("extractRequiredOutputLabels mismatch\n got: %#v\nwant: %#v", got, want)
 	}
@@ -70,7 +101,7 @@ func TestChooseNextExecutionCommandWithStyles_ReadOnlyTaskPrefersImplicitFileRea
 		"internal/proxy/execution_evidence.go",
 	}
 
-	got := chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, executionHistorySignals{}, false)
+	got := chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, executionHistorySignals{}, false, nil)
 	want := buildReadFileCommand("internal/proxy/output_constraints.go")
 	if got != want {
 		t.Fatalf("next command = %q, want %q", got, want)
@@ -179,18 +210,22 @@ func TestStableActionableUserTask_UsesDeveloperTaskWhenUserMessageIsOnlyEnvironm
 	}
 }
 
-func TestChooseNextExecutionCommandWithStyles_PrioritizesStyleInspectionBeforeScaffold(t *testing.T) {
-	requiredFiles := []string{
+func TestChooseNextExecutionCommandWithStyles_PrioritizesMentionedSourceFileBeforeStyleInspection(t *testing.T) {
+	sequenceFiles := []string{
 		"internal/proxy/output_constraints.go",
+		"internal/proxy/output_constraints_test.go",
+	}
+	writeTargets := []string{
 		"internal/proxy/output_constraints_test.go",
 	}
 	styleCommands := []string{
 		"find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5",
 	}
 
-	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, styleCommands, executionHistorySignals{}, true)
-	if got != styleCommands[0] {
-		t.Fatalf("next command = %q, want style inspection command %q", got, styleCommands[0])
+	got := chooseNextExecutionCommandWithStyles(nil, sequenceFiles, styleCommands, executionHistorySignals{}, true, writeTargets)
+	want := buildReadFileCommand("internal/proxy/output_constraints.go")
+	if got != want {
+		t.Fatalf("next command = %q, want source file read %q", got, want)
 	}
 }
 
@@ -200,11 +235,14 @@ func TestChooseNextExecutionCommandWithStyles_ReadsExistingStyleFileAfterListing
 		"internal/proxy/output_constraints_test.go",
 	}
 	styleCommand := "find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5"
+	readSource := buildReadFileCommand("internal/proxy/output_constraints.go")
 	signals := executionHistorySignals{
 		Commands: []string{
+			readSource,
 			styleCommand,
 		},
 		SuccessfulCommands: []string{
+			readSource,
 			styleCommand,
 		},
 		CommandOutputs: map[string]string{
@@ -212,10 +250,33 @@ func TestChooseNextExecutionCommandWithStyles_ReadsExistingStyleFileAfterListing
 		},
 	}
 
-	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, []string{styleCommand}, signals, true)
+	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, []string{styleCommand}, signals, true, []string{"internal/proxy/output_constraints_test.go"})
 	want := buildReadFileCommand("internal/proxy/proxy_test.go")
 	if got != want {
 		t.Fatalf("next command = %q, want %q", got, want)
+	}
+}
+
+func TestMergeExecutionSequenceFiles_PreservesMentionOrderForWriteTargets(t *testing.T) {
+	allMentioned := []string{
+		"internal/codexfixture/feature/formatter.go",
+		"internal/codexfixture/feature/formatter_test.go",
+		"internal/codexfixture/feature/title.go",
+	}
+	writeTargets := []string{
+		"internal/codexfixture/feature/title.go",
+		"internal/codexfixture/feature/formatter.go",
+		"internal/codexfixture/feature/formatter_test.go",
+	}
+
+	got := mergeExecutionSequenceFiles(allMentioned, writeTargets)
+	want := []string{
+		"internal/codexfixture/feature/formatter.go",
+		"internal/codexfixture/feature/formatter_test.go",
+		"internal/codexfixture/feature/title.go",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("mergeExecutionSequenceFiles mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -276,9 +337,235 @@ func TestChooseNextExecutionCommandWithStyles_DoesNotReissueScaffoldAfterEmptyRe
 		},
 	}
 
-	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, nil, signals, true)
+	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, nil, signals, true, []string{"internal/proxy/output_constraints_test.go"})
 	if got != "" {
 		t.Fatalf("next command = %q, want empty after scaffolded target is already re-read as empty", got)
+	}
+}
+
+func TestBuildExecutionPolicy_PrefersSeedWriteCommandForGoStringTransformTask(t *testing.T) {
+	task := "你是资深 Go 工程师。请完成一个需要先搜索再修复的真实 Coding 任务：\n" +
+		"1) 先执行命令：rg -n \"BuildTicketSummary|NormalizeTitle\" internal/codexfixture/searchfix。\n" +
+		"2) 阅读 internal/codexfixture/searchfix/summary.go 与 internal/codexfixture/searchfix/summary_test.go。\n" +
+		"3) 修改现有文件 internal/codexfixture/searchfix/summary.go，让 BuildTicketSummary 对 title 执行 strings.TrimSpace + strings.ToUpper，对 body 执行 strings.TrimSpace。\n" +
+		"4) 不要新增文件。\n" +
+		"5) 执行 go test ./internal/codexfixture/searchfix。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "search_1", "arguments": `{"cmd":"rg -n \"BuildTicketSummary|NormalizeTitle\" internal/codexfixture/searchfix"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "search_1", "output": map[string]any{"content": "internal/codexfixture/searchfix/summary.go:3:func BuildTicketSummary(title, body string) string", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/searchfix/summary.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package searchfix", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_2", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/searchfix/summary_test.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_2", "output": map[string]any{"content": "package searchfix", "success": true}}),
+	}
+
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-instruct", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatal("policy.PendingWrite = false, want true")
+	}
+	if !strings.HasPrefix(policy.NextCommand, "python3 -c ") {
+		t.Fatalf("policy.NextCommand = %q, want python3 -c seed write command", policy.NextCommand)
+	}
+	if strings.Contains(policy.NextCommand, "\n") {
+		t.Fatalf("policy.NextCommand should stay single-line for Codex exec compatibility, got %q", policy.NextCommand)
+	}
+	if !strings.Contains(policy.NextCommand, "exec(") {
+		t.Fatalf("policy.NextCommand should wrap synthesized python in exec(...), got %q", policy.NextCommand)
+	}
+	for _, want := range []string{
+		"internal/codexfixture/searchfix/summary.go",
+		"strings.ToUpper(strings.TrimSpace(title))",
+		"strings.TrimSpace(body)",
+		`import \"strings\"`,
+	} {
+		if !strings.Contains(policy.NextCommand, want) {
+			t.Fatalf("policy.NextCommand missing %q, got %q", want, policy.NextCommand)
+		}
+	}
+	if !strings.Contains(policy.NextCommand, "text.replace(old, new, 1)") {
+		t.Fatalf("policy.NextCommand should ensure strings import exists, got %q", policy.NextCommand)
+	}
+}
+
+func TestBuildSeedGoStringTransformCommand_DoesNotDuplicateExistingStringsImport(t *testing.T) {
+	dir := t.TempDir()
+	targetFile := dir + "/summary.go"
+	if err := os.WriteFile(targetFile, []byte("package searchfix\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nfunc BuildTicketSummary(title, body string) string {\n\treturn title + \": \" + body\n}\n"), 0o644); err != nil {
+		t.Fatalf("write target file: %v", err)
+	}
+
+	task := "修改现有文件 " + targetFile + "，让 BuildTicketSummary 对 title 执行 strings.TrimSpace + strings.ToUpper，对 body 执行 strings.TrimSpace。"
+	signals := executionHistorySignals{
+		SuccessfulCommands: []string{
+			"sed -n '1,200p' " + shellQuoteSingle(targetFile),
+			"sed -n '1,200p' " + shellQuoteSingle(dir+"/summary_test.go"),
+		},
+	}
+	cmd := buildSeedGoStringTransformCommand(task, []string{targetFile}, signals)
+	if strings.TrimSpace(cmd) == "" {
+		t.Fatal("buildSeedGoStringTransformCommand returned empty command")
+	}
+	if strings.Contains(cmd, "\n") {
+		t.Fatalf("buildSeedGoStringTransformCommand should return single-line cmd, got %q", cmd)
+	}
+
+	run := exec.Command("sh", "-c", cmd)
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("run seed transform command: %v\n%s", err, string(output))
+	}
+
+	content, err := os.ReadFile(targetFile)
+	if err != nil {
+		t.Fatalf("read target file: %v", err)
+	}
+	text := string(content)
+	if strings.Count(text, "\"strings\"") != 1 {
+		t.Fatalf("strings import count = %d, want 1\n%s", strings.Count(text, "\"strings\""), text)
+	}
+	if !strings.Contains(text, "return strings.ToUpper(strings.TrimSpace(title)) + \": \" + strings.TrimSpace(body)") {
+		t.Fatalf("transformed return missing:\n%s", text)
+	}
+}
+
+func TestBuildExecutionPolicy_PendingWriteWithoutConcreteNextCommandLeavesNextCommandEmpty(t *testing.T) {
+	task := "你是资深 Go 工程师。请修改 internal/codexfixture/searchfix/summary.go，使逻辑与测试一致。\n" +
+		"1) 阅读 internal/codexfixture/searchfix/summary.go。\n" +
+		"2) 阅读 internal/codexfixture/searchfix/summary_test.go。\n" +
+		"3) 不要新增文件。\n" +
+		"4) 执行 go test ./internal/codexfixture/searchfix。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/searchfix/summary.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package searchfix", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_2", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/searchfix/summary_test.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_2", "output": map[string]any{"content": "package searchfix", "success": true}}),
+	}
+
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-instruct", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatal("policy.PendingWrite = false, want true")
+	}
+	if policy.NextCommand != "" {
+		t.Fatalf("policy.NextCommand = %q, want empty when no deterministic seed write can be synthesized", policy.NextCommand)
+	}
+}
+
+func TestBuildExecutionPolicy_PrefersSeedWriteCommandForCrossFileFeatureTask(t *testing.T) {
+	task := "你是资深 Go 工程师。请完成一个小型跨文件 Coding 任务：\n" +
+		"1) 阅读 internal/codexfixture/feature/formatter.go 与 internal/codexfixture/feature/formatter_test.go。\n" +
+		"2) 新增文件 internal/codexfixture/feature/title.go，提供 normalizeTitle 帮助函数。\n" +
+		"3) 修改现有文件 internal/codexfixture/feature/formatter.go，让 BuildSummary 正确规范化 title 并裁剪 body。\n" +
+		"4) 修改现有文件 internal/codexfixture/feature/formatter_test.go，追加一个空 body 场景。\n" +
+		"5) 执行 go test ./internal/codexfixture/feature。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/feature/formatter.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package feature\n\nfunc BuildSummary(title, body string) string {\n\treturn title + \": \" + body\n}\n", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_2", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/feature/formatter_test.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_2", "output": map[string]any{"content": "package feature\n\nimport \"testing\"\n", "success": true}}),
+	}
+
+	policy := buildExecutionPolicy("glm-5", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatal("policy.PendingWrite = false, want true")
+	}
+	if strings.TrimSpace(policy.NextCommand) == "" {
+		t.Fatal("policy.NextCommand = empty, want cross-file seed write command")
+	}
+	for _, want := range []string{"internal/codexfixture/feature/title.go", "normalizeTitle", "BuildSummary", "strings.TrimSpace(body)"} {
+		if !strings.Contains(policy.NextCommand, want) {
+			t.Fatalf("policy.NextCommand missing %q: %q", want, policy.NextCommand)
+		}
+	}
+}
+
+func TestBuildSeedGoCrossFileFeatureCommand_WritesHelperAndUpdatesFiles(t *testing.T) {
+	dir := t.TempDir()
+	featureDir := dir + "/feature"
+	if err := os.MkdirAll(featureDir, 0o755); err != nil {
+		t.Fatalf("mkdir feature dir: %v", err)
+	}
+	helperFile := "feature/title.go"
+	mainFile := "feature/formatter.go"
+	testFile := "feature/formatter_test.go"
+	if err := os.WriteFile(featureDir+"/formatter.go", []byte("package feature\n\nfunc BuildSummary(title, body string) string {\n\treturn title + \": \" + body\n}\n"), 0o644); err != nil {
+		t.Fatalf("write main file: %v", err)
+	}
+	if err := os.WriteFile(featureDir+"/formatter_test.go", []byte("package feature\n\nimport \"testing\"\n\nfunc TestBuildSummary_NormalizesTitleAndBody(t *testing.T) {\n\tgot := BuildSummary(\"  firew2oai  \", \" adapter \")\n\twant := \"FIREW2OAI: adapter\"\n\tif got != want {\n\t\tt.Fatalf(\"BuildSummary() = %q, want %q\", got, want)\n\t}\n}\n"), 0o644); err != nil {
+		t.Fatalf("write test file: %v", err)
+	}
+
+	task := "你是资深 Go 工程师。请完成一个小型跨文件 Coding 任务：\n" +
+		"1) 阅读 " + mainFile + " 与 " + testFile + "。\n" +
+		"2) 新增文件 " + helperFile + "，提供 normalizeTitle 帮助函数。\n" +
+		"3) 修改现有文件 " + mainFile + "，让 BuildSummary 正确规范化 title 并裁剪 body。\n" +
+		"4) 修改现有文件 " + testFile + "，追加一个空 body 场景。\n" +
+		"5) 执行 go test ./internal/codexfixture/feature。"
+	signals := executionHistorySignals{
+		SuccessfulCommands: []string{
+			"sed -n '1,200p' " + shellQuoteSingle(mainFile),
+			"sed -n '1,200p' " + shellQuoteSingle(testFile),
+		},
+		Commands: []string{
+			"sed -n '1,200p' " + shellQuoteSingle(mainFile),
+			"sed -n '1,200p' " + shellQuoteSingle(testFile),
+		},
+		CommandOutputs: map[string]string{
+			"sed -n '1,200p' " + shellQuoteSingle(mainFile): "package feature\n\nfunc BuildSummary(title, body string) string {\n\treturn title + \": \" + body\n}\n",
+			"sed -n '1,200p' " + shellQuoteSingle(testFile): "package feature\n\nimport \"testing\"\n",
+		},
+	}
+
+	cmd := buildSeedGoCrossFileFeatureCommand(task, []string{helperFile, mainFile, testFile}, signals)
+	if strings.TrimSpace(cmd) == "" {
+		t.Fatalf(
+			"buildSeedGoCrossFileFeatureCommand returned empty command helper=%q main=%q package=%q mentions=%v",
+			extractGoHelperFunctionName(task),
+			extractGoPrimaryFunctionName(task, signals, mainFile),
+			inferGoPackageNameForTarget(mainFile, signals),
+			taskMentionsTitleAndBodyTransform(task),
+		)
+	}
+	if strings.Contains(cmd, "\n") {
+		t.Fatalf("buildSeedGoCrossFileFeatureCommand should return single-line cmd, got %q", cmd)
+	}
+
+	run := exec.Command("sh", "-c", cmd)
+	run.Dir = dir
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("run cross-file seed command: %v\n%s", err, string(output))
+	}
+
+	helperContent, err := os.ReadFile(featureDir + "/title.go")
+	if err != nil {
+		t.Fatalf("read helper file: %v", err)
+	}
+	if !strings.Contains(string(helperContent), "func normalizeTitle(title string) string") {
+		t.Fatalf("helper file missing normalizeTitle:\n%s", string(helperContent))
+	}
+
+	mainContent, err := os.ReadFile(featureDir + "/formatter.go")
+	if err != nil {
+		t.Fatalf("read main file: %v", err)
+	}
+	mainText := string(mainContent)
+	if !strings.Contains(mainText, `trimmedBody := strings.TrimSpace(body)`) {
+		t.Fatalf("main file missing trimmedBody branch:\n%s", mainText)
+	}
+	if !strings.Contains(mainText, `if trimmedBody == ""`) {
+		t.Fatalf("main file missing empty body guard:\n%s", mainText)
+	}
+	if !strings.Contains(mainText, `return normalizeTitle(title) + ":"`) {
+		t.Fatalf("main file missing empty body return:\n%s", mainText)
+	}
+	if !strings.Contains(mainText, `return normalizeTitle(title) + ": " + trimmedBody`) {
+		t.Fatalf("main file missing non-empty body return:\n%s", mainText)
+	}
+
+	testContent, err := os.ReadFile(featureDir + "/formatter_test.go")
+	if err != nil {
+		t.Fatalf("read test file: %v", err)
+	}
+	if !strings.Contains(string(testContent), "TestBuildSummary_EmptyBody") {
+		t.Fatalf("test file missing empty body scenario:\n%s", string(testContent))
 	}
 }
 
@@ -293,7 +580,7 @@ func TestBuildExecutionPolicy_WriteTaskTargetsOnlyMutationFile(t *testing.T) {
 	if !reflect.DeepEqual(policy.RequiredFiles, []string{"internal/proxy/output_constraints_test.go"}) {
 		t.Fatalf("policy.RequiredFiles = %#v, want only mutation target", policy.RequiredFiles)
 	}
-	wantNext := "find 'internal/proxy' -maxdepth 1 -name '*_test.go' | sort | head -n 5"
+	wantNext := "sed -n '1,200p' 'internal/proxy/output_constraints.go'"
 	if policy.NextCommand != wantNext {
 		t.Fatalf("policy.NextCommand = %q, want %q", policy.NextCommand, wantNext)
 	}
@@ -348,6 +635,47 @@ func TestBuildExecutionPolicy_PrefersSeedWriteCommandForMissingNamedTestFile(t *
 	}
 	if strings.Contains(policy.NextCommand, "TODO: implement test") {
 		t.Fatalf("policy.NextCommand should not fall back to TODO scaffold when task already states expected behavior, got %q", policy.NextCommand)
+	}
+}
+
+func TestBuildExecutionPolicy_PrefersSeedWriteCommandForDeterministicReplacementTask(t *testing.T) {
+	task := "你是资深 Go 工程师。请修复一个真实但边界清晰的现有 bug：\n" +
+		"1) 阅读 internal/codexfixture/bugfix/port.go 与 internal/codexfixture/bugfix/port_test.go。\n" +
+		"2) 修复现有文件 internal/codexfixture/bugfix/port.go，把 `return port + 1` 改为 `return port`，使全部测试通过。\n" +
+		"3) 执行 go test ./internal/codexfixture/bugfix。"
+	readTargetArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,120p' 'internal/codexfixture/bugfix/port.go'"})
+	readTestArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,120p' 'internal/codexfixture/bugfix/port_test.go'"})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "exec_command",
+			"call_id":   "read_target",
+			"arguments": string(readTargetArgs),
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "read_target",
+			"output":  "package bugfix\n\nfunc ClampPort(port int) int {\n\treturn port + 1\n}\n",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "exec_command",
+			"call_id":   "read_test",
+			"arguments": string(readTestArgs),
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "read_test",
+			"output":  "package bugfix\n\nfunc TestClampPort(t *testing.T) {}\n",
+		}),
+	}
+
+	policy := buildExecutionPolicy("glm-5", task, history, true, false, true)
+	if !strings.Contains(policy.NextCommand, "text.replace") {
+		t.Fatalf("policy.NextCommand = %q, want deterministic replacement command", policy.NextCommand)
+	}
+	if !strings.Contains(policy.NextCommand, "return port + 1") || !strings.Contains(policy.NextCommand, "return port") {
+		t.Fatalf("policy.NextCommand should contain replacement pair, got %q", policy.NextCommand)
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -155,6 +156,7 @@ type Proxy struct {
 	version             string
 	defaultShowThinking bool
 	upstreamURL         string
+	upstreamEmptyRetry  upstreamEmptyRetryPolicy
 	metrics             *metricsCollector
 	responses           *responseStore
 }
@@ -163,23 +165,31 @@ type Proxy struct {
 // defaultShowThinking controls whether thinking models show their thinking process
 // when the request does not explicitly set show_thinking.
 func New(transport *transport.FireworksTransport, version string, defaultShowThinking bool) *Proxy {
-	return &Proxy{
-		transport:           transport,
-		version:             version,
-		defaultShowThinking: defaultShowThinking,
-		upstreamURL:         upstreamURL,
-		metrics:             newMetricsCollector(time.Now),
-		responses:           newResponseStore(defaultResponseStoreEntries),
-	}
+	return newProxy(transport, version, defaultShowThinking, upstreamURL, newDefaultUpstreamEmptyRetryPolicy())
+}
+
+// NewWithRetryPolicy creates a new Proxy with explicit empty-upstream retry behavior.
+func NewWithRetryPolicy(transport *transport.FireworksTransport, version string, defaultShowThinking bool, emptyRetryCount int, emptyRetryBackoff time.Duration) *Proxy {
+	return newProxy(transport, version, defaultShowThinking, upstreamURL, newUpstreamEmptyRetryPolicy(emptyRetryCount, emptyRetryBackoff))
 }
 
 // NewWithUpstream creates a Proxy with a custom upstream URL (for testing).
 func NewWithUpstream(transport *transport.FireworksTransport, version string, defaultShowThinking bool, upstreamURL string) *Proxy {
+	return newProxy(transport, version, defaultShowThinking, upstreamURL, newDefaultUpstreamEmptyRetryPolicy())
+}
+
+// NewWithUpstreamAndRetryPolicy creates a Proxy with a custom upstream URL and explicit retry behavior.
+func NewWithUpstreamAndRetryPolicy(transport *transport.FireworksTransport, version string, defaultShowThinking bool, upstreamURL string, emptyRetryCount int, emptyRetryBackoff time.Duration) *Proxy {
+	return newProxy(transport, version, defaultShowThinking, upstreamURL, newUpstreamEmptyRetryPolicy(emptyRetryCount, emptyRetryBackoff))
+}
+
+func newProxy(transport *transport.FireworksTransport, version string, defaultShowThinking bool, upstream string, retryPolicy upstreamEmptyRetryPolicy) *Proxy {
 	return &Proxy{
 		transport:           transport,
 		version:             version,
 		defaultShowThinking: defaultShowThinking,
-		upstreamURL:         upstreamURL,
+		upstreamURL:         upstream,
+		upstreamEmptyRetry:  retryPolicy,
 		metrics:             newMetricsCollector(time.Now),
 		responses:           newResponseStore(defaultResponseStoreEntries),
 	}
@@ -372,13 +382,16 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 		authToken = auth[7:]
 	}
 
-	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	openReader := func() (io.ReadCloser, error) {
+		return p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	}
+
+	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream stream error", "request_id", requestID, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
 		return
 	}
-	defer reader.Close()
 
 	// SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -438,48 +451,77 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	}
 
 	isThinking := config.IsThinkingModel(model)
-	doneReceived := false
 	var result strings.Builder
-	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
-		switch evt.Type {
-		case "done":
-			doneReceived = true
-			return finalizeChatStream(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, result.String(), toolCatalog, toolConstraints, bufferForToolCalls)
+	doneReceived := false
+	contentEmitted := false
+	var scanErr error
+	attempt := 0
+	for {
+		doneReceived = false
+		contentEmitted, scanErr = scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+			switch evt.Type {
+			case "done":
+				doneReceived = true
+				return finalizeChatStream(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, result.String(), toolCatalog, toolConstraints, bufferForToolCalls)
 
-		case "thinking_separator":
-			if bufferForToolCalls {
-				result.WriteString("\n\n--- Answer ---\n\n")
-				return true
-			}
-			chunk := StreamChunk{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []StreamChoice{
-					{Index: 0, Delta: StreamDelta{Content: "\n\n--- Answer ---\n\n"}, FinishReason: nil},
-				},
-			}
-			return writeAndFlushChunk(chunk)
+			case "thinking_separator":
+				if bufferForToolCalls {
+					result.WriteString("\n\n--- Answer ---\n\n")
+					return true
+				}
+				chunk := StreamChunk{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []StreamChoice{
+						{Index: 0, Delta: StreamDelta{Content: "\n\n--- Answer ---\n\n"}, FinishReason: nil},
+					},
+				}
+				return writeAndFlushChunk(chunk)
 
-		case "content":
-			if bufferForToolCalls {
-				result.WriteString(evt.Content)
-				return true
+			case "content":
+				if bufferForToolCalls {
+					result.WriteString(evt.Content)
+					return true
+				}
+				chunk := StreamChunk{
+					ID:      requestID,
+					Object:  "chat.completion.chunk",
+					Created: created,
+					Model:   model,
+					Choices: []StreamChoice{
+						{Index: 0, Delta: StreamDelta{Content: evt.Content}, FinishReason: nil},
+					},
+				}
+				return writeAndFlushChunk(chunk)
 			}
-			chunk := StreamChunk{
-				ID:      requestID,
-				Object:  "chat.completion.chunk",
-				Created: created,
-				Model:   model,
-				Choices: []StreamChoice{
-					{Index: 0, Delta: StreamDelta{Content: evt.Content}, FinishReason: nil},
-				},
+			return true
+		})
+		_ = reader.Close()
+
+		if p.upstreamEmptyRetry.shouldRetry(attempt, doneReceived, contentEmitted, result.Len(), scanErr, clientGone) {
+			delay := p.upstreamEmptyRetry.delay(attempt)
+			attempt++
+			slog.Warn("chat upstream empty attempt, retrying",
+				"request_id", requestID,
+				"attempt", attempt,
+				"max_retries", p.upstreamEmptyRetry.count,
+				"backoff", delay,
+				"error", scanErr,
+			)
+			if err := sleepWithContext(ctx, delay); err != nil {
+				break
 			}
-			return writeAndFlushChunk(chunk)
+			reader, err = openReader()
+			if err != nil {
+				scanErr = err
+				break
+			}
+			continue
 		}
-		return true
-	})
+		break
+	}
 
 	// If no done event but content was emitted, send completion markers
 	if !doneReceived && contentEmitted {
@@ -487,9 +529,59 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 		finalizeChatStream(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, result.String(), toolCatalog, toolConstraints, bufferForToolCalls)
 	}
 
+	// If stream ended without any payload, emit a terminal chunk instead of silently
+	// leaving the client with only the initial assistant role event.
+	if !doneReceived && !contentEmitted && result.Len() == 0 && !clientGone && !errors.Is(scanErr, context.Canceled) {
+		finalText := "Codex adapter error: upstream response ended without a completion signal"
+		if scanErr != nil {
+			finalText = "Codex adapter error: upstream stream failed before content: " + scanErr.Error()
+		}
+		slog.Error("chat stream ended without completion payload", "request_id", requestID, "error", scanErr)
+		writeTerminalChatStreamText(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, finalText)
+		return
+	}
+
 	if scanErr != nil && !errors.Is(scanErr, context.Canceled) {
 		slog.Error("stream read error", "request_id", requestID, "error", scanErr)
 	}
+}
+
+func writeTerminalChatStreamText(
+	writeChunk func(StreamChunk) bool,
+	writeDone func([]byte) bool,
+	requestID, model string,
+	created int64,
+	finalText string,
+) bool {
+	if strings.TrimSpace(finalText) != "" {
+		chunk := StreamChunk{
+			ID:      requestID,
+			Object:  "chat.completion.chunk",
+			Created: created,
+			Model:   model,
+			Choices: []StreamChoice{
+				{Index: 0, Delta: StreamDelta{Content: finalText}, FinishReason: nil},
+			},
+		}
+		if !writeChunk(chunk) {
+			return false
+		}
+	}
+
+	reason := "stop"
+	stopChunk := StreamChunk{
+		ID:      requestID,
+		Object:  "chat.completion.chunk",
+		Created: created,
+		Model:   model,
+		Choices: []StreamChoice{
+			{Index: 0, Delta: StreamDelta{}, FinishReason: &reason},
+		},
+	}
+	if !writeChunk(stopChunk) {
+		return false
+	}
+	return writeDone([]byte("data: [DONE]\n\n"))
 }
 
 func finalizeChatStream(
@@ -608,30 +700,61 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 		authToken = auth[7:]
 	}
 
-	reader, err := p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	openReader := func() (io.ReadCloser, error) {
+		return p.transport.StreamPost(ctx, p.upstreamURL, bytes.NewReader(body), authToken)
+	}
+
+	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream non-stream error", "request_id", requestID, "error", err)
 		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
 		return
 	}
-	defer reader.Close()
 
 	var result strings.Builder
 	isThinking := config.IsThinkingModel(model)
 	doneReceived := false
+	contentEmitted := false
+	var scanErr error
+	attempt := 0
+	for {
+		doneReceived = false
+		contentEmitted, scanErr = scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
+			switch evt.Type {
+			case "done":
+				doneReceived = true
+				// handled by scanSSEEvents breaking the loop
+			case "thinking_separator":
+				result.WriteString("\n\n--- Answer ---\n\n")
+			case "content":
+				result.WriteString(evt.Content)
+			}
+			return true
+		})
+		_ = reader.Close()
 
-	contentEmitted, scanErr := scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
-		switch evt.Type {
-		case "done":
-			doneReceived = true
-			// handled by scanSSEEvents breaking the loop
-		case "thinking_separator":
-			result.WriteString("\n\n--- Answer ---\n\n")
-		case "content":
-			result.WriteString(evt.Content)
+		if p.upstreamEmptyRetry.shouldRetry(attempt, doneReceived, contentEmitted, result.Len(), scanErr, false) {
+			delay := p.upstreamEmptyRetry.delay(attempt)
+			attempt++
+			slog.Warn("chat non-stream empty attempt, retrying",
+				"request_id", requestID,
+				"attempt", attempt,
+				"max_retries", p.upstreamEmptyRetry.count,
+				"backoff", delay,
+				"error", scanErr,
+			)
+			if err := sleepWithContext(ctx, delay); err != nil {
+				break
+			}
+			reader, err = openReader()
+			if err != nil {
+				scanErr = err
+				break
+			}
+			continue
 		}
-		return true
-	})
+		break
+	}
 
 	slog.Debug("non-stream scan complete", "request_id", requestID, "scanErr", scanErr, "doneReceived", doneReceived, "contentEmitted", contentEmitted, "result_len", result.Len())
 

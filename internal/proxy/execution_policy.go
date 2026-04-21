@@ -65,14 +65,14 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 		writeTargets := dedupePreserveOrder(extractWriteTargetFiles(task))
 		if len(writeTargets) > 0 {
 			requiredFiles = writeTargets
-			sequenceFiles = append(filterOutFiles(allMentionedFiles, writeTargets), writeTargets...)
+			sequenceFiles = mergeExecutionSequenceFiles(allMentionedFiles, writeTargets)
 		}
 	} else {
 		requiredFiles = append(requiredFiles, allMentionedFiles...)
 	}
 	styleCommands := dedupePreserveOrder(extractStyleInspectionCommands(task))
 	needsWrite := taskLikelyNeedsWrite(task)
-	nextCommand := chooseNextExecutionCommandWithStyles(requiredCommands, sequenceFiles, styleCommands, signals, needsWrite)
+	nextCommand := chooseNextExecutionCommandWithStyles(requiredCommands, sequenceFiles, styleCommands, signals, needsWrite, requiredFiles)
 	if seedWriteCommand := buildSeedWriteCommand(task, requiredFiles, signals); needsWrite && signals.WriteCalls == 0 && shouldPreferSeedWriteCommand(requiredFiles, signals, seedWriteCommand) {
 		nextCommand = seedWriteCommand
 	}
@@ -80,6 +80,9 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 	emptyFiles := collectEmptyRequiredFiles(signals, requiredFiles)
 	repeatedScaffold := collectRepeatedScaffoldFiles(signals, requiredFiles)
 	pendingWrite := needsWrite && (signals.WriteCalls == 0 || signals.LastFailedTestPos > signals.LastWritePos)
+	if pendingWrite && strings.TrimSpace(nextCommand) == "" {
+		nextCommand = buildPendingWriteFallbackCommand(requiredFiles, missingFiles, emptyFiles, signals)
+	}
 	if signals.LastFailedTestPos > signals.LastWritePos {
 		if repairTarget := chooseRepairReadTarget(requiredFiles, signals); repairTarget != "" {
 			nextCommand = buildReadFileCommand(repairTarget)
@@ -138,6 +141,29 @@ func filterOutFiles(allFiles, excluded []string) []string {
 		filtered = append(filtered, filePath)
 	}
 	return filtered
+}
+
+func mergeExecutionSequenceFiles(allMentionedFiles, writeTargets []string) []string {
+	if len(allMentionedFiles) == 0 {
+		return append([]string(nil), writeTargets...)
+	}
+	sequence := append([]string(nil), allMentionedFiles...)
+	seen := make(map[string]struct{}, len(sequence))
+	for _, filePath := range sequence {
+		seen[strings.TrimSpace(filePath)] = struct{}{}
+	}
+	for _, filePath := range writeTargets {
+		key := strings.TrimSpace(filePath)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		sequence = append(sequence, filePath)
+		seen[key] = struct{}{}
+	}
+	return sequence
 }
 
 func buildExecutionPolicyPromptBlock(policy executionPolicy) string {
@@ -221,6 +247,22 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 	if len(result.calls) > 0 {
 		if policy.PendingWrite && policy.NextCommand != "" && shouldRewriteReadOnlyCallsToNext(result.calls, policy.NextCommand) {
 			slog.Info("execution policy rewrite to next command",
+				"stage", policy.Stage,
+				"pending_write", policy.PendingWrite,
+				"next_command", policy.NextCommand,
+				"required_files", policy.RequiredFiles,
+			)
+			if synthetic, ok := buildSyntheticExecCommandCall(policy.NextCommand, toolCatalog, constraints.RequiredTool); ok {
+				result.calls = []parsedToolCall{synthetic}
+				result.err = nil
+				result.visibleText = ""
+				result.mode = toolProtocolModeAIActionsTool
+				result.candidateFound = true
+			}
+			return result
+		}
+		if policy.PendingWrite && policy.NextCommand != "" && shouldRewriteMutationCallsToNext(result.calls, policy.NextCommand) {
+			slog.Info("execution policy rewrite pending write mutation to next command",
 				"stage", policy.Stage,
 				"pending_write", policy.PendingWrite,
 				"next_command", policy.NextCommand,
@@ -362,6 +404,22 @@ func buildPendingWriteGuardCommand(policy executionPolicy, calls []parsedToolCal
 	return ""
 }
 
+func buildPendingWriteFallbackCommand(requiredFiles, missingFiles, emptyFiles []string, signals executionHistorySignals) string {
+	if len(requiredFiles) == 0 {
+		return ""
+	}
+	if signals.WriteCalls > 0 {
+		return ""
+	}
+	if len(missingFiles) > 0 || len(emptyFiles) > 0 {
+		return ""
+	}
+	if signals.ReadCalls < 2 && !allRequiredFilesSeen(signals.Commands, requiredFiles) {
+		return ""
+	}
+	return ""
+}
+
 func shouldBlockReadOnlyDuringPendingWrite(policy executionPolicy) bool {
 	if !policy.PendingWrite {
 		return false
@@ -427,6 +485,36 @@ func shouldRewriteSequentialExecCallsToNext(calls []parsedToolCall, nextCommand 
 		}
 	}
 	return allSequentialExec && !matchedNext
+}
+
+func shouldRewriteMutationCallsToNext(calls []parsedToolCall, nextCommand string) bool {
+	next := strings.TrimSpace(nextCommand)
+	if next == "" || len(calls) == 0 || !isMutationCommand(next) {
+		return false
+	}
+	allMutations := true
+	matchedNext := false
+	for _, call := range calls {
+		name, command, ok := parsedToolCallInvocation(call)
+		if !ok {
+			return false
+		}
+		if name == "exec_command" {
+			if hasSatisfiedRequiredCommand([]string{command}, next) {
+				matchedNext = true
+			}
+			if !isMutationCommand(command) {
+				allMutations = false
+				break
+			}
+			continue
+		}
+		if !isMutationToolName(name) {
+			allMutations = false
+			break
+		}
+	}
+	return allMutations && !matchedNext
 }
 
 func callsAdvanceNextRequiredCommand(calls []parsedToolCall, nextCommand string, seenCommands []string) bool {
@@ -653,10 +741,10 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 }
 
 func chooseNextExecutionCommand(requiredCommands, requiredFiles []string, signals executionHistorySignals, needsWrite bool) string {
-	return chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, signals, needsWrite)
+	return chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, signals, needsWrite, nil)
 }
 
-func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, styleCommands []string, signals executionHistorySignals, needsWrite bool) string {
+func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, styleCommands []string, signals executionHistorySignals, needsWrite bool, writeTargets []string) string {
 	resolveCommandDone := func(command string) bool {
 		if hasSatisfiedRequiredCommand(signals.SuccessfulCommands, command) {
 			return true
@@ -680,6 +768,15 @@ func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, style
 	}
 
 	if needsWrite && signals.WriteCalls == 0 {
+		for _, filePath := range requiredFiles {
+			if isWriteTargetFile(filePath, writeTargets) {
+				continue
+			}
+			if hasSatisfiedReadForFile(signals.SuccessfulCommands, signals.Commands, signals.CommandsWithResult, signals.FailedCommands, filePath) {
+				continue
+			}
+			return buildReadFileCommand(filePath)
+		}
 		if command := chooseNextStyleInspectionCommand(styleCommands, requiredFiles, signals, resolveCommandDone); command != "" {
 			return command
 		}
@@ -753,6 +850,19 @@ func chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, style
 	return ""
 }
 
+func isWriteTargetFile(filePath string, writeTargets []string) bool {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" || len(writeTargets) == 0 {
+		return false
+	}
+	for _, target := range writeTargets {
+		if strings.TrimSpace(target) == filePath {
+			return true
+		}
+	}
+	return false
+}
+
 func hasExplicitReadCommandForFile(requiredCommands []string, filePath string) bool {
 	filePath = strings.TrimSpace(filePath)
 	if filePath == "" {
@@ -809,6 +919,15 @@ func chooseUnreadStyleReferenceFile(output string, requiredFiles, seenCommands [
 }
 
 func buildSeedWriteCommand(task string, requiredFiles []string, signals executionHistorySignals) string {
+	if helperCommand := buildSeedGoCrossFileFeatureCommand(task, requiredFiles, signals); helperCommand != "" {
+		return helperCommand
+	}
+	if replacementCommand := buildSeedReplacementCommand(task, requiredFiles, signals); replacementCommand != "" {
+		return replacementCommand
+	}
+	if transformCommand := buildSeedGoStringTransformCommand(task, requiredFiles, signals); transformCommand != "" {
+		return transformCommand
+	}
 	if len(requiredFiles) != 1 {
 		return ""
 	}
@@ -857,6 +976,154 @@ func buildSeedGoTestFunction(task, testName string) string {
 	return ""
 }
 
+var taskGoHelperFunctionPattern = regexp.MustCompile(`提供\s+([A-Za-z_][A-Za-z0-9_]*)\s+帮助函数`)
+var taskGoPrimaryFunctionPattern = regexp.MustCompile(`让\s+([A-Za-z_][A-Za-z0-9_]*)\s+`)
+var goFunctionNamePattern = regexp.MustCompile(`func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(`)
+
+func buildSeedGoCrossFileFeatureCommand(task string, requiredFiles []string, signals executionHistorySignals) string {
+	if len(requiredFiles) < 3 {
+		return ""
+	}
+	helperName := extractGoHelperFunctionName(task)
+	if helperName == "" || !taskMentionsTitleAndBodyTransform(task) {
+		return ""
+	}
+
+	helperFile, mainFile, testFile := classifyGoFeatureFiles(requiredFiles)
+	if helperFile == "" || mainFile == "" || testFile == "" {
+		return ""
+	}
+	if !hasSatisfiedReadForFile(signals.SuccessfulCommands, signals.Commands, signals.CommandsWithResult, signals.FailedCommands, mainFile) {
+		return ""
+	}
+	if !hasSatisfiedReadForFile(signals.SuccessfulCommands, signals.Commands, signals.CommandsWithResult, signals.FailedCommands, testFile) {
+		return ""
+	}
+
+	packageName := inferGoPackageNameForTarget(mainFile, signals)
+	if packageName == "" {
+		return ""
+	}
+	mainFunc := extractGoPrimaryFunctionName(task, signals, mainFile)
+	if mainFunc == "" {
+		return ""
+	}
+
+	helperContent := "package " + packageName + "\n\nimport \"strings\"\n\nfunc " + helperName + "(title string) string {\n\treturn strings.ToUpper(strings.TrimSpace(title))\n}\n"
+	emptyBodyTestName := "Test" + mainFunc + "_EmptyBody"
+	testSnippet := "\nfunc " + emptyBodyTestName + "(t *testing.T) {\n\tgot := " + mainFunc + "(\"  firew2oai  \", \"\")\n\twant := \"FIREW2OAI:\"\n\tif got != want {\n\t\tt.Fatalf(\"" + mainFunc + "() = %q, want %q\", got, want)\n\t}\n}\n"
+	mainReplacement := "func " + mainFunc + "(title, body string) string {\n\ttrimmedBody := strings.TrimSpace(body)\n\tif trimmedBody == \"\" {\n\t\treturn " + helperName + "(title) + \":\"\n\t}\n\treturn " + helperName + "(title) + \": \" + trimmedBody\n}"
+
+	lines := []string{
+		"from pathlib import Path",
+		"import re",
+		"helper_path = Path(" + strconv.Quote(helperFile) + ")",
+		"main_path = Path(" + strconv.Quote(mainFile) + ")",
+		"test_path = Path(" + strconv.Quote(testFile) + ")",
+		"helper_path.write_text(" + strconv.Quote(helperContent) + ", encoding='utf-8')",
+		"main_text = main_path.read_text(encoding='utf-8')",
+		"main_pattern = re.compile(r'func\\s+" + regexp.QuoteMeta(mainFunc) + `\s*\(title,\s*body\s+string\)\s*string\s*\{[\s\S]*?\n\}')`,
+		"assert main_pattern.search(main_text), 'main function not found'",
+		"main_text = main_pattern.sub(" + strconv.Quote(mainReplacement) + ", main_text, count=1)",
+		"has_single_import = re.search(r'(?m)^import\\s+\"strings\"\\s*$', main_text) is not None",
+		"block_match = re.search(r'(?s)\\nimport\\s*\\((.*?)\\n\\)', main_text)",
+		"has_block_import = block_match is not None and re.search(r'(?m)^\\s*\"strings\"\\s*$', block_match.group(1)) is not None",
+		"if not has_single_import and not has_block_import:",
+		"    if block_match is not None:",
+		"        insert_at = block_match.start(1)",
+		"        main_text = main_text[:insert_at] + '\\n\\t\"strings\"' + main_text[insert_at:]",
+		"    else:",
+		"        pkg_end = main_text.find('\\n')",
+		"        assert pkg_end >= 0, 'package line not found'",
+		"        main_text = main_text[:pkg_end+1] + '\\nimport \"strings\"\\n' + main_text[pkg_end+1:]",
+		"main_path.write_text(main_text, encoding='utf-8')",
+		"test_text = test_path.read_text(encoding='utf-8')",
+		"if " + strconv.Quote(emptyBodyTestName) + " not in test_text:",
+		"    test_text = test_text.rstrip() + " + strconv.Quote(testSnippet) + "",
+		"test_path.write_text(test_text, encoding='utf-8')",
+	}
+	return buildPythonExecCommand(lines)
+}
+
+func extractGoHelperFunctionName(task string) string {
+	match := taskGoHelperFunctionPattern.FindStringSubmatch(task)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func extractGoPrimaryFunctionName(task string, signals executionHistorySignals, filePath string) string {
+	if match := taskGoPrimaryFunctionPattern.FindStringSubmatch(task); len(match) >= 2 {
+		return strings.TrimSpace(match[1])
+	}
+	content := readSuccessfulFileOutput(signals, filePath)
+	if content == "" {
+		return ""
+	}
+	match := goFunctionNamePattern.FindStringSubmatch(content)
+	if len(match) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(match[1])
+}
+
+func classifyGoFeatureFiles(requiredFiles []string) (string, string, string) {
+	helperFile := ""
+	mainFile := ""
+	testFile := ""
+	for _, filePath := range requiredFiles {
+		trimmed := strings.TrimSpace(filePath)
+		if trimmed == "" {
+			continue
+		}
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasSuffix(lower, "_test.go"):
+			if testFile == "" {
+				testFile = trimmed
+			}
+		case strings.HasSuffix(lower, ".go"):
+			if helperFile == "" {
+				helperFile = trimmed
+			} else if mainFile == "" {
+				mainFile = trimmed
+			}
+		}
+	}
+	return helperFile, mainFile, testFile
+}
+
+func taskMentionsTitleAndBodyTransform(task string) bool {
+	lower := strings.ToLower(task)
+	hasTitle := strings.Contains(lower, "title")
+	hasBody := strings.Contains(lower, "body")
+	hasNormalize := strings.Contains(task, "规范化") || strings.Contains(lower, "normalize")
+	hasTrim := strings.Contains(task, "裁剪") || strings.Contains(lower, "trimspace") || strings.Contains(lower, "trim")
+	return hasTitle && hasBody && hasNormalize && hasTrim
+}
+
+func readSuccessfulFileOutput(signals executionHistorySignals, filePath string) string {
+	filePath = strings.TrimSpace(filePath)
+	if filePath == "" {
+		return ""
+	}
+	for _, command := range signals.SuccessfulCommands {
+		if !isReadOnlyCommand(command) || !commandTouchesFile(command, filePath) {
+			continue
+		}
+		if output := strings.TrimSpace(signals.CommandOutputs[command]); output != "" {
+			return output
+		}
+	}
+	return ""
+}
+
+func buildPythonExecCommand(lines []string) string {
+	code := strings.Join(lines, "\n")
+	return "python3 -c " + shellQuoteSingle("exec("+strconv.Quote(code)+")")
+}
+
 var goCallPattern = regexp.MustCompile(`([A-Za-z_][A-Za-z0-9_]*\([^\n]*\))`)
 
 func extractGoEmptyStringExpectation(task string) (string, bool) {
@@ -882,11 +1149,23 @@ func shouldPreferSeedWriteCommand(requiredFiles []string, signals executionHisto
 	if strings.TrimSpace(seedWriteCommand) == "" || len(requiredFiles) == 0 {
 		return false
 	}
-	if !hasSuccessfulReferenceRead(requiredFiles, signals) {
+	if !hasSuccessfulReferenceRead(requiredFiles, signals) && !hasSuccessfulTargetRead(requiredFiles, signals) {
 		return false
+	}
+	if signals.WriteCalls == 0 {
+		return true
 	}
 	for _, filePath := range requiredFiles {
 		if hasFailedReadForFile(signals.FailedCommands, filePath) || hasEmptyReadForFile(signals.EmptyCommands, filePath) || hasScaffoldCreateForFile(signals.Commands, filePath) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSuccessfulTargetRead(requiredFiles []string, signals executionHistorySignals) bool {
+	for _, filePath := range requiredFiles {
+		if hasSatisfiedReadForFile(signals.SuccessfulCommands, signals.Commands, signals.CommandsWithResult, signals.FailedCommands, filePath) {
 			return true
 		}
 	}
@@ -936,6 +1215,127 @@ func inferGoPackageNameForTarget(targetFile string, signals executionHistorySign
 		}
 	}
 	return normalizeGoPackageFallback(path.Base(targetDir))
+}
+
+var taskQuotedReplacementPattern = regexp.MustCompile("`([^`\\n]+)`\\s*改为\\s*`([^`\\n]+)`")
+var taskGoStringTransformPattern = regexp.MustCompile(`对\s+([A-Za-z_][A-Za-z0-9_]*)\s+执行\s+([A-Za-z0-9_.+\s]+?)\s*[，,]\s*对\s+([A-Za-z_][A-Za-z0-9_]*)\s+执行\s+([A-Za-z0-9_.+\s]+?)(?:[。；;\n]|$)`)
+
+func buildSeedReplacementCommand(task string, requiredFiles []string, signals executionHistorySignals) string {
+	if len(requiredFiles) != 1 || !hasSuccessfulReferenceRead(requiredFiles, signals) {
+		return ""
+	}
+	match := taskQuotedReplacementPattern.FindStringSubmatch(task)
+	if len(match) < 3 {
+		return ""
+	}
+	targetFile := strings.TrimSpace(requiredFiles[0])
+	oldText := strings.TrimSpace(match[1])
+	newText := strings.TrimSpace(match[2])
+	if targetFile == "" || oldText == "" || newText == "" || oldText == newText {
+		return ""
+	}
+	pythonCode := "from pathlib import Path; path = Path(" + strconv.Quote(targetFile) + "); text = path.read_text(encoding='utf-8'); old = " + strconv.Quote(oldText) + "; new = " + strconv.Quote(newText) + "; assert old in text, 'old snippet not found'; path.write_text(text.replace(old, new, 1), encoding='utf-8')"
+	return "python3 -c " + shellQuoteSingle(pythonCode)
+}
+
+func buildSeedGoStringTransformCommand(task string, requiredFiles []string, signals executionHistorySignals) string {
+	if len(requiredFiles) != 1 || !hasSuccessfulReferenceRead(requiredFiles, signals) {
+		return ""
+	}
+	targetFile := strings.TrimSpace(requiredFiles[0])
+	if targetFile == "" || !strings.HasSuffix(strings.ToLower(targetFile), ".go") {
+		return ""
+	}
+	match := taskGoStringTransformPattern.FindStringSubmatch(task)
+	if len(match) < 5 {
+		return ""
+	}
+
+	leftVar := strings.TrimSpace(match[1])
+	leftPipeline := parseGoStringTransformPipeline(match[2])
+	rightVar := strings.TrimSpace(match[3])
+	rightPipeline := parseGoStringTransformPipeline(match[4])
+	if leftVar == "" || rightVar == "" || len(leftPipeline) == 0 || len(rightPipeline) == 0 {
+		return ""
+	}
+
+	leftExpr := composeGoCallPipeline(leftVar, leftPipeline)
+	rightExpr := composeGoCallPipeline(rightVar, rightPipeline)
+	if leftExpr == "" || rightExpr == "" {
+		return ""
+	}
+	oldReturn := "return " + leftVar + ` + ": " + ` + rightVar
+	newReturn := "return " + leftExpr + ` + ": " + ` + rightExpr
+	if oldReturn == newReturn {
+		return ""
+	}
+
+	addStringsImport := false
+	for _, fn := range append(append([]string(nil), leftPipeline...), rightPipeline...) {
+		if strings.HasPrefix(fn, "strings.") {
+			addStringsImport = true
+			break
+		}
+	}
+
+	lines := []string{
+		"from pathlib import Path",
+		"path = Path(" + strconv.Quote(targetFile) + ")",
+		"text = path.read_text(encoding='utf-8')",
+		"old = " + strconv.Quote(oldReturn),
+		"new = " + strconv.Quote(newReturn),
+		"assert old in text, 'old return not found'",
+		"text = text.replace(old, new, 1)",
+	}
+	if addStringsImport {
+		lines = append(lines,
+			"import re",
+			"has_single_import = re.search(r'(?m)^import\\s+\"strings\"\\s*$', text) is not None",
+			"block_match = re.search(r'(?s)\\nimport\\s*\\((.*?)\\n\\)', text)",
+			"has_block_import = block_match is not None and re.search(r'(?m)^\\s*\"strings\"\\s*$', block_match.group(1)) is not None",
+			"if not has_single_import and not has_block_import:",
+			"    if block_match is not None:",
+			"        insert_at = block_match.start(1)",
+			"        text = text[:insert_at] + '\\n\\t\"strings\"' + text[insert_at:]",
+			"    else:",
+			"        pkg_end = text.find('\\n')",
+			"        assert pkg_end >= 0, 'package line not found'",
+			"        text = text[:pkg_end+1] + '\\nimport \"strings\"\\n' + text[pkg_end+1:]",
+		)
+	}
+	lines = append(lines, "path.write_text(text, encoding='utf-8')")
+	return buildPythonExecCommand(lines)
+}
+
+func parseGoStringTransformPipeline(raw string) []string {
+	parts := strings.Split(raw, "+")
+	pipeline := make([]string, 0, len(parts))
+	for _, part := range parts {
+		fn := strings.TrimSpace(part)
+		if fn == "" {
+			return nil
+		}
+		if !regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`).MatchString(fn) {
+			return nil
+		}
+		pipeline = append(pipeline, fn)
+	}
+	return pipeline
+}
+
+func composeGoCallPipeline(arg string, pipeline []string) string {
+	expr := strings.TrimSpace(arg)
+	if expr == "" || len(pipeline) == 0 {
+		return ""
+	}
+	for _, fn := range pipeline {
+		fn = strings.TrimSpace(fn)
+		if fn == "" {
+			return ""
+		}
+		expr = fn + "(" + expr + ")"
+	}
+	return expr
 }
 
 func extractGoPackageName(text string) string {

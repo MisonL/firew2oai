@@ -513,12 +513,70 @@ func extractWriteTargetFiles(task string) []string {
 	targets := make([]string, 0, 4)
 	for _, segment := range segments {
 		lower := strings.ToLower(segment)
-		if !containsAny(lower, taskWriteKeywords) {
+		writeIdx := firstKeywordIndex(lower, taskWriteKeywords)
+		if writeIdx < 0 {
 			continue
 		}
-		targets = append(targets, taskFilePathPattern.FindAllString(segment, -1)...)
+		targets = append(targets, taskFilePathPattern.FindAllString(segment[writeIdx:], -1)...)
 	}
 	return dedupePreserveOrder(targets)
+}
+
+func firstKeywordIndex(text string, keywords []string) int {
+	best := -1
+	for _, keyword := range keywords {
+		if keyword == "" {
+			continue
+		}
+		idx := findTaskKeywordIndex(text, strings.ToLower(keyword))
+		if idx < 0 {
+			continue
+		}
+		if best < 0 || idx < best {
+			best = idx
+		}
+	}
+	return best
+}
+
+func findTaskKeywordIndex(text, keyword string) int {
+	if text == "" || keyword == "" {
+		return -1
+	}
+	if !isASCIIAlphaNumericKeyword(keyword) {
+		return strings.Index(text, keyword)
+	}
+	searchFrom := 0
+	for searchFrom <= len(text)-len(keyword) {
+		idx := strings.Index(text[searchFrom:], keyword)
+		if idx < 0 {
+			return -1
+		}
+		idx += searchFrom
+		beforeOK := idx == 0 || !isASCIIAlphaNumericUnderscore(text[idx-1])
+		afterPos := idx + len(keyword)
+		afterOK := afterPos >= len(text) || !isASCIIAlphaNumericUnderscore(text[afterPos])
+		if beforeOK && afterOK {
+			return idx
+		}
+		searchFrom = idx + len(keyword)
+	}
+	return -1
+}
+
+func isASCIIAlphaNumericKeyword(keyword string) bool {
+	for i := 0; i < len(keyword); i++ {
+		c := keyword[i]
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isASCIIAlphaNumericUnderscore(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'
 }
 
 func splitTaskActionSegments(task string) []string {
@@ -835,7 +893,11 @@ func extractRequiredOutputLabels(task string) []string {
 	if !strings.Contains(lower, "只输出") && !strings.Contains(lower, "only output") && !strings.Contains(lower, "output only") {
 		return nil
 	}
-	matches := taskOutputLabelPattern.FindAllStringSubmatch(task, -1)
+	if labels := extractPlainRequiredOutputLabels(task); len(labels) > 0 {
+		return labels
+	}
+	section := requiredOutputSection(task)
+	matches := taskOutputLabelPattern.FindAllStringSubmatch(section, -1)
 	labels := make([]string, 0, len(matches))
 	for _, match := range matches {
 		if len(match) < 2 {
@@ -846,10 +908,35 @@ func extractRequiredOutputLabels(task string) []string {
 			labels = append(labels, label)
 		}
 	}
-	if len(labels) == 0 {
-		labels = append(labels, extractPlainRequiredOutputLabels(task)...)
+	return dedupePreserveOrder(labels)
+}
+
+func requiredOutputSection(task string) string {
+	trimmed := strings.TrimSpace(task)
+	if trimmed == "" {
+		return ""
 	}
-	return labels
+	lower := strings.ToLower(trimmed)
+	best := -1
+	for _, marker := range []string{
+		"最终只输出",
+		"完成后只输出",
+		"最后只输出",
+		"只输出",
+		"最终仅输出",
+		"完成后仅输出",
+		"仅输出",
+		"only output",
+		"output only",
+	} {
+		if idx := strings.LastIndex(lower, marker); idx > best {
+			best = idx
+		}
+	}
+	if best < 0 || best >= len(trimmed) {
+		return trimmed
+	}
+	return trimmed[best:]
 }
 
 func extractPlainRequiredOutputLabels(task string) []string {

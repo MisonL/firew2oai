@@ -11,24 +11,32 @@ import (
 
 // Config holds all service configuration.
 type Config struct {
-	Port              int
-	Host              string
-	APIKey            string // comma-separated keys, JSON file path, or inline JSON
-	Timeout           int    // seconds
-	LogLevel          string
-	ShowThinking      bool // default: show thinking process for thinking models
-	CORSOrigins       string
-	RateLimit         int    // global rate limit: max requests per minute per key (0 = disabled)
-	IPWhitelist       string // comma-separated IPs/CIDRs; default "127.0.0.1,::1" (loopback only); set "" or "0.0.0.0/0,::/0" to allow all
-	TrustedProxyCount int    // number of trusted reverse proxies (0 = trust none, use RemoteAddr)
+	Port                        int
+	Host                        string
+	APIKey                      string // comma-separated keys, JSON file path, or inline JSON
+	Timeout                     int    // seconds
+	UpstreamRetryCount          int    // retry count for transient upstream failures before first byte
+	UpstreamRetryBackoffMS      int    // base backoff in milliseconds for transient upstream retries
+	UpstreamEmptyRetryCount     int    // retry count for 200 OK upstream responses that end before any content/done signal
+	UpstreamEmptyRetryBackoffMS int    // base backoff in milliseconds for empty upstream retries
+	LogLevel                    string
+	ShowThinking                bool // default: show thinking process for thinking models
+	CORSOrigins                 string
+	RateLimit                   int    // global rate limit: max requests per minute per key (0 = disabled)
+	IPWhitelist                 string // comma-separated IPs/CIDRs; default "127.0.0.1,::1" (loopback only); set "" or "0.0.0.0/0,::/0" to allow all
+	TrustedProxyCount           int    // number of trusted reverse proxies (0 = trust none, use RemoteAddr)
 }
 
 const (
-	defaultPort      = 39527
-	defaultTimeout   = 120
-	defaultRateLimit = 0
-	minPort          = 1
-	maxPort          = 65535
+	defaultPort                        = 39527
+	defaultTimeout                     = 120
+	defaultUpstreamRetryCount          = 1
+	defaultUpstreamRetryBackoffMS      = 200
+	defaultUpstreamEmptyRetryCount     = 1
+	defaultUpstreamEmptyRetryBackoffMS = 200
+	defaultRateLimit                   = 0
+	minPort                            = 1
+	maxPort                            = 65535
 )
 
 var AvailableModels = []string{
@@ -87,6 +95,10 @@ func Load() *Config {
 	cfg.Host = ""
 	cfg.APIKey = "sk-admin"
 	cfg.Timeout = defaultTimeout
+	cfg.UpstreamRetryCount = defaultUpstreamRetryCount
+	cfg.UpstreamRetryBackoffMS = defaultUpstreamRetryBackoffMS
+	cfg.UpstreamEmptyRetryCount = defaultUpstreamEmptyRetryCount
+	cfg.UpstreamEmptyRetryBackoffMS = defaultUpstreamEmptyRetryBackoffMS
 	cfg.LogLevel = "info"
 	cfg.ShowThinking = false
 	cfg.CORSOrigins = "*"
@@ -119,6 +131,34 @@ func Load() *Config {
 			slog.Warn("TIMEOUT must be positive, using default", "value", v)
 		} else {
 			slog.Warn("invalid TIMEOUT value, using default", "value", v)
+		}
+	}
+	if v := os.Getenv("UPSTREAM_RETRY_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.UpstreamRetryCount = n
+		} else {
+			slog.Warn("invalid UPSTREAM_RETRY_COUNT value, using default", "value", v)
+		}
+	}
+	if v := os.Getenv("UPSTREAM_RETRY_BACKOFF_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.UpstreamRetryBackoffMS = n
+		} else {
+			slog.Warn("invalid UPSTREAM_RETRY_BACKOFF_MS value, using default", "value", v)
+		}
+	}
+	if v := os.Getenv("UPSTREAM_EMPTY_RETRY_COUNT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.UpstreamEmptyRetryCount = n
+		} else {
+			slog.Warn("invalid UPSTREAM_EMPTY_RETRY_COUNT value, using default", "value", v)
+		}
+	}
+	if v := os.Getenv("UPSTREAM_EMPTY_RETRY_BACKOFF_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			cfg.UpstreamEmptyRetryBackoffMS = n
+		} else {
+			slog.Warn("invalid UPSTREAM_EMPTY_RETRY_BACKOFF_MS value, using default", "value", v)
 		}
 	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
@@ -163,6 +203,10 @@ func (c *Config) ApplyFlags(args []string) {
 	fs.StringVar(&c.Host, "host", c.Host, "listen host (default: all interfaces)")
 	fs.StringVar(&c.APIKey, "api-key", c.APIKey, "API key for authentication")
 	fs.IntVar(&c.Timeout, "timeout", c.Timeout, "upstream request timeout in seconds")
+	fs.IntVar(&c.UpstreamRetryCount, "upstream-retry-count", c.UpstreamRetryCount, "retry count for transient upstream 429/502/503/504 before first byte")
+	fs.IntVar(&c.UpstreamRetryBackoffMS, "upstream-retry-backoff-ms", c.UpstreamRetryBackoffMS, "base backoff in milliseconds for transient upstream retries")
+	fs.IntVar(&c.UpstreamEmptyRetryCount, "upstream-empty-retry-count", c.UpstreamEmptyRetryCount, "retry count for upstream 200 responses that end before any content or done signal")
+	fs.IntVar(&c.UpstreamEmptyRetryBackoffMS, "upstream-empty-retry-backoff-ms", c.UpstreamEmptyRetryBackoffMS, "base backoff in milliseconds for empty upstream retries")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "log level: debug, info, warn, error")
 	fs.BoolVar(&c.ShowThinking, "show-thinking", c.ShowThinking, "show thinking process for thinking models")
 	fs.StringVar(&c.CORSOrigins, "cors-origins", c.CORSOrigins, "allowed CORS origins (comma-separated, * for all)")
@@ -177,6 +221,22 @@ func (c *Config) ApplyFlags(args []string) {
 	if c.Timeout <= 0 {
 		slog.Warn("timeout must be positive, using default", "value", c.Timeout)
 		c.Timeout = defaultTimeout
+	}
+	if c.UpstreamRetryCount < 0 {
+		slog.Warn("upstream-retry-count must be non-negative, using default", "value", c.UpstreamRetryCount)
+		c.UpstreamRetryCount = defaultUpstreamRetryCount
+	}
+	if c.UpstreamRetryBackoffMS < 0 {
+		slog.Warn("upstream-retry-backoff-ms must be non-negative, using default", "value", c.UpstreamRetryBackoffMS)
+		c.UpstreamRetryBackoffMS = defaultUpstreamRetryBackoffMS
+	}
+	if c.UpstreamEmptyRetryCount < 0 {
+		slog.Warn("upstream-empty-retry-count must be non-negative, using default", "value", c.UpstreamEmptyRetryCount)
+		c.UpstreamEmptyRetryCount = defaultUpstreamEmptyRetryCount
+	}
+	if c.UpstreamEmptyRetryBackoffMS < 0 {
+		slog.Warn("upstream-empty-retry-backoff-ms must be non-negative, using default", "value", c.UpstreamEmptyRetryBackoffMS)
+		c.UpstreamEmptyRetryBackoffMS = defaultUpstreamEmptyRetryBackoffMS
 	}
 	if c.RateLimit < 0 {
 		slog.Warn("rate-limit must be non-negative, clamping to 0", "value", c.RateLimit)

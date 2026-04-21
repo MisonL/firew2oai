@@ -86,6 +86,37 @@ func TestApplyExecutionPolicyToParseResult_ReadLoopRewritesReadOnlyCall(t *testi
 	}
 }
 
+func TestApplyExecutionPolicyToParseResult_PendingWriteRewritesMutationToDeterministicSeed(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	nextCommand := `python3 -c 'from pathlib import Path; Path("internal/proxy/output_constraints_test.go").write_text("package proxy\n\nimport \"testing\"\n", encoding='"'"'utf-8'"'"')'`
+	content := "先创建测试文件。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"python3 -c 'from pathlib import Path; Path(\\\"internal/proxy/output_constraints_test.go\\\").write_text(\\\"broken\\\", encoding=\\\"utf-8\\\")'\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:      true,
+		RequireTool:  true,
+		PendingWrite: true,
+		Stage:        "execute",
+		NextCommand:  nextCommand,
+		RequiredFiles: []string{
+			"internal/proxy/output_constraints_test.go",
+		},
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if command != nextCommand {
+		t.Fatalf("command = %q, want rewritten deterministic seed command", command)
+	}
+}
+
 func TestApplyExecutionPolicyToParseResult_RewritesReadOnlyWhenMissingRequiredStep(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
@@ -506,7 +537,7 @@ func TestChooseNextExecutionCommand_WriteTaskCreatesMissingFileAfterFailedRead(t
 		},
 	}
 
-	got := chooseNextExecutionCommand(requiredCommands, requiredFiles, signals, true)
+	got := chooseNextExecutionCommandWithStyles(requiredCommands, requiredFiles, nil, signals, true, []string{"internal/proxy/output_constraints_test.go"})
 	want := buildCreateMissingFileCommand("internal/proxy/output_constraints_test.go")
 	if got != want {
 		t.Fatalf("next command = %q, want %q", got, want)
@@ -531,7 +562,7 @@ func TestChooseNextExecutionCommand_WriteTaskPrioritizesMissingTargetBeforeReRea
 		},
 	}
 
-	got := chooseNextExecutionCommand(nil, requiredFiles, signals, true)
+	got := chooseNextExecutionCommandWithStyles(nil, requiredFiles, nil, signals, true, []string{"internal/proxy/output_constraints_test.go"})
 	want := buildCreateMissingFileCommand("internal/proxy/output_constraints_test.go")
 	if got != want {
 		t.Fatalf("next command = %q, want %q", got, want)
@@ -1102,6 +1133,38 @@ func TestBuildExecutionPolicy_FinalizesWhenToolHistoryOnlyExistsAsSummaryMessage
 	}
 	if policy.PendingWrite {
 		t.Fatalf("policy.PendingWrite = true, want false after summarized write and tests completed: %+v", policy)
+	}
+}
+
+func TestBuildExecutionPolicy_AdvancesFromCommandStyleToolResultsWithoutAssistantSummary(t *testing.T) {
+	task := "你是资深 Go 工程师。请完成一个需要先搜索再修复的真实 Coding 任务：\n" +
+		"1) 先执行命令：rg -n \"BuildTicketSummary|NormalizeTitle\" internal/codexfixture/searchfix。\n" +
+		"2) 阅读 internal/codexfixture/searchfix/summary.go 与 internal/codexfixture/searchfix/summary_test.go。\n" +
+		"3) 修改现有文件 internal/codexfixture/searchfix/summary.go，让 BuildTicketSummary 对 title 执行 strings.TrimSpace + strings.ToUpper，对 body 执行 strings.TrimSpace。\n" +
+		"4) 不要新增文件。\n" +
+		"5) 执行 go test ./internal/codexfixture/searchfix。"
+
+	rawItems := []any{
+		"Tool result (call_id=call_search)\nCommand: rg -n \"BuildTicketSummary|NormalizeTitle\" internal/codexfixture/searchfix\nExit code: 0\nOutput:\ninternal/codexfixture/searchfix/summary.go:3:func BuildTicketSummary(title, body string) string",
+		"Tool result (call_id=call_read_main)\nCommand: sed -n '1,200p' 'internal/codexfixture/searchfix/summary.go'\nExit code: 0\nOutput:\npackage searchfix\n\nfunc BuildTicketSummary(title, body string) string {\n\treturn title + \": \" + body\n}",
+		"Tool result (call_id=call_read_test)\nCommand: sed -n '1,200p' 'internal/codexfixture/searchfix/summary_test.go'\nExit code: 0\nOutput:\npackage searchfix\n\nimport \"testing\"\n\nfunc TestBuildTicketSummary_TrimsAndUppercases(t *testing.T) {\n\tgot := BuildTicketSummary(\"  firew2oai  \", \" adapter \")\n\twant := \"FIREW2OAI: adapter\"\n\tif got != want {\n\t\tt.Fatalf(\"BuildTicketSummary() = %q, want %q\", got, want)\n\t}\n}",
+	}
+
+	history := make([]json.RawMessage, 0, len(rawItems)*2)
+	for _, item := range rawItems {
+		raws := normalizeRawResponseInputItems(item)
+		if len(raws) == 0 {
+			t.Fatalf("normalizeRawResponseInputItems returned empty for %#v", item)
+		}
+		history = append(history, raws...)
+	}
+
+	policy := buildExecutionPolicy("glm-5", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = false, want true")
+	}
+	if !strings.Contains(policy.NextCommand, "text.replace") {
+		t.Fatalf("policy.NextCommand = %q, want deterministic replacement command", policy.NextCommand)
 	}
 }
 

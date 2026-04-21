@@ -38,6 +38,10 @@ func main() {
 		"version", Version,
 		"port", cfg.Port,
 		"timeout", cfg.Timeout,
+		"upstream_retry_count", cfg.UpstreamRetryCount,
+		"upstream_retry_backoff_ms", cfg.UpstreamRetryBackoffMS,
+		"upstream_empty_retry_count", cfg.UpstreamEmptyRetryCount,
+		"upstream_empty_retry_backoff_ms", cfg.UpstreamEmptyRetryBackoffMS,
 		"rate_limit", cfg.RateLimit,
 		"cors_origins", cfg.CORSOrigins,
 		"ip_whitelist", cfg.IPWhitelist,
@@ -48,7 +52,7 @@ func main() {
 
 	// Create transport with Chrome TLS fingerprint
 	timeout := time.Duration(cfg.Timeout) * time.Second
-	tp := transport.New(timeout)
+	tp := transport.NewWithRetry(timeout, cfg.UpstreamRetryCount, time.Duration(cfg.UpstreamRetryBackoffMS)*time.Millisecond)
 
 	// Create token auth manager
 	tm, err := tokenauth.New(cfg.APIKey, cfg.RateLimit)
@@ -71,7 +75,13 @@ func main() {
 	}
 
 	// Create proxy handler
-	p := proxy.New(tp, Version, cfg.ShowThinking)
+	p := proxy.NewWithRetryPolicy(
+		tp,
+		Version,
+		cfg.ShowThinking,
+		cfg.UpstreamEmptyRetryCount,
+		time.Duration(cfg.UpstreamEmptyRetryBackoffMS)*time.Millisecond,
+	)
 	handler := proxy.NewMux(p, cfg.CORSOrigins, tm)
 
 	// Wrap with IP whitelist (applied first, constructed once at startup)
