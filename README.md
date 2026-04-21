@@ -13,7 +13,7 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 ## 当前验证状态
 
-核对日期：2026-04-20  
+核对日期：2026-04-21  
 当前 README 只保留最后一次验证情况；历史矩阵和早期复测记录已从仓库文档中移除。
 
 ### 最后一次真实链路验证
@@ -21,27 +21,26 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 | 项目 | 结果 |
 |---|---|
 | 链路 | `Codex -> new-api -> firew2oai` |
-| 模型 | `glm-5` |
-| 任务 | 只读分析 `internal/proxy/output_constraints.go`、`internal/proxy/execution_evidence.go`，执行 `go test ./internal/proxy` 与 `go test ./...`，最终输出 `RESULT/CONSTRAINT/EVIDENCE/TEST` |
-| 证据文件 | `/tmp/firew2oai-compare-newapi-glm5.jsonl` |
-| 结果 | `PASS` |
+| 接口 | `wire_api=responses` |
+| 场景 | `readonly_audit`、`add_test_file`、`fix_existing_bug`、`search_and_patch`、`cross_file_feature` |
+| 证据文件 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260421-094437/summary.tsv` |
+| 补充证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260420-230054/summary.reconstructed.tsv` |
+| 结果 | 已完成当前模型集真实 coding 场景分梯队复核 |
 
 验证结论：
 
-- 第 1 轮读取 `internal/proxy/output_constraints.go`
-- 第 2 轮读取 `internal/proxy/execution_evidence.go`
-- 第 3 轮执行 `go test ./internal/proxy`
-- 第 4 轮执行 `go test ./...`
-- 第 5 轮进入 `execution_stage=finalize`
-- 最终返回规范四行 `RESULT/CONSTRAINT/EVIDENCE/TEST`
-- finalize 阶段未再重复触发工具调用
+- 第一梯队，`5/5 PASS`：`glm-5`、`glm-4p7`、`gpt-oss-20b`、`gpt-oss-120b`、`kimi-k2p5`、`llama-v3p3-70b-instruct`、`minimax-m2p5`、`qwen3-vl-30b-a3b-instruct`、`deepseek-v3p1`、`deepseek-v3p2`
+- 第二梯队，`4/5 PASS`：`qwen3-8b`，唯一失败场景为 `readonly_audit`，最新失败表现为 `upstream response ended without a completion signal`
+- 第三梯队：`qwen3-vl-30b-a3b-thinking`，剩余问题主要表现为 completion signal 异常或长尾超时
+- 当前已确认的一梯队模型，在真实链路下可稳定完成只读审计、补测试、修已有 bug、仓库搜索后定点修补、跨文件小功能这 5 类 Coding 场景
+- 第二、第三梯队的残余问题当前更接近上游响应稳定性或模型能力长尾，不是已确认的主转换层回归
 
 本地回归验证：
 
 - `go test ./internal/proxy`
 - `go test ./...`
 
-详细记录见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md`。
+详细记录见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md`。
 
 ## 快速开始
 
@@ -79,12 +78,31 @@ docker run -d -p 39527:39527 -e API_KEY=sk-admin firew2oai:latest
 | `-host` | `HOST` | `""` | 监听地址，空表示所有网卡 |
 | `-api-key` | `API_KEY` | `sk-admin` | API Key 配置（见下文） |
 | `-timeout` | `TIMEOUT` | `120` | 上游超时（秒） |
+| `-upstream-retry-count` | `UPSTREAM_RETRY_COUNT` | `1` | 首包前瞬时失败重试次数，适用于发送失败与 `429/502/503/504` |
+| `-upstream-retry-backoff-ms` | `UPSTREAM_RETRY_BACKOFF_MS` | `200` | 首包前瞬时失败重试基础退避（毫秒） |
+| `-upstream-empty-retry-count` | `UPSTREAM_EMPTY_RETRY_COUNT` | `1` | 上游已返回 `200` 但在任何内容或 `done` 信号前空结束时的重试次数 |
+| `-upstream-empty-retry-backoff-ms` | `UPSTREAM_EMPTY_RETRY_BACKOFF_MS` | `200` | 空流重试基础退避（毫秒） |
 | `-log-level` | `LOG_LEVEL` | `info` | `debug/info/warn/error` |
 | `-show-thinking` | `SHOW_THINKING` | `false` | 是否输出 thinking 内容 |
 | `-cors-origins` | `CORS_ORIGINS` | `*` | 允许跨域来源 |
 | `-rate-limit` | `RATE_LIMIT` | `0` | 全局每 Key 每分钟限流，0 表示关闭 |
 | `-ip-whitelist` | `IP_WHITELIST` | `127.0.0.1,::1` | 允许访问 IP/CIDR |
 | `-trusted-proxy-count` | `TRUSTED_PROXY_COUNT` | `0` | 信任代理层数 |
+
+### 上游重试策略
+
+项目当前把上游容错拆成两层，默认都保守开启，且都可通过重试次数设为 `0` 关闭：
+
+- `UPSTREAM_RETRY_COUNT` / `UPSTREAM_RETRY_BACKOFF_MS`
+  只处理首包前的基础设施级瞬时失败，包括发送失败以及 `429/502/503/504`。
+- `UPSTREAM_EMPTY_RETRY_COUNT` / `UPSTREAM_EMPTY_RETRY_BACKOFF_MS`
+  只处理“上游已经返回 `200`，但在任何内容或 `done` 信号前就空结束”的情况，适用于 `/v1/chat/completions` 和 `/v1/responses`。
+
+约束边界：
+
+- 只在尚未向客户端产出任何正文内容前重试。
+- 一旦已经收到正文内容，即使上游后续中断，也不会透明重试，避免把有状态输出重复播放给客户端。
+- 这两层重试都只覆盖瞬时上游扰动，不覆盖模型语义错误、协议跑偏或 finalize 收口失败。
 
 ### API Key 配置格式
 

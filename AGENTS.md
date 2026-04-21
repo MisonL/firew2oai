@@ -41,9 +41,12 @@
 当前仓库对 Codex 的主适配目标是 `/v1/responses`，新增协议兼容改动、回归测试和真实链路验证都以该接口为准。
 
 - 只读型 Coding 审计任务当前已经稳定，真实写代码任务不能默认假设“所有模型都稳定可用”。
-- 最新真实链路验证见 [docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md](/Volumes/Work/code/firew2oai/docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-20.md)；当前应以该文档和 `README.md` 为准，不要沿用更早的口头结论。
-- 该验证只代表最后一次 `glm-5` 经 `Codex -> new-api -> firew2oai` 的真实链路测试，不代表全模型矩阵。
+- 最新真实链路验证见 [docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md](/Volumes/Work/code/firew2oai/docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md)；当前应以该文档和 `README.md` 为准，不要沿用更早的口头结论。
+- 当前综合结论不是单模型样本，而是 `Codex -> new-api -> firew2oai` 真实链路下、5 类 Coding 场景的全模型分梯队结果。
+- 当前第一梯队模型已经在真实 Coding 场景达到 `5/5 PASS`；第二梯队问题主要是 `completion signal` 异常，第三梯队问题主要是上游空结束或长尾超时。
 - 走 `new-api -> firew2oai` 正式链路时，如同模型存在多渠道，必须先确认 `firew2oai` 渠道优先级最高，否则测试结果不能代表本项目适配效果。
 - 与 Codex 兼容性直接相关的高风险边界仍集中在 `apply_patch`、`tool_choice`、四行收口和 finalize 收口稳定性，修改这些路径后必须补对应回归测试。
+- 上游重试当前分两层：`transport` 负责首包前瞬时失败（发送失败、`429/502/503/504`），`proxy` 负责上游 `200` 但在任何内容或 `done` 信号前空结束；修改重试逻辑时必须分别验证启用与禁用场景。
+- 任何透明重试都只能发生在“尚未向客户端输出正文内容”之前；一旦已经输出正文内容，不得静默重放上游请求。
 - 如果模型未按协议产出工具块、错误把自述文本写进 `FILES`/`NOTE`、或在 finalize 阶段漂移，先检查是否属于当前已知适配层误差：
   `task_intent.go` 的命令抽取、`output_constraints.go` 的标签推断、`execution_policy.go` 的写入完成态识别；确认排除这些路径后，再归因为模型能力或上游扰动。
