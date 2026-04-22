@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 from pathlib import Path
+import struct
+import zlib
 
 
 MODELS = [
@@ -25,6 +27,8 @@ class Scenario:
     expected_operations: tuple[str, ...]
     expected_files: tuple[str, ...]
     capabilities: tuple[str, ...]
+    required_tools: tuple[str, ...] = ()
+    expected_signals: tuple[str, ...] = ()
     expect_clean_diff: bool = False
 
 
@@ -48,6 +52,7 @@ SCENARIOS = (
         ),
         expected_files=(),
         capabilities=("read", "package_test", "repo_test", "no_write", "structured_final"),
+        required_tools=("exec_command",),
         expect_clean_diff=True,
     ),
     Scenario(
@@ -66,6 +71,7 @@ SCENARIOS = (
         ),
         expected_files=("internal/proxy/output_constraints_test.go",),
         capabilities=("read", "style_inspection", "create_file", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
     ),
     Scenario(
         name="fix_existing_bug",
@@ -84,6 +90,7 @@ SCENARIOS = (
         ),
         expected_files=("internal/codexfixture/bugfix/port.go",),
         capabilities=("read", "edit_existing", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
     ),
     Scenario(
         name="search_and_patch",
@@ -104,6 +111,7 @@ SCENARIOS = (
         ),
         expected_files=("internal/codexfixture/searchfix/summary.go",),
         capabilities=("repo_search", "read", "edit_existing", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
     ),
     Scenario(
         name="cross_file_feature",
@@ -127,6 +135,232 @@ SCENARIOS = (
             "internal/codexfixture/feature/formatter_test.go",
         ),
         capabilities=("create_file", "edit_existing", "cross_file", "update_tests", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
+    ),
+    Scenario(
+        name="plan_then_read",
+        prompt=(
+            "你是测试代理。请在当前仓库完成一个计划驱动的只读任务：\n"
+            "1) 必须先调用 update_plan。\n"
+            "2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n"
+            "3) plan 里只写两个步骤：Inspect README.md、Reply with summary。\n"
+            "4) 然后必须使用 exec_command 执行 `head -n 3 README.md`。\n"
+            "5) 不要修改任何文件。\n"
+            "最后只输出四行，不要有任何额外内容：\n"
+            "RESULT: PASS 或 FAIL\n"
+            "FILES: 你读取的文件\n"
+            "TEST: N/A\n"
+            "NOTE: 你是否先成功调用了 update_plan"
+        ),
+        expected_operations=("README.md",),
+        expected_files=(),
+        capabilities=("planning", "read", "structured_final"),
+        required_tools=("update_plan", "exec_command"),
+        expected_signals=("update_plan", "command_execution"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="interactive_shell_session",
+        prompt=(
+            "你是测试代理。请验证交互式 shell 会话能力：\n"
+            "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n"
+            "2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。\n"
+            "3) 禁止使用 python3 -c、here-doc 或一次性命令替代 write_stdin。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 交互式会话结果。"
+        ),
+        expected_operations=("python3",),
+        expected_files=(),
+        capabilities=("exec_command", "write_stdin", "interactive_session", "structured_final"),
+        required_tools=("exec_command", "write_stdin"),
+        expected_signals=("write_stdin", "command_execution"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="js_repl_roundtrip",
+        prompt=(
+            "你是测试代理。请验证 js_repl：\n"
+            "1) 必须先使用 js_repl 计算数组 [2,3,5] 的和。\n"
+            "2) 然后调用 js_repl_reset。\n"
+            "3) 再次使用 js_repl 计算 7 * 8。\n"
+            "4) 不要使用 exec_command 代替 js_repl。\n"
+            "5) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: js_repl 两次计算结果。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("js_repl", "js_repl_reset", "structured_final"),
+        required_tools=("js_repl", "js_repl_reset"),
+        expected_signals=("js_repl", "js_repl_reset"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="web_search_probe",
+        prompt=(
+            "你是测试代理。请验证 web_search：\n"
+            "1) 必须使用 web_search 查询 Go 官方最新稳定版本与发布日期。\n"
+            "2) 禁止使用 exec_command、docfork 或其他工具代替 web_search。\n"
+            "3) web_search 返回后，必须直接用四行格式收口，不要输出前言或解释工具行为。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("web_search", "structured_final"),
+        required_tools=("web_search",),
+        expected_signals=("web_search",),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="context7_probe",
+        prompt=(
+            "你是测试代理。请验证 Context7 MCP：\n"
+            "1) 必须使用 mcp__context7__resolve-library-id 查找 react。\n"
+            "2) 必须再使用 mcp__context7__get-library-docs 获取 useEffectEvent 相关文档。\n"
+            "3) 禁止使用 exec_command、docfork 或其他工具代替 Context7。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_context7", "structured_final"),
+        required_tools=("mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"),
+        expected_signals=("context7", "resolve_library_id", "get_library_docs"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="docfork_probe",
+        prompt=(
+            "你是测试代理。请验证 Docfork MCP：\n"
+            "1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n"
+            "2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n"
+            "3) 禁止使用 web_search 代替 Docfork。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_docfork", "structured_final"),
+        required_tools=("mcp__docfork__search_docs", "mcp__docfork__fetch_doc"),
+        expected_signals=("docfork", "search_docs", "fetch_doc"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="cloudflare_spec_probe",
+        prompt=(
+            "你是测试代理。请验证 Cloudflare API MCP：\n"
+            "1) 必须使用 mcp__cloudflare_api__search。\n"
+            "2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n"
+            "3) 返回两个对象即可，每个对象至少包含 method 和 path。\n"
+            "4) 禁止调用 execute。\n"
+            "5) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你找到的两个 path。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_cloudflare", "structured_final"),
+        required_tools=("mcp__cloudflare_api__search",),
+        expected_signals=("cloudflare_api", "search"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="apply_patch_probe",
+        prompt=(
+            "你是测试代理。请验证 apply_patch：\n"
+            "1) 先读取 internal/codexfixture/patchprobe/message.txt。\n"
+            "2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。\n"
+            "3) 再读取同一文件确认内容已经变成 beta。\n"
+            "4) 最后只输出四行：RESULT: PASS 或 FAIL；FILES: internal/codexfixture/patchprobe/message.txt；TEST: N/A；NOTE: 修改后的内容。"
+        ),
+        expected_operations=("internal/codexfixture/patchprobe/message.txt",),
+        expected_files=("internal/codexfixture/patchprobe/message.txt",),
+        capabilities=("read", "apply_patch", "structured_final"),
+        required_tools=("exec_command", "apply_patch"),
+        expected_signals=("apply_patch",),
+    ),
+    Scenario(
+        name="chrome_devtools_probe",
+        prompt=(
+            "你是测试代理。请验证 Chrome DevTools MCP：\n"
+            "1) 必须使用 mcp__chrome_devtools__new_page 打开这个 data URL："
+            "data:text/html,%3Cbutton%20id%3D%22go%22%20onclick%3D%22document.getElementById('status').textContent%3D'clicked'%22%3EGo%3C%2Fbutton%3E%3Cdiv%20id%3D%22status%22%3Eidle%3C%2Fdiv%3E\n"
+            "2) 然后必须使用 mcp__chrome_devtools__take_snapshot。\n"
+            "3) 再必须使用 mcp__chrome_devtools__click 点击按钮。\n"
+            "4) 最后必须使用 mcp__chrome_devtools__wait_for 等待页面出现 clicked。\n"
+            "5) 禁止使用 exec_command 代替浏览器工具。\n"
+            "6) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 页面最终状态。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_chrome_devtools", "structured_final"),
+        required_tools=(
+            "mcp__chrome_devtools__new_page",
+            "mcp__chrome_devtools__take_snapshot",
+            "mcp__chrome_devtools__click",
+            "mcp__chrome_devtools__wait_for",
+        ),
+        expected_signals=("chrome_devtools", "new_page", "take_snapshot", "click", "wait_for"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="view_image_probe",
+        prompt=(
+            "你是测试代理。请验证 view_image：\n"
+            "1) 必须先使用 exec_command 执行 `pwd`，读取当前工作目录绝对路径。\n"
+            "2) 然后必须使用 view_image 查看 internal/codexfixture/assets/red.png。\n"
+            "3) 不要修改任何文件。\n"
+            "最后只输出四行，不要有任何额外内容：\n"
+            "RESULT: PASS 或 FAIL\n"
+            "FILES: internal/codexfixture/assets/red.png\n"
+            "TEST: N/A\n"
+            "NOTE: 图片主颜色"
+        ),
+        expected_operations=("pwd",),
+        expected_files=(),
+        capabilities=("view_image", "read", "structured_final"),
+        required_tools=("exec_command", "view_image"),
+        expected_signals=("view_image",),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="subagent_probe",
+        prompt=(
+            "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n"
+            "1) 必须使用 spawn_agent 启动一个子代理。\n"
+            "2) 子代理任务是读取 README.md 第一行并返回结果。\n"
+            "3) 必须使用 wait_agent 等待结果。\n"
+            "4) 必须使用 close_agent 关闭子代理。\n"
+            "5) 不要修改任何文件。\n"
+            "最后只输出四行，不要有任何额外内容：\n"
+            "RESULT: PASS 或 FAIL\n"
+            "FILES: README.md\n"
+            "TEST: N/A\n"
+            "NOTE: 子代理返回的第一行内容"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("spawn_agent", "wait_agent", "close_agent", "structured_final"),
+        required_tools=("spawn_agent", "wait_agent", "close_agent"),
+        expected_signals=("spawn_agent", "wait_agent", "close_agent"),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="mcp_resource_listing_probe",
+        prompt=(
+            "你是测试代理。请验证通用 MCP 资源发现接口：\n"
+            "1) 必须调用 list_mcp_resources。\n"
+            "2) 必须调用 list_mcp_resource_templates。\n"
+            "3) 如果结果为空就如实说明为空，不要虚构资源。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 当前资源与模板是否为空。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_resources", "structured_final"),
+        required_tools=("list_mcp_resources", "list_mcp_resource_templates"),
+        expected_signals=("list_mcp_resources", "list_mcp_resource_templates"),
+        expect_clean_diff=True,
     ),
 )
 
@@ -136,7 +370,34 @@ def write_text(path: Path, content: str) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def write_png(path: Path, width: int, height: int, rgb: tuple[int, int, int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    raw = bytearray()
+    row = bytes(rgb) * width
+    for _ in range(height):
+        raw.append(0)
+        raw.extend(row)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    png = bytearray(b"\x89PNG\r\n\x1a\n")
+    png.extend(chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)))
+    png.extend(chunk(b"IDAT", zlib.compress(bytes(raw), level=9)))
+    png.extend(chunk(b"IEND", b""))
+    path.write_bytes(bytes(png))
+
+
 def prepare_fixture(worktree: Path, scenario_name: str) -> None:
+    if scenario_name == "view_image_probe":
+        write_png(worktree / "internal/codexfixture/assets/red.png", 24, 24, (255, 0, 0))
+    if scenario_name == "apply_patch_probe":
+        write_text(worktree / "internal/codexfixture/patchprobe/message.txt", "alpha\n")
     if scenario_name == "fix_existing_bug":
         write_text(
             worktree / "internal/codexfixture/bugfix/port.go",
