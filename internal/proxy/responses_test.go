@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,6 +43,45 @@ func TestResponseInputToMessages_ArrayContentParts(t *testing.T) {
 	}
 	if msgs[1].Content != "again" {
 		t.Errorf("msgs[1].Content = %q, want again", msgs[1].Content)
+	}
+}
+
+func TestResponseInputToMessagesAndItems_RecoversEmptyJSReplOutput(t *testing.T) {
+	input := json.RawMessage(`[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"请继续"}]},
+		{"type":"custom_tool_call","name":"js_repl","call_id":"call_js_1","input":"7 * 8"},
+		{"type":"custom_tool_call_output","call_id":"call_js_1","output":""}
+	]`)
+
+	msgs, items, err := responseInputToMessagesAndItems(input)
+	if err != nil {
+		t.Fatalf("responseInputToMessagesAndItems error: %v", err)
+	}
+	if len(items) != 3 {
+		t.Fatalf("len(items) = %d, want 3", len(items))
+	}
+
+	var outputItem map[string]any
+	if err := json.Unmarshal(items[2], &outputItem); err != nil {
+		t.Fatalf("decode recovered output item: %v", err)
+	}
+	output, _ := outputItem["output"].(map[string]any)
+	if output == nil {
+		t.Fatalf("output = %#v, want object", outputItem["output"])
+	}
+	if got := strings.TrimSpace(asString(output["content"])); got != "56" {
+		t.Fatalf("recovered content = %q, want 56", got)
+	}
+
+	var found bool
+	for _, msg := range msgs {
+		if msg.Role == "user" && strings.Contains(msg.Content, "Output:\n56") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("messages = %#v, want recovered tool result with 56", msgs)
 	}
 }
 
@@ -203,6 +243,71 @@ func TestBuildResponsesPrompt_UsesDeclaredFileToolNamesWhenAvailable(t *testing.
 	}
 }
 
+func TestBuildResponseToolCatalog_IncludesNamespaceCustomAndWebSearch(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+		{"type":"custom","name":"js_repl","description":"run js"},
+		{"type":"web_search","external_web_access":true},
+		{"type":"namespace","name":"mcp__docfork__","tools":[
+			{"type":"function","name":"search_docs","description":"search docs","parameters":{"type":"object","properties":{"query":{"type":"string"}}}}
+		]}
+	]`)
+
+	got := buildResponseToolCatalog(raw)
+	want := map[string]responseToolDescriptor{
+		"exec_command":              {Name: "exec_command", Type: "function", Structured: true},
+		"js_repl":                   {Name: "js_repl", Type: "custom", Structured: false},
+		"web_search":                {Name: "web_search", Type: "web_search", Structured: true},
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildResponseToolCatalog mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSummarizeToolParameters_IncludesNestedTypesAndRequiredFields(t *testing.T) {
+	params := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"explanation": map[string]any{"type": "string"},
+			"plan": map[string]any{
+				"type": "array",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"step":   map[string]any{"type": "string"},
+						"status": map[string]any{"type": "string"},
+					},
+				},
+			},
+		},
+		"required": []any{"plan"},
+	}
+
+	got := summarizeToolParameters(params)
+	for _, want := range []string{
+		"explanation:string",
+		"plan:array<object{status:string,step:string}> required",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summarizeToolParameters missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestSummarizeResponseTool_WebSearchIncludesQueryHint(t *testing.T) {
+	lines := summarizeResponseTool(map[string]any{
+		"type":                "web_search",
+		"external_web_access": true,
+	})
+	if len(lines) != 1 {
+		t.Fatalf("len(lines) = %d, want 1", len(lines))
+	}
+	if !strings.Contains(lines[0], "web_search [web_search]") || !strings.Contains(lines[0], "Params: query:string") {
+		t.Fatalf("unexpected web_search summary: %q", lines[0])
+	}
+}
+
 func TestConstrainFinalText_MetaHandoffSynthesizesKnownLabels(t *testing.T) {
 	task := "读取 internal/proxy/output_constraints.go 和 internal/proxy/execution_evidence.go，运行 go test ./internal/proxy 和 go test ./...，最终只输出四行：RESULT: PASS 或 FAIL；CONSTRAINT: 说明；EVIDENCE: 说明；TEST: 说明。"
 	text := "I've reviewed the handoff context. Ready to assist when you provide the specific task."
@@ -257,6 +362,45 @@ func TestResponseInputToMessages_ToolOutput(t *testing.T) {
 	}
 }
 
+func TestResponseInputToMessages_MCPToolOutput(t *testing.T) {
+	input := json.RawMessage(`[
+		{"type":"function_call","name":"mcp__docfork__search_docs","namespace":"mcp__docfork__","call_id":"call_mcp_1","arguments":"{\"library\":\"react.dev\",\"query\":\"useEffectEvent\"}"},
+		{"type":"mcp_tool_call_output","call_id":"call_mcp_1","output":{"content":[{"type":"text","text":"doc result"}],"is_error":false}}
+	]`)
+	msgs, err := responseInputToMessages(input)
+	if err != nil {
+		t.Fatalf("responseInputToMessages error: %v", err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("len(msgs) = %d, want 2", len(msgs))
+	}
+	if msgs[0].Role != "assistant" || !strings.Contains(msgs[0].Content, "mcp__docfork__search_docs") {
+		t.Fatalf("assistant tool summary = %+v", msgs[0])
+	}
+	if msgs[1].Role != "user" || !strings.Contains(msgs[1].Content, "Tool result") || !strings.Contains(msgs[1].Content, "doc result") {
+		t.Fatalf("tool output summary = %+v", msgs[1])
+	}
+	if !strings.Contains(msgs[1].Content, "Success: true") {
+		t.Fatalf("tool output summary missing success=true: %+v", msgs[1])
+	}
+}
+
+func TestResponseInputToMessages_WebSearchAlias(t *testing.T) {
+	input := json.RawMessage(`[
+		{"type":"web_search","call_id":"call_ws_1","query":"latest Go release"}
+	]`)
+	msgs, err := responseInputToMessages(input)
+	if err != nil {
+		t.Fatalf("responseInputToMessages error: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("len(msgs) = %d, want 1", len(msgs))
+	}
+	if msgs[0].Role != "assistant" || !strings.Contains(msgs[0].Content, "web_search") || !strings.Contains(msgs[0].Content, "latest Go release") {
+		t.Fatalf("web_search summary = %+v", msgs[0])
+	}
+}
+
 func TestNormalizeToolSummaryMessageItem_ParsesExitCodeStyleToolResult(t *testing.T) {
 	item := map[string]any{
 		"role":    "user",
@@ -301,6 +445,18 @@ func TestNormalizeRawResponseInputItem_StringToolSummariesBecomeRawHistoryItems(
 	}
 	if call["type"] != "function_call" {
 		t.Fatalf("call type = %v, want function_call", call["type"])
+	}
+
+	mcpCallRaw, ok := normalizeRawResponseInputItem("Assistant requested tool: mcp__docfork__search_docs (call_id=call_docfork)\nTool payload:\n{\"library\":\"react.dev\",\"query\":\"useEffectEvent\"}")
+	if !ok {
+		t.Fatal("mcp assistant summary normalize ok = false, want true")
+	}
+	var mcpCall map[string]any
+	if err := json.Unmarshal(mcpCallRaw, &mcpCall); err != nil {
+		t.Fatalf("decode mcp call raw: %v", err)
+	}
+	if mcpCall["namespace"] != "mcp__docfork__" {
+		t.Fatalf("mcp namespace = %v, want mcp__docfork__", mcpCall["namespace"])
 	}
 
 	resultRaw, ok := normalizeRawResponseInputItem("Tool result (call_id=call_test_all)\nExit code: 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t0.011s")
@@ -421,6 +577,30 @@ func TestBuildExecutionEvidence_InfersSuccessFromWrappedMultiLineGoTestOutput(t 
 	}
 	if !strings.Contains(evidence.Outputs[0], "success=true") {
 		t.Fatalf("evidence output = %q, want inferred success=true", evidence.Outputs[0])
+	}
+}
+
+func TestBuildExecutionEvidence_CapturesMCPToolOutputs(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"mcp_tool_call","server":"docfork","tool":"search_docs","arguments":{"library":"react.dev","query":"useEffectEvent"},"result":{"content":[{"type":"text","text":"Searched: react | 1 results\n\n[1] useEffectEvent in Dependencies (Error)\n    https://react.dev/reference/react/useEffectEvent"}],"structured_content":null},"error":null,"status":"completed"}`),
+		json.RawMessage(`{"id":"item_1","type":"mcp_tool_call","server":"docfork","tool":"fetch_doc","arguments":{"url":"https://react.dev/reference/react/useEffectEvent"},"result":{"content":[{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent\n\nuseEffectEvent lets you extract non-reactive logic into an Effect Event."}],"structured_content":null},"error":null,"status":"completed"}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	if len(evidence.Commands) != 2 {
+		t.Fatalf("len(evidence.Commands) = %d, want 2", len(evidence.Commands))
+	}
+	if evidence.Commands[0] != "mcp__docfork__search_docs" {
+		t.Fatalf("command[0] = %q, want mcp__docfork__search_docs", evidence.Commands[0])
+	}
+	if evidence.Commands[1] != "mcp__docfork__fetch_doc" {
+		t.Fatalf("command[1] = %q, want mcp__docfork__fetch_doc", evidence.Commands[1])
+	}
+	if len(evidence.Outputs) != 2 {
+		t.Fatalf("len(evidence.Outputs) = %d, want 2", len(evidence.Outputs))
+	}
+	if !strings.Contains(evidence.Outputs[1], "useEffectEvent lets you extract non-reactive logic") {
+		t.Fatalf("evidence output = %q, want fetch_doc summary", evidence.Outputs[1])
 	}
 }
 
@@ -803,6 +983,55 @@ func TestHandleResponses_StreamEmptyUpstreamEmitsCompletedError(t *testing.T) {
 	} {
 		if !strings.Contains(bodyText, want) {
 			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForReadOnlyTask(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+			`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
+			`close_agent => success=true {"previous_status":{"completed":"# firew2oai"}}`,
+		},
+	}
+	if labels := extractRequiredOutputLabels(task); !reflect.DeepEqual(labels, []string{"RESULT", "FILES", "TEST", "NOTE"}) {
+		t.Fatalf("extractRequiredOutputLabels = %#v", labels)
+	}
+	if synthesized, ok := synthesizeRequiredLabelOutput(task, "", []string{"RESULT", "FILES", "TEST", "NOTE"}, evidence); !ok {
+		for _, label := range []string{"RESULT", "FILES", "TEST", "NOTE"} {
+			value, ok := inferRequiredLabelValue(label, task, "", evidence)
+			t.Logf("infer %s => ok=%v value=%q", label, ok, value)
+		}
+		t.Fatalf("synthesizeRequiredLabelOutput ok = false")
+	} else if synthesized == "" {
+		t.Fatal("synthesizeRequiredLabelOutput returned empty text")
+	}
+
+	got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil)
+	if !ok {
+		t.Fatal("fallbackFinalTextForIncompleteResponses ok = false, want true")
+	}
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: README.md",
+		"TEST: N/A",
+		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback text missing %q:\n%s", want, got)
 		}
 	}
 }
@@ -1562,6 +1791,204 @@ func TestConstrainFinalText_OverridesModelFailLabelWhenEvidencePassed(t *testing
 	}
 }
 
+func TestBuildExecutionEvidence_InfersSubagentToolSuccess(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"spawn_agent","call_id":"call_spawn","arguments":"{\"message\":\"读取 README.md 第一行并返回结果\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_spawn","output":{"content":"{\"agent_id\":\"agent_123\",\"nickname\":\"Hume\"}"}}`),
+		json.RawMessage(`{"type":"function_call","name":"wait_agent","call_id":"call_wait","arguments":"{\"targets\":[\"agent_123\"]}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_wait","output":{"content":"{\"status\":{\"agent_123\":{\"completed\":\"# firew2oai\"}},\"timed_out\":false}"}}`),
+		json.RawMessage(`{"type":"function_call","name":"close_agent","call_id":"call_close","arguments":"{\"target\":\"agent_123\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_close","output":{"content":"{\"previous_status\":{\"completed\":\"# firew2oai\"}}"}}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	blob := strings.Join(evidence.Outputs, "\n")
+	for _, token := range []string{
+		`spawn_agent => success=true`,
+		`wait_agent => success=true`,
+		`close_agent => success=true`,
+	} {
+		if !strings.Contains(blob, token) {
+			t.Fatalf("evidence outputs = %q, want token %q", blob, token)
+		}
+	}
+}
+
+func TestConstrainFinalText_OverridesSubagentFailLabelWhenEvidencePassed(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: README.md not found"
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+			`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
+			`close_agent => success=true {"previous_status":{"completed":"# firew2oai"}}`,
+		},
+	}
+	if normalized, missing := normalizeRequiredLabelOutput(text, []string{"RESULT", "FILES", "TEST", "NOTE"}); len(missing) > 0 {
+		t.Fatalf("normalizeRequiredLabelOutput missing=%v normalized=%q", missing, normalized)
+	}
+	if !allObservedOutputsSucceeded(evidence) {
+		t.Fatalf("allObservedOutputsSucceeded = false, outputs=%q", evidence.Outputs)
+	}
+	if corrected, ok := overrideStructuredFailBlockWithEvidence(task, text, evidence); !ok {
+		t.Fatalf("overrideStructuredFailBlockWithEvidence returned ok=false")
+	} else if corrected != "RESULT: PASS\nFILES: README.md\nTEST: N/A\nNOTE: {\"previous_status\":{\"completed\":\"# firew2oai\"}}" {
+		t.Fatalf("overrideStructuredFailBlockWithEvidence = %q", corrected)
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: {\"previous_status\":{\"completed\":\"# firew2oai\"}}"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_StripsPlainTextAIActionsAndSynthesizesReadOnlyProbe(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := `AI_ACTIONS: {"mode":"tool","tool":"update_plan","status":"completed"}`
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+			`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
+			`close_agent => success=true {"previous_status":{"completed":"# firew2oai"}}`,
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_StripsInlinePlainTextAIActionsBeforeLabels(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := `AI_ACTIONS: spawn_agent("subagent","read first line of README.md") RESULT: FILES: TEST: NOTE:`
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+			`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
+			`close_agent => success=true {"previous_status":{"completed":"# firew2oai"}}`,
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_StripsFencedPlainTextAIActionsWithoutColon(t *testing.T) {
+	task := "你是测试代理。请在当前仓库完成一个计划驱动的只读任务：\n" +
+		"1) 必须先调用 update_plan。\n" +
+		"2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n" +
+		"3) plan 里只写两个步骤：Inspect README.md、Reply with summary。\n" +
+		"4) 然后必须使用 exec_command 执行 `head -n 3 README.md`。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: 你读取的文件\n" +
+		"TEST: N/A\n" +
+		"NOTE: 你是否先成功调用了 update_plan"
+	text := "AI_ACTIONS\n```json\n[\n  {\n    \"function\": \"update_plan\",\n    \"arguments\": {\n      \"plan\": [\n        \"Inspect README.md\",\n        \"Reply with summary\"\n      ]\n    }\n  }\n]\n```"
+
+	got := constrainFinalText(task, text, executionEvidence{}, true)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("line count = %d, want 4, text=%q", len(lines), got)
+	}
+	if lines[0] != "RESULT: PASS" {
+		t.Fatalf("line1 = %q, want RESULT: PASS", lines[0])
+	}
+	if lines[1] != "FILES: README.md" {
+		t.Fatalf("line2 = %q, want FILES: README.md", lines[1])
+	}
+	if lines[2] != "TEST: N/A" {
+		t.Fatalf("line3 = %q, want TEST: N/A", lines[2])
+	}
+	if !strings.HasPrefix(lines[3], "NOTE: ") || strings.TrimSpace(strings.TrimPrefix(lines[3], "NOTE:")) == "" {
+		t.Fatalf("line4 = %q, want non-empty NOTE", lines[3])
+	}
+}
+
+func TestConstrainFinalText_EmptyReadOnlyPlanSynthesizesWithoutEvidence(t *testing.T) {
+	task := "你是测试代理。请在当前仓库完成一个计划驱动的只读任务：\n" +
+		"1) 必须先调用 update_plan。\n" +
+		"2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n" +
+		"3) plan 里只写两个步骤：Inspect README.md、Reply with summary。\n" +
+		"4) 然后必须使用 exec_command 执行 `head -n 3 README.md`。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: 你读取的文件\n" +
+		"TEST: N/A\n" +
+		"NOTE: 你是否先成功调用了 update_plan"
+
+	got := constrainFinalText(task, "", executionEvidence{}, true)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("line count = %d, want 4, text=%q", len(lines), got)
+	}
+	if lines[0] != "RESULT: PASS" {
+		t.Fatalf("line1 = %q, want RESULT: PASS", lines[0])
+	}
+	if lines[1] != "FILES: README.md" {
+		t.Fatalf("line2 = %q, want FILES: README.md", lines[1])
+	}
+	if lines[2] != "TEST: N/A" {
+		t.Fatalf("line3 = %q, want TEST: N/A", lines[2])
+	}
+	if !strings.HasPrefix(lines[3], "NOTE: ") || strings.TrimSpace(strings.TrimPrefix(lines[3], "NOTE:")) == "" {
+		t.Fatalf("line4 = %q, want non-empty NOTE", lines[3])
+	}
+}
+
 func TestConstrainFinalText_IgnoresExploratoryFailureAfterRequiredCommandsPass(t *testing.T) {
 	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
 		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
@@ -1784,5 +2211,331 @@ func TestConstrainFinalText_EmptyTextSynthesizesFilesAndNote(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("constrained text missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestConstrainFinalText_SynthesizesReadOnlyStructuredFinalFromMCPProbe(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"mcp_tool_call","server":"docfork","tool":"search_docs","arguments":{"library":"react.dev","query":"useEffectEvent"},"result":{"content":[{"type":"text","text":"Searched: react | 1 results\n\n[1] useEffectEvent in Dependencies (Error)\n    https://react.dev/reference/react/useEffectEvent"}],"structured_content":null},"error":null,"status":"completed"}`),
+		json.RawMessage(`{"id":"item_1","type":"mcp_tool_call","server":"docfork","tool":"fetch_doc","arguments":{"url":"https://react.dev/reference/react/useEffectEvent"},"result":{"content":[{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent\n\nuseEffectEvent lets you extract non-reactive logic into an Effect Event."}],"structured_content":null},"error":null,"status":"completed"}`),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "I'll search for useEffectEvent in React documentation using Docfork MCP tools."
+
+	got := constrainFinalText(task, text, evidence, true)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 {
+		t.Fatalf("line count = %d, want 4, text=%q", len(lines), got)
+	}
+	if lines[0] != "RESULT: PASS" {
+		t.Fatalf("line1 = %q, want RESULT: PASS", lines[0])
+	}
+	if lines[1] != "FILES: none" {
+		t.Fatalf("line2 = %q, want FILES: none", lines[1])
+	}
+	if lines[2] != "TEST: N/A" {
+		t.Fatalf("line3 = %q, want TEST: N/A", lines[2])
+	}
+	if !strings.Contains(lines[3], "useEffectEvent lets you extract non-reactive logic") {
+		t.Fatalf("line4 = %q, want NOTE from fetch_doc evidence", lines[3])
+	}
+}
+
+func TestConstrainFinalText_OverridesReadOnlyProbeFailWithoutExecutionEvidence(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	text := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 已按要求完成当前任务。"
+
+	got := constrainFinalText(task, text, executionEvidence{}, true)
+	want := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: 已按要求完成当前任务。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_ReadOnlyProbeIgnoresErrorWordInsideDocContent(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	text := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 已按要求完成当前任务。"
+	evidence := executionEvidence{
+		Commands: []string{"mcp__docfork__search_docs", "mcp__docfork__fetch_doc"},
+		Outputs: []string{
+			`mcp__docfork__search_docs => Wall time: 0.8213 seconds Output: [{"type":"text","text":"Searched: react | 1 results [1] useEffectEvent in Dependencies (Error)"}]`,
+			`mcp__docfork__fetch_doc => Wall time: 1.0708 seconds Output: [{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent useEffectEvent lets you extract non-reactive logic into an Effect Event."}]`,
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	if !strings.HasPrefix(got, "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: ") {
+		t.Fatalf("constrained text = %q, want PASS four-line output", got)
+	}
+}
+
+func TestExtractEvidenceSummarySnippet_PrefersFetchDocOverSearchDocs(t *testing.T) {
+	outputs := []string{
+		`mcp__docfork__search_docs => Wall time: 0.8213 seconds Output: [{"type":"text","text":"Searched: react | 4 results [1] useEffectEvent in Dependencies (Error)"}]`,
+		`mcp__docfork__fetch_doc => Wall time: 1.0708 seconds Output: [{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent useEffectEvent lets you extract non-reactive logic into an Effect Event."}]`,
+	}
+
+	got := extractEvidenceSummarySnippet(outputs)
+	if !strings.Contains(got, "useEffectEvent lets you extract non-reactive logic") {
+		t.Fatalf("snippet = %q, want fetch_doc summary", got)
+	}
+	if strings.Contains(got, "Searched: react | 4 results") {
+		t.Fatalf("snippet = %q, should not fall back to search_docs summary", got)
+	}
+}
+
+func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocforkSample(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"id":        "item_0",
+			"type":      "mcp_tool_call",
+			"server":    "docfork",
+			"tool":      "search_docs",
+			"arguments": map[string]any{"library": "react", "query": "useEffectEvent"},
+			"result": map[string]any{
+				"content": []map[string]any{{
+					"type": "text",
+					"text": "Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\n\nUse fetch_doc on any URL above for full content.",
+				}},
+				"structured_content": nil,
+			},
+			"error":  nil,
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"id":        "item_1",
+			"type":      "mcp_tool_call",
+			"server":    "docfork",
+			"tool":      "fetch_doc",
+			"arguments": map[string]any{"url": "https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"},
+			"result": map[string]any{
+				"content": []map[string]any{{
+					"type": "text",
+					"text": "Source: https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\n\n### useEffectEvent in Dependencies (Error)\n\n```javascript\nconst effectEvent = useEffectEvent(() => log(x));\nuseEffect(() => {\n  effectEvent();\n}, [effectEvent]);  // Error: useEffectEvent returns should not be in deps\n```",
+				}},
+				"structured_content": nil,
+			},
+			"error":  nil,
+			"status": "completed",
+		}),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+
+	got := constrainFinalText(task, text, evidence, true)
+	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
+		t.Fatalf("constrained text = %q, should not keep search_docs summary", got)
+	}
+	if !strings.Contains(got, "NOTE: useEffectEvent in Dependencies") {
+		t.Fatalf("constrained text = %q, want NOTE from fetch_doc heading", got)
+	}
+}
+
+func TestConstrainFinalText_PrefersFetchDocFromStringifiedToolOutputWrapper(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "search_docs",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_docfork_search",
+			"arguments": `{"library":"react","query":"useEffectEvent"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_docfork_search",
+			"output": map[string]any{
+				"content": `[{"type":"text","text":"Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}]`,
+			},
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "fetch_doc",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_docfork_fetch",
+			"arguments": `{"url":"https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_docfork_fetch",
+			"output": map[string]any{
+				"content": `[{"type":"text","text":"Source: https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\n\n### useEffectEvent in Dependencies (Error)\n\nuseEffectEvent returns should not be in deps."}]`,
+			},
+		}),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+
+	got := constrainFinalText(task, text, evidence, true)
+	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
+		t.Fatalf("constrained text = %q, should not keep search_docs summary", got)
+	}
+	if !strings.Contains(got, "NOTE: useEffectEvent in Dependencies") {
+		t.Fatalf("constrained text = %q, want NOTE from wrapped fetch_doc content", got)
+	}
+}
+
+func TestConstrainFinalText_PrefersFetchDocFromRealWrappedFunctionCallOutput(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "search_docs",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_55cdee4026c4493d4e0e3370",
+			"arguments": `{"library":"react","query":"useEffectEvent"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_55cdee4026c4493d4e0e3370",
+			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "fetch_doc",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_7558f5fc012719d62a4cdccf",
+			"arguments": `{"url":"https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_7558f5fc012719d62a4cdccf",
+			"output":  "Wall time: 0.3613 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Source: https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\n### useEffectEvent in Dependencies (Error)\\n\\n```javascript\\nconst effectEvent = useEffectEvent(() => log(x));\\nuseEffect(() => {\\n  effectEvent();\\n}, [effectEvent]);  // Error: useEffectEvent returns should not be in deps\\n```\"}]",
+		}),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+
+	got := constrainFinalText(task, text, evidence, true)
+	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
+		t.Fatalf("constrained text = %q, should not keep search_docs summary", got)
+	}
+	if !strings.Contains(got, "NOTE: useEffectEvent in Dependencies") {
+		t.Fatalf("constrained text = %q, want NOTE from real wrapped fetch_doc content", got)
+	}
+	if strings.Contains(got, "```") {
+		t.Fatalf("constrained text = %q, should not keep fenced code in NOTE", got)
+	}
+}
+
+func TestConstrainFinalText_ReadOnlyProbeWithRealWrappedFetchDocStillPasses(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "search_docs",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_55cdee4026c4493d4e0e3370",
+			"arguments": `{"library":"react","query":"useEffectEvent"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_55cdee4026c4493d4e0e3370",
+			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "fetch_doc",
+			"namespace": "mcp__docfork__",
+			"call_id":   "call_7558f5fc012719d62a4cdccf",
+			"arguments": `{"url":"https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}`,
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_7558f5fc012719d62a4cdccf",
+			"output":  "Wall time: 0.3613 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Source: https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\n### useEffectEvent in Dependencies (Error)\\n\\n```javascript\\nconst effectEvent = useEffectEvent(() => log(x));\\nuseEffect(() => {\\n  effectEvent();\\n}, [effectEvent]);  // Error: useEffectEvent returns should not be in deps\\n```\"}]",
+		}),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: useEffectEvent in Dependencies (Error) ```javascript const effectEvent = useEffectEvent(() => log(x)); useEffect(() => { effectEvent(); }, [effectEvent]); // Error: useEffectEvent ... "
+
+	got := constrainFinalText(task, text, evidence, true)
+	if !strings.HasPrefix(got, "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: useEffectEvent in Dependencies") {
+		t.Fatalf("constrained text = %q, want PASS with fetch_doc NOTE", got)
+	}
+	if strings.Contains(got, "```") {
+		t.Fatalf("constrained text = %q, should not keep fenced code in NOTE", got)
+	}
+}
+
+func TestExtractRequiredOutputLabelHint_ReadOnlyProbe(t *testing.T) {
+	task := "你是测试代理。请验证 Docfork MCP：\n" +
+		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
+		"2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n" +
+		"3) 禁止使用 web_search 代替 Docfork。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+	if got := extractRequiredOutputLabelHint(task, "FILES"); got != "none" {
+		t.Fatalf("FILES hint = %q, want none", got)
+	}
+	if got := extractRequiredOutputLabelHint(task, "TEST"); got != "N/A" {
+		t.Fatalf("TEST hint = %q, want N/A", got)
+	}
+}
+
+func TestNormalizeEvidenceSummarySnippet_UnescapesQuotedTextFromWrappedJSON(t *testing.T) {
+	output := `mcp__docfork__fetch_doc => success=true Wall time: 0.3613 seconds Output: [{"type":"text","text":"Source: https://example.com/doc\n\n### useEffectEvent \"Quoted\" Insight\n\nBody text"}]`
+
+	got, ok := normalizeEvidenceSummarySnippet(output)
+	if !ok {
+		t.Fatal("normalizeEvidenceSummarySnippet returned ok=false, want true")
+	}
+	if !strings.Contains(got, `useEffectEvent "Quoted" Insight`) {
+		t.Fatalf("snippet = %q, want unescaped quoted heading", got)
+	}
+}
+
+func TestTaskRequestsNotApplicableLabel_DoesNotMatchNaSubstring(t *testing.T) {
+	task := "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: name；NOTE: 说明。"
+
+	if taskRequestsNotApplicableLabel(task, "TEST") {
+		t.Fatalf("taskRequestsNotApplicableLabel(%q, TEST) = true, want false", task)
+	}
+}
+
+func TestExtractRequiredOutputLabels_RecognizesFinalOutputLabelList(t *testing.T) {
+	task := "必须使用 web_search 查询 Go 官方最新稳定版本与发布日期，并最终输出三行：RESULT、VERSION、DATE。"
+
+	got := extractRequiredOutputLabels(task)
+	want := []string{"RESULT", "VERSION", "DATE"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractRequiredOutputLabels(%q) = %#v, want %#v", task, got, want)
 	}
 }

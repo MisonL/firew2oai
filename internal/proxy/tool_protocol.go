@@ -66,11 +66,25 @@ func appendToolProtocolInstructionsForCatalog(builder *strings.Builder, supports
 	builder.WriteString("If you need tools, put the machine-readable control block at the very end of your reply.\n")
 	builder.WriteString("Emit exactly one AI_ACTIONS block per reply.\n")
 	builder.WriteString("Use only tool names listed in AVAILABLE_TOOLS. Never invent or rename a tool.\n")
+	builder.WriteString("If CURRENT_USER_TASK explicitly requires a named tool, do not write narration before the tool call. Emit the AI_ACTIONS tool block immediately.\n")
+	builder.WriteString("A sentence that only says you will use a tool is invalid unless it also contains a real AI_ACTIONS tool block.\n")
 	builder.WriteString("If the tool is exec_command, arguments must be exactly an object containing cmd, for example {\"cmd\":\"pwd\"}.\n")
 	if shouldForceExecCommandAliases(toolCatalog) {
 		builder.WriteString("Do not emit read_file/cat/list_files aliases; use exec_command with cmd instead.\n")
 	} else {
 		builder.WriteString("If file tools are listed in AVAILABLE_TOOLS, use those exact names for file reads and writes.\n")
+	}
+	if _, ok := toolCatalog["update_plan"]; ok {
+		builder.WriteString("For update_plan, arguments must be an object with key plan, not steps. Example: {\"plan\":[{\"step\":\"Inspect README.md\",\"status\":\"in_progress\"},{\"step\":\"Reply with OK\",\"status\":\"pending\"}]}. Optional explanation is allowed.\n")
+	}
+	if _, ok := toolCatalog["web_search"]; ok {
+		builder.WriteString("For web_search, use the exact tool name web_search and pass arguments as {\"query\":\"...\"}. The proxy will convert that into a web_search_call item.\n")
+	}
+	if _, ok := toolCatalog["js_repl"]; ok {
+		builder.WriteString("For js_repl, send raw JavaScript source in input. Do not wrap js_repl input in JSON, quotes, or markdown fences.\n")
+	}
+	if catalogHasNamespacedTools(toolCatalog) {
+		builder.WriteString("For namespaced MCP tools, use the full declared name exactly as shown, including the namespace prefix and double-underscore separator.\n")
 	}
 	builder.WriteString("After each tool result, continue CURRENT_USER_TASK. If it is not complete, emit another tool call instead of mode final.\n")
 	builder.WriteString("Never ask for a new task when CURRENT_USER_TASK is already provided.\n")
@@ -108,6 +122,15 @@ func shouldForceExecCommandAliases(toolCatalog map[string]responseToolDescriptor
 		}
 	}
 	return true
+}
+
+func catalogHasNamespacedTools(toolCatalog map[string]responseToolDescriptor) bool {
+	for name := range toolCatalog {
+		if strings.HasPrefix(name, "mcp__") {
+			return true
+		}
+	}
+	return false
 }
 
 func extractAIActionsBlock(text string) (aiActionsBlock, bool) {
@@ -176,9 +199,74 @@ func parseToolCallOutputsWithConstraints(text string, allowedTools map[string]re
 	if recovered, ok := recoverToolCallsFromAIActionsBlocks(text, allowedTools, constraints); ok {
 		return recovered
 	}
+	if shorthand, ok := parseInlineAIActionsShorthand(text, allowedTools, constraints); ok {
+		return shorthand
+	}
 
 	legacy := parseLegacyToolCallOutputs(text, allowedTools, constraints.RequiredTool)
 	return applyToolProtocolConstraints(legacy, constraints)
+}
+
+func parseInlineAIActionsShorthand(text string, allowedTools map[string]responseToolDescriptor, constraints toolProtocolConstraints) (parsedToolCallBatchResult, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return parsedToolCallBatchResult{}, false
+	}
+	lower := strings.ToLower(trimmed)
+	idx := strings.Index(lower, "ai_actions:")
+	if idx < 0 {
+		return parsedToolCallBatchResult{}, false
+	}
+
+	tail := strings.TrimSpace(trimmed[idx+len("ai_actions:"):])
+	if tail == "" {
+		return parsedToolCallBatchResult{}, false
+	}
+	fields := strings.Fields(tail)
+	if len(fields) == 0 {
+		return parsedToolCallBatchResult{}, false
+	}
+	name := strings.TrimSpace(fields[0])
+	if name == "" {
+		return parsedToolCallBatchResult{}, false
+	}
+	if strings.Contains(name, "`") || strings.Contains(name, "{") || strings.Contains(name, "}") {
+		return parsedToolCallBatchResult{}, false
+	}
+	jsonStart := strings.Index(tail, "{")
+	if jsonStart < 0 {
+		return parsedToolCallBatchResult{}, false
+	}
+	objectText, ok := extractJSONObject(tail[jsonStart:])
+	if !ok {
+		return parsedToolCallBatchResult{}, false
+	}
+
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(objectText), &arguments); err != nil {
+		return parsedToolCallBatchResult{
+			candidateFound: true,
+			err:            fmt.Errorf("AI_ACTIONS shorthand JSON decode failed: %w", err),
+			visibleText:    strings.TrimSpace(trimmed[:idx]),
+			mode:           toolProtocolModePlainText,
+		}, true
+	}
+
+	call, err := buildParsedToolCall(map[string]any{
+		"name":      name,
+		"arguments": arguments,
+	}, allowedTools, constraints.RequiredTool, true)
+	result := parsedToolCallBatchResult{
+		candidateFound: true,
+		visibleText:    strings.TrimSpace(trimmed[:idx]),
+		mode:           toolProtocolModeAIActionsTool,
+	}
+	if err != nil {
+		result.err = err
+		return applyToolProtocolConstraints(result, constraints), true
+	}
+	result.calls = []parsedToolCall{*call}
+	return applyToolProtocolConstraints(result, constraints), true
 }
 
 func recoverToolCallsFromAIActionsBlocks(text string, allowedTools map[string]responseToolDescriptor, constraints toolProtocolConstraints) (parsedToolCallBatchResult, bool) {
@@ -340,16 +428,17 @@ func decodeAIActionsEnvelope(jsonText string) (aiActionsEnvelope, error) {
 }
 
 func repairAIActionsJSON(jsonText string) string {
-	arrayClose := strings.LastIndex(jsonText, "]")
+	repaired := insertMissingArrayClosers(jsonText)
+	arrayClose := strings.LastIndex(repaired, "]")
 	if arrayClose < 0 {
-		return jsonText
+		return repaired
 	}
 
 	curlyDepth := 0
 	inString := false
 	escaped := false
 	for i := 0; i < arrayClose; i++ {
-		ch := jsonText[i]
+		ch := repaired[i]
 		if inString {
 			if escaped {
 				escaped = false
@@ -376,9 +465,77 @@ func repairAIActionsJSON(jsonText string) string {
 		}
 	}
 	if inString || curlyDepth <= 1 {
+		return repaired
+	}
+	return repaired[:arrayClose] + strings.Repeat("}", curlyDepth-1) + repaired[arrayClose:]
+}
+
+func insertMissingArrayClosers(jsonText string) string {
+	squareDepth, insertAt, ok := scanTrailingJSONClosers(jsonText)
+	if !ok || squareDepth <= 0 {
 		return jsonText
 	}
-	return jsonText[:arrayClose] + strings.Repeat("}", curlyDepth-1) + jsonText[arrayClose:]
+	return jsonText[:insertAt] + strings.Repeat("]", squareDepth) + jsonText[insertAt:]
+}
+
+func scanTrailingJSONClosers(text string) (squareDepth int, insertAt int, ok bool) {
+	inString := false
+	escaped := false
+	curlyDepth := 0
+	squareDepth = 0
+	for i := 0; i < len(text); i++ {
+		ch := text[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if ch == '\\' {
+				escaped = true
+				continue
+			}
+			if ch == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch ch {
+		case '"':
+			inString = true
+		case '{':
+			curlyDepth++
+		case '}':
+			if curlyDepth > 0 {
+				curlyDepth--
+			}
+		case '[':
+			squareDepth++
+		case ']':
+			if squareDepth > 0 {
+				squareDepth--
+			}
+		}
+	}
+	if inString || squareDepth <= 0 {
+		return squareDepth, 0, false
+	}
+
+	insertAt = len(text)
+	for insertAt > 0 {
+		ch := text[insertAt-1]
+		if ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
+			insertAt--
+			continue
+		}
+		if ch != '}' {
+			return squareDepth, insertAt, false
+		}
+		break
+	}
+	if insertAt == 0 || text[insertAt-1] != '}' {
+		return squareDepth, insertAt, false
+	}
+	return squareDepth, insertAt - 1, true
 }
 
 func applyToolProtocolConstraints(result parsedToolCallBatchResult, constraints toolProtocolConstraints) parsedToolCallBatchResult {
@@ -470,6 +627,9 @@ func parseLegacyToolCallOutputs(text string, allowedTools map[string]responseToo
 			mode:        toolProtocolModePlainText,
 		}
 	}
+	for i := range raws {
+		raws[i] = normalizeLegacyToolCallMap(raws[i])
+	}
 	if _, hasType := raws[0]["type"]; !hasType {
 		return parsedToolCallBatchResult{
 			visibleText: text,
@@ -495,9 +655,47 @@ func parseLegacyToolCallOutputs(text string, allowedTools map[string]responseToo
 	return result
 }
 
+func normalizeLegacyToolCallMap(raw map[string]any) map[string]any {
+	if len(raw) == 0 {
+		return raw
+	}
+	normalized := cloneMap(raw)
+	inferredFromAlias := false
+	if _, ok := normalized["name"]; !ok {
+		if name, ok := firstStringField(normalized, "tool", "tool_name", "function", "function_name"); ok {
+			normalized["name"] = name
+			inferredFromAlias = true
+		}
+	}
+	if _, ok := normalized["arguments"]; !ok {
+		if args, ok := normalized["tool_args"]; ok {
+			normalized["arguments"] = args
+			inferredFromAlias = true
+		} else if args, ok := normalized["tool_arguments"]; ok {
+			normalized["arguments"] = args
+			inferredFromAlias = true
+		} else if args, ok := normalized["args"]; ok {
+			normalized["arguments"] = args
+			inferredFromAlias = true
+		}
+	}
+	if _, ok := normalized["type"]; !ok && inferredFromAlias {
+		if _, hasInput := normalized["input"]; hasInput {
+			normalized["type"] = "custom_tool_call"
+		} else if _, hasArguments := normalized["arguments"]; hasArguments {
+			normalized["type"] = "function_call"
+		}
+	}
+	return normalized
+}
+
 func legacyJSONPrefixLooksLikeToolOutput(prefix string) bool {
 	trimmed := strings.TrimSpace(prefix)
 	if trimmed == "" {
+		return true
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "function_call") || strings.Contains(lower, "tool_call") || strings.Contains(lower, "ai_actions") {
 		return true
 	}
 	// Allow short lead-in text such as "先做两步：" but avoid treating long prose/code as tool JSON.
@@ -509,10 +707,6 @@ func legacyJSONPrefixLooksLikeToolOutput(prefix string) bool {
 	}
 	if strings.Contains(trimmed, "```") {
 		return false
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "function_call") || strings.Contains(lower, "tool_call") || strings.Contains(lower, "ai_actions") {
-		return true
 	}
 	return true
 }
@@ -590,21 +784,74 @@ func resolveToolNameForCatalog(rawName, normalized string, allowedTools map[stri
 	if len(allowedTools) == 0 {
 		return normalized, true
 	}
-	if _, ok := allowedTools[normalized]; ok {
-		return normalized, true
+	for _, candidate := range toolNameAliasVariants(normalized) {
+		if _, ok := allowedTools[candidate]; ok {
+			return candidate, true
+		}
 	}
-	if _, ok := allowedTools[rawName]; ok {
-		return rawName, true
+	for _, candidate := range toolNameAliasVariants(rawName) {
+		if _, ok := allowedTools[candidate]; ok {
+			return candidate, true
+		}
 	}
 	for declared := range allowedTools {
-		if strings.EqualFold(declared, rawName) {
-			return declared, true
+		for _, candidate := range toolNameAliasVariants(rawName) {
+			if strings.EqualFold(declared, candidate) {
+				return declared, true
+			}
 		}
 	}
 	return normalized, false
 }
 
+func toolNameAliasVariants(name string) []string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return nil
+	}
+
+	variants := []string{trimmed}
+	if normalized, ok := normalizeNamespacedToolName(trimmed); ok {
+		variants = append(variants, normalized)
+	}
+	if strings.HasPrefix(trimmed, "mcp__") {
+		if idx := strings.LastIndex(trimmed, "__"); idx >= len("mcp__") && idx+2 < len(trimmed) {
+			namespaceName := strings.TrimSpace(trimmed[:idx+2])
+			toolPart := strings.TrimSpace(trimmed[idx+2:])
+			if namespaceName != "" && toolPart != "" {
+				variants = append(variants, strings.TrimSuffix(namespaceName, "__")+"."+toolPart)
+			}
+		}
+	}
+	if idx := strings.LastIndex(trimmed, "__"); idx >= 0 && idx+2 < len(trimmed) {
+		prefix := trimmed[:idx+2]
+		toolPart := trimmed[idx+2:]
+		if strings.Contains(toolPart, "_") {
+			variants = append(variants, prefix+strings.ReplaceAll(toolPart, "_", "-"))
+		}
+		if strings.Contains(toolPart, "-") {
+			variants = append(variants, prefix+strings.ReplaceAll(toolPart, "-", "_"))
+		}
+	}
+	if idx := strings.LastIndex(trimmed, "."); idx >= 0 && idx+1 < len(trimmed) {
+		prefix := trimmed[:idx+1]
+		toolPart := trimmed[idx+1:]
+		if strings.Contains(toolPart, "_") {
+			variants = append(variants, prefix+strings.ReplaceAll(toolPart, "_", "-"))
+		}
+		if strings.Contains(toolPart, "-") {
+			variants = append(variants, prefix+strings.ReplaceAll(toolPart, "-", "_"))
+		}
+	}
+	return dedupePreserveOrder(variants)
+}
+
 func firstStringField(values map[string]any, keys ...string) (string, bool) {
+	_, value, ok := firstStringFieldWithKey(values, keys...)
+	return value, ok
+}
+
+func firstStringFieldWithKey(values map[string]any, keys ...string) (string, string, bool) {
 	for _, key := range keys {
 		raw, ok := values[key]
 		if !ok {
@@ -618,9 +865,9 @@ func firstStringField(values map[string]any, keys ...string) (string, bool) {
 		if text == "" {
 			continue
 		}
-		return text, true
+		return key, text, true
 	}
-	return "", false
+	return "", "", false
 }
 
 func isLikelyCommandContinuationLine(line string) bool {
@@ -736,6 +983,59 @@ func normalizeExecCommandArguments(args any, sourceToolName string) (any, bool) 
 	return args, false
 }
 
+func normalizeStructuredToolArguments(toolName, sourceToolName string, args any) (any, bool) {
+	switch normalizeToolName(sourceToolName) {
+	case "exec_command":
+		return normalizeExecCommandArguments(args, sourceToolName)
+	case "mcp__docfork__search_docs":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		if _, hasLibrary := value["library"]; hasLibrary {
+			return args, false
+		}
+		source, ok := firstStringField(value, "source")
+		if !ok {
+			return args, false
+		}
+		normalized := cloneMap(value)
+		delete(normalized, "source")
+		normalized["library"] = source
+		return normalized, true
+	case "spawn_agent":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		if _, hasMessage := value["message"]; hasMessage {
+			return args, false
+		}
+		if _, hasItems := value["items"]; hasItems {
+			return args, false
+		}
+		if matchedKey, task, ok := firstStringFieldWithKey(value, "task", "prompt", "instruction"); ok {
+			normalized := cloneMap(value)
+			delete(normalized, matchedKey)
+			normalized["message"] = task
+			return normalized, true
+		}
+	}
+	return args, false
+}
+
+func normalizeCustomToolInputArgument(args any) (string, bool) {
+	value, ok := args.(map[string]any)
+	if !ok || len(value) != 1 {
+		return "", false
+	}
+	input, ok := value["input"].(string)
+	if !ok || strings.TrimSpace(input) == "" {
+		return "", false
+	}
+	return input, true
+}
+
 func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToolDescriptor, requiredTool string, allowImplicitType bool) (*parsedToolCall, error) {
 	callType, _ := raw["type"].(string)
 	rawName, _ := raw["name"].(string)
@@ -756,6 +1056,17 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 
 	_, hasArguments := raw["arguments"]
 	_, hasInput := raw["input"]
+	if hasArguments && !hasInput && ok && !toolDesc.Structured {
+		if normalizedInput, changed := normalizeCustomToolInputArgument(raw["arguments"]); changed {
+			raw["input"] = normalizedInput
+			delete(raw, "arguments")
+			hasArguments = false
+			hasInput = true
+			if callType == "" && allowImplicitType {
+				callType = "custom_tool_call"
+			}
+		}
+	}
 	if hasArguments && hasInput {
 		return nil, fmt.Errorf("tool call for %q must not provide both arguments and input", name)
 	}
@@ -770,8 +1081,8 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 			}
 		}
 	}
-	if hasArguments && name == "exec_command" && ok && toolDesc.Structured {
-		if normalizedArgs, changed := normalizeExecCommandArguments(raw["arguments"], rawName); changed {
+	if hasArguments && ok && toolDesc.Structured {
+		if normalizedArgs, changed := normalizeStructuredToolArguments(name, rawName, raw["arguments"]); changed {
 			raw["arguments"] = normalizedArgs
 		}
 	}
@@ -779,7 +1090,9 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 		if !allowImplicitType {
 			return nil, fmt.Errorf("tool call for %q must include type", name)
 		}
-		if ok && !toolDesc.Structured {
+		if ok && toolDesc.Type == "web_search" {
+			callType = "web_search_call"
+		} else if ok && !toolDesc.Structured {
 			callType = "custom_tool_call"
 		} else {
 			callType = "function_call"
@@ -787,7 +1100,34 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 	}
 
 	callID := "call_" + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
+	itemID := generateToolProtocolItemID(callType)
 	switch callType {
+	case "web_search_call":
+		if hasInput {
+			return nil, fmt.Errorf("web_search_call for %q must use arguments, not input", name)
+		}
+		if !hasArguments {
+			return nil, fmt.Errorf("web_search_call for %q must include arguments", name)
+		}
+		query, err := extractWebSearchQuery(raw["arguments"])
+		if err != nil {
+			return nil, fmt.Errorf("web_search_call for %q: %w", name, err)
+		}
+		item := mustMarshalRawJSON(map[string]any{
+			"id":     itemID,
+			"type":   "web_search_call",
+			"status": "completed",
+			"action": map[string]any{
+				"type":    "search",
+				"query":   query,
+				"queries": []string{query},
+			},
+		})
+		argsText := mustMarshalJSONText(map[string]any{"query": query})
+		return &parsedToolCall{
+			item:         item,
+			conversation: ChatMessage{Role: "assistant", Content: formatToolCallSummary(name, callID, argsText)},
+		}, nil
 	case "function_call":
 		if hasInput {
 			return nil, fmt.Errorf("function_call for %q must use arguments, not input", name)
@@ -816,13 +1156,29 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 		if !strings.HasPrefix(strings.TrimSpace(argsText), "{") {
 			return nil, fmt.Errorf("function_call arguments for %q must be a JSON object", name)
 		}
-		item := mustMarshalRawJSON(map[string]any{
+		namespace := ""
+		if ok {
+			namespace = toolDesc.Namespace
+		}
+		if namespace == "" {
+			namespace = inferMCPToolNamespace(name)
+		}
+		itemName := name
+		if namespace != "" {
+			itemName = bareMCPToolName(name, namespace)
+		}
+		itemMap := map[string]any{
+			"id":        itemID,
 			"type":      "function_call",
-			"name":      name,
+			"name":      itemName,
 			"arguments": argsText,
 			"call_id":   callID,
 			"status":    "completed",
-		})
+		}
+		if namespace != "" {
+			itemMap["namespace"] = namespace
+		}
+		item := mustMarshalRawJSON(itemMap)
 		return &parsedToolCall{
 			item:         item,
 			conversation: ChatMessage{Role: "assistant", Content: formatToolCallSummary(name, callID, argsText)},
@@ -842,6 +1198,7 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 			return nil, fmt.Errorf("tool %q is declared as structured but model emitted custom_tool_call", name)
 		}
 		item := mustMarshalRawJSON(map[string]any{
+			"id":      itemID,
 			"type":    "custom_tool_call",
 			"name":    name,
 			"input":   input,
@@ -855,4 +1212,48 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 	default:
 		return nil, fmt.Errorf("unsupported tool call type %q", callType)
 	}
+}
+
+func generateToolProtocolItemID(callType string) string {
+	prefix := "item_"
+	switch callType {
+	case "web_search_call":
+		prefix = "ws_"
+	case "function_call":
+		prefix = "fc_"
+	case "custom_tool_call":
+		prefix = "ctc_"
+	}
+	return prefix + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
+}
+
+func extractWebSearchQuery(args any) (string, error) {
+	switch value := args.(type) {
+	case string:
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(value), &decoded); err != nil {
+			return "", fmt.Errorf("arguments are not valid JSON: %w", err)
+		}
+		return extractWebSearchQuery(decoded)
+	case map[string]any:
+		if query, ok := firstStringField(value, "query"); ok {
+			return query, nil
+		}
+		if action, ok := value["action"].(map[string]any); ok {
+			if query, ok := firstStringField(action, "query"); ok {
+				return query, nil
+			}
+		}
+		return "", errors.New("missing query")
+	default:
+		return "", errors.New("arguments must be an object")
+	}
+}
+
+func mustMarshalJSONText(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
 }

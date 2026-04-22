@@ -97,6 +97,53 @@ func TestBuildResponsesPrompt_MaxCallsOneIncludesSingleStepGuidance(t *testing.T
 	}
 }
 
+func TestBuildResponsesPrompt_UpdatePlanIncludesExplicitPlanShape(t *testing.T) {
+	prompt := buildResponsesPrompt(
+		nil,
+		"be concise",
+		[]ChatMessage{{Role: "user", Content: "先更新计划再读取 README.md"}},
+		json.RawMessage(`[{"type":"function","name":"update_plan","description":"update task plan","parameters":{"type":"object","properties":{"explanation":{"type":"string"},"plan":{"type":"array","items":{"type":"object","properties":{"step":{"type":"string"},"status":{"type":"string"}}}}},"required":["plan"]}}]`),
+		1,
+		responsesPromptOptions{},
+	)
+
+	for _, want := range []string{
+		"For update_plan, arguments must be an object with key plan, not steps.",
+		`{"plan":[{"step":"Inspect README.md","status":"in_progress"}`,
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
+func TestBuildResponsesPrompt_IncludesSpecialHintsForWebSearchJsReplAndNamespacedTools(t *testing.T) {
+	prompt := buildResponsesPrompt(
+		nil,
+		"be concise",
+		[]ChatMessage{{Role: "user", Content: "先搜索资料，再用 js 计算，然后调用 docfork"}},
+		json.RawMessage(`[
+			{"type":"custom","name":"js_repl","description":"run js"},
+			{"type":"web_search","external_web_access":true},
+			{"type":"namespace","name":"mcp__docfork__","tools":[
+				{"type":"function","name":"search_docs","description":"search docs","parameters":{"type":"object","properties":{"library":{"type":"string"},"query":{"type":"string"}}}}
+			]}
+		]`),
+		0,
+		responsesPromptOptions{},
+	)
+
+	for _, want := range []string{
+		"For web_search, use the exact tool name web_search and pass arguments as {\"query\":\"...\"}. The proxy will convert that into a web_search_call item.",
+		"For js_repl, send raw JavaScript source in input.",
+		"For namespaced MCP tools, use the full declared name exactly as shown, including the namespace prefix and double-underscore separator.",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestBuildToolChoiceInstructions_RequiredNamedToolIsMandatory(t *testing.T) {
 	instructions := buildToolChoiceInstructions(mustMarshalRawJSON(map[string]any{"name": "exec_command"}))
 
@@ -162,6 +209,20 @@ func TestTaskLikelyNeedsTools_PlainQuestion(t *testing.T) {
 	}
 }
 
+func TestTaskLikelyNeedsTools_ExplicitToolName(t *testing.T) {
+	task := "必须使用 update_plan，然后读取 README.md 前三行"
+	if !taskLikelyNeedsTools(task) {
+		t.Fatalf("explicit tool task should require tools, task=%q", task)
+	}
+}
+
+func TestTaskLikelyNeedsTools_NamespacedTool(t *testing.T) {
+	task := "必须使用 mcp__docfork__search_docs 查询 react useEffectEvent 文档"
+	if !taskLikelyNeedsTools(task) {
+		t.Fatalf("namespaced MCP tool task should require tools, task=%q", task)
+	}
+}
+
 func TestBuildTaskCompletionGate_ExtractsRequirements(t *testing.T) {
 	task := `你在一个真实 Go 项目里做一次小型编码任务。严格执行：
 1) 修改 internal/proxy/responses.go：新增别名。
@@ -194,6 +255,60 @@ func TestBuildTaskCompletionGate_PlainQuestionReturnsEmpty(t *testing.T) {
 	}
 }
 
+func TestBuildExplicitToolUseBlock_ExtractsDeclaredNames(t *testing.T) {
+	task := "必须使用 mcp__docfork__search_docs 搜索，再调用 fetch_doc 获取正文"
+	block := buildExplicitToolUseBlock(task, map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true},
+	})
+
+	for _, want := range []string{
+		"<EXPLICIT_TOOL_REQUIREMENTS>",
+		"mcp__docfork__search_docs",
+		"mcp__docfork__fetch_doc",
+		"do not describe intended tool use in prose",
+	} {
+		if !strings.Contains(strings.ToLower(block), strings.ToLower(want)) {
+			t.Fatalf("block missing %q:\n%s", want, block)
+		}
+	}
+}
+
+func TestBuildResponsesPrompt_ExplicitToolTaskAddsNoNarrationRule(t *testing.T) {
+	tools := mustMarshalRawJSON([]map[string]any{
+		{
+			"type":        "function",
+			"name":        "web_search",
+			"description": "search",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"query": map[string]any{"type": "string"},
+				},
+			},
+		},
+	})
+
+	prompt := buildResponsesPrompt(
+		nil,
+		"",
+		[]ChatMessage{{Role: "user", Content: "必须使用 web_search 查询 Go 最新稳定版本"}},
+		tools,
+		0,
+		responsesPromptOptions{},
+	)
+
+	for _, want := range []string{
+		"<EXPLICIT_TOOL_REQUIREMENTS>",
+		"Narration like \"I'll use web_search\" without a real tool call is invalid.",
+		"emit AI_ACTIONS mode tool immediately with no visible text before the block",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+}
+
 func TestParseToolCallOutputs_AIActionsBlockMultipleCalls(t *testing.T) {
 	text := "先读取 README.md 和当前目录。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}},{\"name\":\"Bash\",\"arguments\":{\"command\":\"pwd\",\"description\":\"show cwd\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
 	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
@@ -215,6 +330,90 @@ func TestParseToolCallOutputs_AIActionsBlockMultipleCalls(t *testing.T) {
 	}
 	if !strings.Contains(string(result.calls[1].item), `"name":"Bash"`) {
 		t.Fatalf("second item = %s", string(result.calls[1].item))
+	}
+}
+
+func TestParseToolCallOutputs_LegacySingleToolJSONWithoutType(t *testing.T) {
+	text := "AI_ACTIONS:\n```json\n{\"tool\":\"spawn_agent\",\"arguments\":{\"task\":\"Read README.md first line\"}}\n```"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if !strings.Contains(string(result.calls[0].item), `"name":"spawn_agent"`) {
+		t.Fatalf("call item = %s", string(result.calls[0].item))
+	}
+	if !strings.Contains(string(result.calls[0].item), `\"message\":\"Read README.md first line\"`) {
+		t.Fatalf("spawn_agent call should normalize task->message, item=%s", string(result.calls[0].item))
+	}
+}
+
+func TestParseToolCallOutputs_ResolvesMCPToolNameHyphenUnderscoreAlias(t *testing.T) {
+	text := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__context7__resolve_library_id\",\"arguments\":{\"library_name\":\"react\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"mcp__context7__resolve-library-id": {Name: "mcp__context7__resolve-library-id", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if !strings.Contains(string(result.calls[0].item), `"name":"resolve-library-id"`) {
+		t.Fatalf("call item = %s", string(result.calls[0].item))
+	}
+	if !strings.Contains(string(result.calls[0].item), `"namespace":"mcp__context7__"`) {
+		t.Fatalf("call item = %s", string(result.calls[0].item))
+	}
+}
+
+func TestParseToolCallOutputs_ParsesInlineAIActionsShorthand(t *testing.T) {
+	text := `I'll use a sub-agent.
+
+AI_ACTIONS: spawn_agent {"task":"Read README.md first line"}`
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if result.visibleText != "I'll use a sub-agent." {
+		t.Fatalf("visible text = %q", result.visibleText)
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"spawn_agent"`) || !strings.Contains(item, `\"message\":\"Read README.md first line\"`) {
+		t.Fatalf("unexpected shorthand parse item: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesSpawnAgentPromptWithoutLeavingAlias(t *testing.T) {
+	text := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"spawn_agent\",\"arguments\":{\"prompt\":\"Read README.md first line\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `\"message\":\"Read README.md first line\"`) {
+		t.Fatalf("normalized spawn_agent item = %s, want message field", item)
+	}
+	if strings.Contains(item, `\"prompt\":`) {
+		t.Fatalf("normalized spawn_agent item = %s, should not keep prompt alias", item)
 	}
 }
 
@@ -249,6 +448,23 @@ func TestParseToolCallOutputs_AIActionsBlockWithFencedJSON(t *testing.T) {
 	}
 	if result.visibleText != "先读取 README。" {
 		t.Fatalf("visible text = %q", result.visibleText)
+	}
+}
+
+func TestParseToolCallOutputs_AIActionsBlockRepairsMissingCallsArrayCloser(t *testing.T) {
+	text := "先更新计划。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"update_plan\",\"arguments\":{\"plan\":[{\"step\":\"读取 README\",\"status\":\"pending\"},{\"step\":\"回复\",\"status\":\"pending\"}]}}}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"update_plan": {Name: "update_plan", Type: "function", Structured: true},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	if !strings.Contains(string(result.calls[0].item), `"name":"update_plan"`) {
+		t.Fatalf("unexpected item: %s", string(result.calls[0].item))
 	}
 }
 
@@ -502,6 +718,120 @@ func TestParseToolCallOutputs_NormalizesReadFileAliasToExecCommand(t *testing.T)
 	}
 }
 
+func TestParseToolCallOutputs_AcceptsWebSearchPseudoTool(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest Go release\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"web_search": {Name: "web_search", Type: "web_search", Structured: true},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"id":"ws_`) {
+		t.Fatalf("item missing web_search id: %s", item)
+	}
+	if !strings.Contains(item, `"type":"web_search_call"`) {
+		t.Fatalf("item tool type mismatch: %s", item)
+	}
+	if !strings.Contains(item, `"query":"latest Go release"`) {
+		t.Fatalf("item missing query argument: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_AcceptsNamespacedFunctionTool(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"library\":\"react\",\"query\":\"server components\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"id":"fc_`) {
+		t.Fatalf("item missing function-call id: %s", item)
+	}
+	if !strings.Contains(item, `"name":"search_docs"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `"namespace":"mcp__docfork__"`) {
+		t.Fatalf("item missing namespace: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesDotSeparatedNamespacedToolAlias(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__.search_docs\",\"arguments\":{\"library\":\"react\",\"query\":\"server components\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"search_docs"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	if !strings.Contains(item, `"namespace":"mcp__docfork__"`) {
+		t.Fatalf("item missing namespace: %s", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesDocforkSearchDocsSourceAlias(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"query\":\"useEffectEvent\",\"source\":\"react.dev\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"name":"search_docs"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["library"] != "react.dev" {
+		t.Fatalf("library = %v, want react.dev", arguments["library"])
+	}
+	if _, ok := arguments["source"]; ok {
+		t.Fatalf("source alias should be removed, arguments=%#v", arguments)
+	}
+}
+
 func TestParseToolCallOutputs_LegacyJSONSequence(t *testing.T) {
 	result := parseToolCallOutputs(
 		"{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",
@@ -695,6 +1025,37 @@ func TestParseToolCallOutputs_RejectsStructuredToolUsingInputField(t *testing.T)
 
 	if result.err == nil || !strings.Contains(result.err.Error(), "must use arguments") {
 		t.Fatalf("expected structured-field mismatch error, got %v", result.err)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesCustomToolArgumentsInputAlias(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"js_repl\",\"arguments\":{\"input\":\"[2,3,5].reduce((a,b) => a + b, 0)\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"js_repl": {Name: "js_repl", Type: "custom", Structured: false},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `"type":"custom_tool_call"`) {
+		t.Fatalf("item tool type mismatch: %s", item)
+	}
+	if !strings.Contains(item, `"name":"js_repl"`) {
+		t.Fatalf("item tool name mismatch: %s", item)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	if decoded["input"] != "[2,3,5].reduce((a,b) => a + b, 0)" {
+		t.Fatalf("input = %v, want raw js source", decoded["input"])
 	}
 }
 

@@ -10,11 +10,13 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
+	"github.com/dop251/goja"
 	"github.com/mison/firew2oai/internal/config"
 )
 
@@ -168,6 +170,11 @@ func responseInputToMessagesAndItems(input json.RawMessage) ([]ChatMessage, []js
 		return nil, nil, errors.New("input must be a string or array")
 	}
 
+	items = recoverEmptyJSReplOutputs(items)
+	if rebuilt := rawItemsToMessages(items); len(rebuilt) > 0 {
+		messages = rebuilt
+	}
+
 	nonSystemCount := 0
 	filtered := messages[:0]
 	for _, msg := range messages {
@@ -183,6 +190,141 @@ func responseInputToMessagesAndItems(input json.RawMessage) ([]ChatMessage, []js
 		return nil, nil, errors.New("input must contain at least one text item")
 	}
 	return filtered, items, nil
+}
+
+func recoverEmptyJSReplOutputs(items []json.RawMessage) []json.RawMessage {
+	if len(items) == 0 {
+		return items
+	}
+
+	callInputs := make(map[string]string, len(items))
+	recovered := make([]json.RawMessage, 0, len(items))
+	for _, raw := range items {
+		if len(raw) == 0 {
+			continue
+		}
+
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			recovered = append(recovered, raw)
+			continue
+		}
+
+		switch strings.TrimSpace(asString(item["type"])) {
+		case "custom_tool_call":
+			if normalizeToolName(asString(item["name"])) == "js_repl" {
+				callID := strings.TrimSpace(asString(item["call_id"]))
+				input := strings.TrimSpace(asString(item["input"]))
+				if callID != "" && input != "" {
+					callInputs[callID] = input
+				}
+			}
+		case "custom_tool_call_output":
+			callID := strings.TrimSpace(asString(item["call_id"]))
+			input := strings.TrimSpace(callInputs[callID])
+			text, _ := extractToolOutputText(item["output"])
+			if input != "" && strings.TrimSpace(text) == "" {
+				if recoveredText, ok := recoverJSReplOutputText(input); ok {
+					item["output"] = mergeRecoveredToolOutput(item["output"], recoveredText)
+					raw = mustMarshalRawJSON(item)
+					slog.Warn("recovered empty js_repl output",
+						"call_id", callID,
+						"input", truncateForLog(input, 200),
+						"recovered_output", truncateForLog(recoveredText, 200),
+					)
+				}
+			}
+		}
+
+		recovered = append(recovered, raw)
+	}
+	return recovered
+}
+
+func mergeRecoveredToolOutput(existing any, recoveredText string) any {
+	recoveredText = strings.TrimSpace(recoveredText)
+	if recoveredText == "" {
+		return existing
+	}
+
+	if existingMap, ok := existing.(map[string]any); ok {
+		cloned := cloneMap(existingMap)
+		cloned["content"] = recoveredText
+		if _, ok := cloned["success"]; !ok {
+			cloned["success"] = true
+		}
+		return cloned
+	}
+
+	return map[string]any{
+		"content": recoveredText,
+		"success": true,
+	}
+}
+
+var recoverableJSReplDisallowedPattern = regexp.MustCompile(`(?i)(?:\bwhile\b|\bfor\b|\bfunction\b|\bclass\b|\bimport\b|\bawait\b|\bthrow\b|\btry\b|\bcatch\b|\bswitch\b|\bconst\b|\blet\b|\bvar\b|\bprocess\b|\bglobal(?:this)?\b|\bcodex\b|;)`)
+
+func recoverJSReplOutputText(input string) (string, bool) {
+	trimmed := strings.TrimSpace(input)
+	if !looksRecoverableJSReplExpression(trimmed) {
+		return "", false
+	}
+
+	vm := goja.New()
+	value, err := vm.RunString(trimmed)
+	if err != nil {
+		return "", false
+	}
+	return formatRecoveredJSReplValue(value)
+}
+
+func looksRecoverableJSReplExpression(input string) bool {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "" || len(trimmed) > 256 {
+		return false
+	}
+	if strings.ContainsAny(trimmed, "\r\n`") {
+		return false
+	}
+	return !recoverableJSReplDisallowedPattern.MatchString(trimmed)
+}
+
+func formatRecoveredJSReplValue(value goja.Value) (string, bool) {
+	if value == nil || goja.IsUndefined(value) {
+		return "", false
+	}
+	if goja.IsNull(value) {
+		return "null", true
+	}
+
+	exported := value.Export()
+	switch v := exported.(type) {
+	case string:
+		return v, true
+	case bool:
+		if v {
+			return "true", true
+		}
+		return "false", true
+	case int, int8, int16, int32, int64:
+		return fmt.Sprintf("%v", v), true
+	case uint, uint8, uint16, uint32, uint64:
+		return fmt.Sprintf("%v", v), true
+	case float32:
+		return strconv.FormatFloat(float64(v), 'f', -1, 32), true
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), true
+	}
+
+	if encoded, err := json.Marshal(exported); err == nil {
+		return string(encoded), true
+	}
+
+	text := strings.TrimSpace(value.String())
+	if text == "" {
+		return "", false
+	}
+	return text, true
 }
 
 func buildInputMessageItem(role, text string) json.RawMessage {
@@ -233,11 +375,18 @@ func normalizeRawResponseInputItems(item any) []json.RawMessage {
 
 func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
 	typ, _ := item["type"].(string)
-	if typ != "function_call_output" && typ != "custom_tool_call_output" {
+	if typ != "function_call_output" && typ != "custom_tool_call_output" && typ != "mcp_tool_call_output" {
 		return nil
 	}
 
 	text, embeddedSuccess := extractToolOutputText(item["output"])
+	if typ == "custom_tool_call_output" && strings.TrimSpace(text) == "" {
+		slog.Warn("custom tool output normalized to empty text",
+			"call_id", strings.TrimSpace(asString(item["call_id"])),
+			"output_type", fmt.Sprintf("%T", item["output"]),
+			"raw_output", truncateForLog(mustMarshalJSONText(item["output"]), 800),
+		)
+	}
 	callID, command, parsedSuccess, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
 		return nil
@@ -272,7 +421,7 @@ func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
 	}
 
 	callOutput := map[string]any{
-		"type":   typ,
+		"type":   "function_call_output",
 		"output": output,
 	}
 	if normalizedCallID != "" {
@@ -300,6 +449,9 @@ func normalizeToolSummaryStringItems(text string) []json.RawMessage {
 		call := map[string]any{
 			"type": "function_call",
 			"name": strings.TrimSpace(match[1]),
+		}
+		if namespace := inferMCPToolNamespace(strings.TrimSpace(match[1])); namespace != "" {
+			call["namespace"] = namespace
 		}
 		if callID := strings.TrimSpace(match[2]); callID != "" {
 			call["call_id"] = callID
@@ -434,7 +586,23 @@ func extractToolInputMessages(item map[string]any) []ChatMessage {
 			Role:    "assistant",
 			Content: formatToolCallSummary(name, callID, payload),
 		}}
-	case "function_call_output", "custom_tool_call_output":
+	case "web_search_call", "web_search":
+		query := ""
+		if directQuery, ok := firstStringField(item, "query"); ok {
+			query = directQuery
+		}
+		if action, ok := item["action"].(map[string]any); ok {
+			query, _ = firstStringField(action, "query")
+		}
+		payload := "{}"
+		if strings.TrimSpace(query) != "" {
+			payload = mustMarshalJSONText(map[string]any{"query": query})
+		}
+		return []ChatMessage{{
+			Role:    "assistant",
+			Content: formatToolCallSummary("web_search", callID, payload),
+		}}
+	case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
 		text, success := extractToolOutputText(item["output"])
 		content := formatToolOutputSummary(callID, success, text)
 		if content == "" {
@@ -480,6 +648,15 @@ func extractTextParts(parts []any) string {
 func extractToolOutputText(v any) (string, *bool) {
 	switch value := v.(type) {
 	case string:
+		if payload, success, ok := parseWrappedToolOutputEnvelope(value); ok {
+			if decoded := decodeEmbeddedToolOutputText(payload); decoded != "" {
+				return decoded, success
+			}
+			return payload, success
+		}
+		if decoded := decodeEmbeddedToolOutputText(value); decoded != "" {
+			return decoded, nil
+		}
 		return value, nil
 	case []any:
 		return extractTextParts(value), nil
@@ -487,6 +664,11 @@ func extractToolOutputText(v any) (string, *bool) {
 		var text string
 		if content, ok := value["content"].(string); ok {
 			text = content
+		}
+		if text == "" {
+			if items, ok := value["content"].([]any); ok {
+				text = extractTextParts(items)
+			}
 		}
 		if text == "" {
 			if items, ok := value["content_items"].([]any); ok {
@@ -498,10 +680,144 @@ func extractToolOutputText(v any) (string, *bool) {
 			flag := raw
 			success = &flag
 		}
+		if success == nil {
+			if raw, ok := value["is_error"].(bool); ok {
+				flag := !raw
+				success = &flag
+			}
+		}
+		if success == nil {
+			if raw, ok := value["isError"].(bool); ok {
+				flag := !raw
+				success = &flag
+			}
+		}
+		if payload, wrappedSuccess, ok := parseWrappedToolOutputEnvelope(text); ok {
+			text = payload
+			if success == nil {
+				success = wrappedSuccess
+			}
+		}
+		if decoded := decodeEmbeddedToolOutputText(text); decoded != "" {
+			text = decoded
+		}
 		return text, success
 	default:
 		return "", nil
 	}
+}
+
+func asString(v any) string {
+	if text, ok := v.(string); ok {
+		return text
+	}
+	return ""
+}
+
+func truncateForLog(text string, max int) string {
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	return text[:max]
+}
+
+func parseWrappedToolOutputEnvelope(text string) (string, *bool, bool) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return "", nil, false
+	}
+	if strings.HasPrefix(strings.ToLower(trimmed), "tool result") {
+		return "", nil, false
+	}
+	lines := strings.Split(trimmed, "\n")
+	var success *bool
+	outputStarted := false
+	outputLines := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" && !outputStarted {
+			continue
+		}
+		lower := strings.ToLower(line)
+		switch {
+		case strings.HasPrefix(lower, "success:"):
+			value := strings.TrimSpace(line[len("Success:"):])
+			if value != "" {
+				flag := strings.EqualFold(value, "true")
+				success = &flag
+			}
+		case strings.HasPrefix(lower, "process exited with code"):
+			value := strings.TrimSpace(line[len("Process exited with code"):])
+			if code, err := strconv.Atoi(value); err == nil {
+				flag := code == 0
+				success = &flag
+			}
+		case strings.HasPrefix(lower, "exit code:"):
+			value := strings.TrimSpace(line[len("Exit code:"):])
+			if code, err := strconv.Atoi(value); err == nil {
+				flag := code == 0
+				success = &flag
+			}
+		case strings.HasPrefix(lower, "output:"):
+			outputStarted = true
+			remainder := strings.TrimSpace(line[len("Output:"):])
+			if remainder != "" {
+				outputLines = append(outputLines, remainder)
+			}
+		case outputStarted:
+			outputLines = append(outputLines, rawLine)
+		}
+	}
+	if !outputStarted {
+		return "", nil, false
+	}
+	return strings.TrimSpace(strings.Join(outputLines, "\n")), success, true
+}
+
+func decodeEmbeddedToolOutputText(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "{") {
+		return ""
+	}
+
+	var decoded any
+	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
+		return ""
+	}
+	return extractEmbeddedToolOutputText(decoded)
+}
+
+func extractEmbeddedToolOutputText(v any) string {
+	switch value := v.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case []any:
+		if text := extractTextParts(value); strings.TrimSpace(text) != "" {
+			return text
+		}
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			if text := extractEmbeddedToolOutputText(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, "\n")
+	case map[string]any:
+		if text, _ := value["text"].(string); strings.TrimSpace(text) != "" {
+			return text
+		}
+		for _, key := range []string{"content", "content_items"} {
+			if nested, ok := value[key]; ok {
+				if text := extractEmbeddedToolOutputText(nested); text != "" {
+					return text
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func formatToolCallSummary(name, callID, payload string) string {
@@ -588,6 +904,9 @@ func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 		call := map[string]any{
 			"type": "function_call",
 			"name": strings.TrimSpace(match[1]),
+		}
+		if namespace := inferMCPToolNamespace(strings.TrimSpace(match[1])); namespace != "" {
+			call["namespace"] = namespace
 		}
 		if callID := strings.TrimSpace(match[2]); callID != "" {
 			call["call_id"] = callID
@@ -766,6 +1085,9 @@ func buildResponsesPrompt(base []ChatMessage, instructions string, current []Cha
 		builder.WriteString("CURRENT_USER_TASK requires real workspace execution. Emit tool calls before any final answer text.\n")
 		builder.WriteString("Do not stop after read-only inspection when the task still requires edits or tests.\n")
 	}
+	if explicitToolBlock := buildExplicitToolUseBlock(currentTask, toolCatalog); explicitToolBlock != "" {
+		builder.WriteString(explicitToolBlock)
+	}
 	if gate := buildTaskCompletionGate(currentTask); gate != "" {
 		builder.WriteString(gate)
 	}
@@ -908,13 +1230,13 @@ func summarizeResponseTool(tool map[string]any) []string {
 			name, _ := child["name"].(string)
 			if namespaceName != "" && name != "" {
 				child = cloneMap(child)
-				child["name"] = namespaceName + "." + name
+				child["name"] = joinNamespaceToolName(namespaceName, name)
 			}
 			lines = append(lines, summarizeResponseTool(child)...)
 		}
 		return lines
 	case "web_search":
-		return []string{"- web_search: use for internet search when current information is required."}
+		return []string{"- web_search [web_search]: use for internet search when current information is required. Params: query:string"}
 	default:
 		name, _ := tool["name"].(string)
 		if name == "" {
@@ -939,19 +1261,104 @@ func summarizeToolParameters(v any) string {
 	if !ok {
 		return ""
 	}
+	if typ, _ := paramMap["type"].(string); typ != "" && typ != "object" {
+		return summarizeJSONSchema(paramMap, 0)
+	}
 	props, ok := paramMap["properties"].(map[string]any)
 	if !ok || len(props) == 0 {
 		return ""
+	}
+
+	required := make(map[string]struct{})
+	if rawRequired, ok := paramMap["required"].([]any); ok {
+		for _, item := range rawRequired {
+			if key, ok := item.(string); ok && strings.TrimSpace(key) != "" {
+				required[key] = struct{}{}
+			}
+		}
 	}
 
 	keys := make([]string, 0, len(props))
 	for key := range props {
 		keys = append(keys, key)
 	}
-	if len(keys) > 8 {
-		keys = keys[:8]
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		child, _ := props[key].(map[string]any)
+		part := key + ":" + summarizeJSONSchema(child, 1)
+		if _, ok := required[key]; ok {
+			part += " required"
+		}
+		parts = append(parts, part)
 	}
-	return strings.Join(keys, ", ")
+	if len(parts) > 8 {
+		parts = parts[:8]
+	}
+	return strings.Join(parts, ", ")
+}
+
+func summarizeJSONSchema(schema map[string]any, depth int) string {
+	if len(schema) == 0 {
+		return "object"
+	}
+
+	typ, _ := schema["type"].(string)
+	if typ == "" {
+		if _, ok := schema["properties"].(map[string]any); ok {
+			typ = "object"
+		}
+	}
+
+	switch typ {
+	case "string", "boolean", "integer", "number":
+		return typ
+	case "array":
+		if depth >= 3 {
+			return "array"
+		}
+		items, _ := schema["items"].(map[string]any)
+		return "array<" + summarizeJSONSchema(items, depth+1) + ">"
+	case "object":
+		if depth >= 3 {
+			return "object"
+		}
+		props, _ := schema["properties"].(map[string]any)
+		if len(props) == 0 {
+			return "object"
+		}
+		keys := make([]string, 0, len(props))
+		for key := range props {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		if len(keys) > 4 {
+			keys = keys[:4]
+		}
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			child, _ := props[key].(map[string]any)
+			parts = append(parts, key+":"+summarizeJSONSchema(child, depth+1))
+		}
+		return "object{" + strings.Join(parts, ",") + "}"
+	default:
+		if enumValues, ok := schema["enum"].([]any); ok && len(enumValues) > 0 {
+			enumParts := make([]string, 0, len(enumValues))
+			for _, item := range enumValues {
+				if text, ok := item.(string); ok && text != "" {
+					enumParts = append(enumParts, text)
+				}
+			}
+			if len(enumParts) > 0 {
+				if len(enumParts) > 3 {
+					enumParts = enumParts[:3]
+				}
+				return "enum(" + strings.Join(enumParts, "|") + ")"
+			}
+		}
+	}
+
+	return "object"
 }
 
 func cloneMap(input map[string]any) map[string]any {
@@ -971,6 +1378,7 @@ type responseToolDescriptor struct {
 	Name       string
 	Type       string
 	Structured bool
+	Namespace  string
 }
 
 type parsedToolCallResult struct {
@@ -1061,12 +1469,78 @@ func extractJSONObject(text string) (string, bool) {
 
 func normalizeToolName(name string) string {
 	trimmed := strings.TrimSpace(name)
+	if normalized, ok := normalizeNamespacedToolName(trimmed); ok {
+		trimmed = normalized
+	}
 	switch strings.ToLower(trimmed) {
 	case "run_terminal", "run_terminal_cmd", "run_command", "shell", "shell_command", "bash", "terminal", "terminal_exec", "read_file", "readfile", "cat", "list_files", "listfiles", "execute_command":
 		return "exec_command"
 	default:
 		return trimmed
 	}
+}
+
+func joinNamespaceToolName(namespaceName, childName string) string {
+	namespaceName = strings.TrimSpace(namespaceName)
+	childName = strings.TrimSpace(childName)
+	if namespaceName == "" {
+		return childName
+	}
+	if childName == "" {
+		return namespaceName
+	}
+	if strings.HasSuffix(namespaceName, "__") {
+		return namespaceName + childName
+	}
+	return namespaceName + "__" + childName
+}
+
+func normalizeResponseToolNamespace(namespaceName string) string {
+	return strings.TrimSpace(namespaceName)
+}
+
+func inferMCPToolNamespace(toolName string) string {
+	trimmed := strings.TrimSpace(toolName)
+	if !strings.HasPrefix(trimmed, "mcp__") {
+		return ""
+	}
+	idx := strings.LastIndex(trimmed, "__")
+	if idx <= len("mcp__") || idx+2 >= len(trimmed) {
+		return ""
+	}
+	return normalizeResponseToolNamespace(trimmed[:idx+2])
+}
+
+func bareMCPToolName(toolName, namespace string) string {
+	toolName = strings.TrimSpace(toolName)
+	namespace = normalizeResponseToolNamespace(namespace)
+	if toolName == "" || namespace == "" {
+		return toolName
+	}
+	prefix := namespace
+	if !strings.HasPrefix(toolName, prefix) {
+		return toolName
+	}
+	bare := strings.TrimPrefix(toolName, prefix)
+	if bare == "" {
+		return toolName
+	}
+	return bare
+}
+
+func normalizeNamespacedToolName(name string) (string, bool) {
+	trimmed := strings.TrimSpace(name)
+	if !strings.HasPrefix(trimmed, "mcp__") {
+		return "", false
+	}
+	if idx := strings.LastIndex(trimmed, "."); idx >= 0 && idx+1 < len(trimmed) {
+		namespaceName := strings.TrimSpace(trimmed[:idx])
+		childName := strings.TrimSpace(trimmed[idx+1:])
+		if namespaceName != "" && childName != "" {
+			return joinNamespaceToolName(namespaceName, childName), true
+		}
+	}
+	return "", false
 }
 
 func buildResponseInputItemList(items []json.RawMessage) ResponseInputItemList {
@@ -1183,9 +1657,17 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 				}
 				childCopy := cloneMap(childMap)
 				if name, _ := childCopy["name"].(string); namespaceName != "" && name != "" {
-					childCopy["name"] = namespaceName + "." + name
+					childCopy["name"] = joinNamespaceToolName(namespaceName, name)
 				}
 				walk(namespaceName, childCopy)
+			}
+			return
+		}
+		if toolType == "web_search" {
+			catalog["web_search"] = responseToolDescriptor{
+				Name:       "web_search",
+				Type:       toolType,
+				Structured: true,
 			}
 			return
 		}
@@ -1198,6 +1680,7 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 			Name:       name,
 			Type:       toolType,
 			Structured: toolType != "custom",
+			Namespace:  normalizeResponseToolNamespace(prefix),
 		}
 	}
 
@@ -1205,6 +1688,18 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 		walk("", tool)
 	}
 	return catalog
+}
+
+func sortedResponseToolNames(toolCatalog map[string]responseToolDescriptor) []string {
+	if len(toolCatalog) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(toolCatalog))
+	for name := range toolCatalog {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 type resolvedToolChoice struct {
@@ -1456,6 +1951,30 @@ func compactCommandsForLog(commands []string) []string {
 	return compacted
 }
 
+func summarizeRawItemTypes(items []json.RawMessage) []string {
+	if len(items) == 0 {
+		return nil
+	}
+	types := make([]string, 0, len(items))
+	for _, raw := range items {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if typ, _ := item["type"].(string); strings.TrimSpace(typ) != "" {
+			types = append(types, strings.TrimSpace(typ))
+		}
+	}
+	types = dedupePreserveOrder(types)
+	if len(types) > 12 {
+		types = append([]string(nil), types[len(types)-12:]...)
+	}
+	return types
+}
+
 func writeResponsesMessageAdded(writeAndFlushEvent func(string, any) bool, responseID, messageID string) bool {
 	if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
 		Type:        "response.output_item.added",
@@ -1572,7 +2091,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
 	policyHistoryItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
 	executionEvidence := buildExecutionEvidence(policyHistoryItems)
-	executionPolicy := buildExecutionPolicy(req.Model, currentTask, policyHistoryItems, len(toolCatalog) > 0, toolChoice.DisableTools, autoRequireTool)
+	executionPolicy := buildExecutionPolicyWithCatalog(req.Model, currentTask, policyHistoryItems, toolCatalog, len(toolCatalog) > 0, toolChoice.DisableTools, autoRequireTool)
 	disableToolsForFinalize := shouldDisableToolsForExecutionFinalize(executionPolicy, toolChoice)
 	effectiveToolChoice := toolChoice
 	if disableToolsForFinalize {
@@ -1589,6 +2108,9 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if policyBlock := buildExecutionPolicyPromptBlock(executionPolicy); policyBlock != "" {
 		prompt += policyBlock
 	}
+	if initialToolBlock := buildInitialRequiredToolBlock(currentTask, toolCatalog, policyHistoryItems); initialToolBlock != "" {
+		prompt += initialToolBlock
+	}
 	if writeHint := buildPendingWriteMutationHint(executionPolicy, toolCatalog); writeHint != "" {
 		prompt += writeHint
 	}
@@ -1601,6 +2123,12 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		PreferredToolNames: nil,
 		MaxCalls:           maxToolCalls,
 		AllowTruncateToMax: executionPolicy.AllowTruncateToMax,
+	}
+	if toolConstraints.RequiredTool == "" && !toolChoice.DisableTools {
+		if nextRequiredTool := executionPolicy.NextRequiredTool; nextRequiredTool != "" {
+			toolConstraints.RequiredTool = nextRequiredTool
+			toolConstraints.RequireTool = true
+		}
 	}
 	if executionPolicy.PendingWrite && toolChoice.RequiredTool == "" && !toolChoice.DisableTools {
 		preferredMutationTools := availableMutationToolNames(toolCatalog)
@@ -1645,6 +2173,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"previous_response_id", req.PreviousResponseID,
 		"thinking", showThinking,
 		"tools_present", bufferForToolCalls,
+		"tool_names", sortedResponseToolNames(toolCatalog),
 		"required_tool", toolConstraints.RequiredTool,
 		"require_tool", toolConstraints.RequireTool,
 		"auto_require_tool", autoRequireTool,
@@ -1661,12 +2190,15 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"execution_repeated_scaffold", executionPolicy.RepeatedScaffold,
 		"execution_pending_write", executionPolicy.PendingWrite,
 		"execution_disable_tools", disableToolsForFinalize,
+		"evidence_commands", compactCommandsForLog(executionEvidence.Commands),
+		"evidence_outputs", compactCommandsForLog(executionEvidence.Outputs),
+		"history_item_types", summarizeRawItemTypes(policyHistoryItems),
 	)
 	if req.Stream {
-		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
+		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 		return
 	}
-	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
+	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 }
 
 func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
@@ -1702,7 +2234,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry.response)
 }
 
-func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
+func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -1788,6 +2320,48 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 						"error", toolProtocolErrorString(parseResult.err),
 					)
 					if parseResult.err == nil && len(parseResult.calls) > 0 {
+						finalText, callOutputItems, historyRequestItems, handled, webSearchErr := p.completeResponsesViaServerWebSearch(r.Context(), authToken, model, showThinking, baseHistoryItems, requestItems, instructions, temperature, maxOutputTokens, currentTask, parseResult.calls)
+						if handled {
+							if webSearchErr != nil {
+								finalText = buildToolProtocolErrorMessage(webSearchErr, finalText)
+							}
+							finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
+							messageItem := buildResponsesMessageItem(messageID, finalText)
+							outputItems := append(cloneRawItems(callOutputItems), messageItem)
+							followupPromptInputItems := buildHistoryItems(baseHistoryItems, historyRequestItems, nil)
+							completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, followupPromptInputItems)
+							for index, item := range callOutputItems {
+								if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+									Type:        "response.output_item.added",
+									ResponseID:  responseID,
+									OutputIndex: index,
+									Item:        item,
+								}) {
+									return false
+								}
+							}
+							for index, item := range callOutputItems {
+								if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+									Type:        "response.output_item.done",
+									ResponseID:  responseID,
+									OutputIndex: index,
+									Item:        item,
+								}) {
+									return false
+								}
+							}
+							if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
+								return false
+							}
+							if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText) {
+								return false
+							}
+							if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+								return false
+							}
+							p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+							return true
+						}
 						outputItems := buildParsedToolOutputItems(parseResult.calls)
 						completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 						for index, item := range outputItems {
@@ -1921,6 +2495,36 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				"error", toolProtocolErrorString(parseResult.err),
 			)
 			if parseResult.err == nil && len(parseResult.calls) > 0 {
+				finalText, callOutputItems, historyRequestItems, handled, webSearchErr := p.completeResponsesViaServerWebSearch(r.Context(), authToken, model, showThinking, baseHistoryItems, requestItems, instructions, temperature, maxOutputTokens, currentTask, parseResult.calls)
+				if handled {
+					if webSearchErr != nil {
+						finalText = buildToolProtocolErrorMessage(webSearchErr, finalText)
+					}
+					finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
+					messageItem := buildResponsesMessageItem(messageID, finalText)
+					outputItems := append(cloneRawItems(callOutputItems), messageItem)
+					followupPromptInputItems := buildHistoryItems(baseHistoryItems, historyRequestItems, nil)
+					completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, followupPromptInputItems)
+					for index, item := range callOutputItems {
+						writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+							Type:        "response.output_item.added",
+							ResponseID:  responseID,
+							OutputIndex: index,
+							Item:        item,
+						})
+						writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+							Type:        "response.output_item.done",
+							ResponseID:  responseID,
+							OutputIndex: index,
+							Item:        item,
+						})
+					}
+					writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID)
+					writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
+					writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
+					p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+					return
+				}
 				outputItems := buildParsedToolOutputItems(parseResult.calls)
 				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 				for index, item := range outputItems {
@@ -1968,6 +2572,28 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 
 	// If stream ended without done/content, emit a terminal error response instead of leaving client pending.
 	if !doneReceived && !contentEmitted && result.Len() == 0 && !clientGone && !errors.Is(scanErr, context.Canceled) {
+		if fallbackText, ok := fallbackFinalTextForIncompleteResponses(currentTask, evidence, checkControlMarkup, scanErr); ok {
+			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, fallbackText)}
+			if bufferForToolCalls {
+				if !writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID) {
+					return
+				}
+			}
+			if delayRawTextDeltas && fallbackText != "" {
+				if !writeResponsesTextDelta(writeAndFlushEvent, responseID, messageID, fallbackText) {
+					return
+				}
+			}
+			if !writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, fallbackText) {
+				return
+			}
+			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+			if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+				return
+			}
+			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			return
+		}
 		finalText := "Codex adapter error: upstream response ended without a completion signal"
 		if scanErr != nil {
 			finalText = "Codex adapter error: upstream stream failed before content: " + scanErr.Error()
@@ -2000,7 +2626,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
+func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.transport.Timeout())
 	defer cancel()
 
@@ -2080,6 +2706,14 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		slog.Warn("responses stream read error but content available, returning partial response", "response_id", responseID, "error", scanErr)
 	}
 	if !doneReceived && !contentEmitted && result.Len() == 0 {
+		if fallbackText, ok := fallbackFinalTextForIncompleteResponses(currentTask, evidence, checkControlMarkup, nil); ok {
+			createdAt := time.Now().Unix()
+			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, fallbackText)}
+			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			writeJSON(w, http.StatusOK, completed)
+			return
+		}
 		slog.Error("responses stream ended without done event and no content", "response_id", responseID)
 		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "upstream response ended without a completion signal")
 		return
@@ -2111,6 +2745,20 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 			"error", toolProtocolErrorString(parseResult.err),
 		)
 		if parseResult.err == nil && len(parseResult.calls) > 0 {
+			finalText, callOutputItems, historyRequestItems, handled, webSearchErr := p.completeResponsesViaServerWebSearch(ctx, authToken, model, showThinking, baseHistoryItems, requestItems, instructions, temperature, maxOutputTokens, currentTask, parseResult.calls)
+			if handled {
+				if webSearchErr != nil {
+					finalText = buildToolProtocolErrorMessage(webSearchErr, finalText)
+				}
+				finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
+				messageItem := buildResponsesMessageItem(messageID, finalText)
+				outputItems := append(cloneRawItems(callOutputItems), messageItem)
+				followupPromptInputItems := buildHistoryItems(baseHistoryItems, historyRequestItems, nil)
+				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, followupPromptInputItems)
+				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+				writeJSON(w, http.StatusOK, completed)
+				return
+			}
 			outputItems := buildParsedToolOutputItems(parseResult.calls)
 			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
@@ -2129,4 +2777,24 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 	completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 	p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 	writeJSON(w, http.StatusOK, completed)
+}
+
+func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvidence, checkControlMarkup bool, scanErr error) (string, bool) {
+	if scanErr != nil {
+		return "", false
+	}
+	if strings.TrimSpace(task) == "" || taskLikelyNeedsWrite(task) {
+		return "", false
+	}
+	if len(extractRequiredOutputLabels(task)) == 0 {
+		return "", false
+	}
+	if !taskCompletionSatisfied(task, evidence) || !allObservedOutputsSucceeded(evidence) {
+		return "", false
+	}
+	finalText := strings.TrimSpace(constrainFinalText(task, "", evidence, checkControlMarkup))
+	if finalText == "" || strings.HasPrefix(finalText, "Codex adapter error:") {
+		return "", false
+	}
+	return finalText, true
 }

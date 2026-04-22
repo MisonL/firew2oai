@@ -20,6 +20,36 @@ var taskTargetKeywords = []string{
 	"sed -n", "ls -", "cat ", "git diff", "git status", "命令", "文件", "目录",
 }
 
+var taskToolKeywords = []string{
+	"exec_command",
+	"write_stdin",
+	"update_plan",
+	"js_repl",
+	"js_repl_reset",
+	"web_search",
+	"view_image",
+	"spawn_agent",
+	"send_input",
+	"resume_agent",
+	"wait_agent",
+	"close_agent",
+	"list_mcp_resources",
+	"list_mcp_resource_templates",
+	"read_mcp_resource",
+	"mcp__",
+	"chrome devtools",
+	"docfork",
+	"cloudflare api",
+	"search_docs",
+	"fetch_doc",
+	"new_page",
+	"take_snapshot",
+	"wait_for",
+	"必须使用",
+	"must use",
+	"use the exact tool",
+}
+
 var taskPlainResponseKeywords = []string{
 	"summarize", "summary", "explain", "description", "概述", "总结", "解释", "介绍",
 }
@@ -86,7 +116,7 @@ var taskCommandTrailingStepPattern = regexp.MustCompile(`\s+\d+[.)][\s\S]*$`)
 var taskBacktickPattern = regexp.MustCompile("`([^`\\n]+)`")
 var goTestNamePattern = regexp.MustCompile(`\bTest[A-Z][A-Za-z0-9_]*\b`)
 var taskOutputLabelPattern = regexp.MustCompile(`\b([A-Z][A-Z0-9_]{1,24}):`)
-var taskPlainOutputLabelListPattern = regexp.MustCompile(`(?i)(?:只输出|only output|output only)[^A-Z\n]{0,40}([A-Z][A-Z0-9_]{1,24}(?:\s*[、，,;；/]\s*[A-Z][A-Z0-9_]{1,24}){1,7})`)
+var taskPlainOutputLabelListPattern = regexp.MustCompile(`(?i)(?:只输出|仅输出|最终输出|最后输出|only output|output only)[^A-Z\n]{0,40}([A-Z][A-Z0-9_]{1,24}(?:\s*[、，,;；/]\s*[A-Z][A-Z0-9_]{1,24}){1,7})`)
 var taskBulletPrefixPattern = regexp.MustCompile(`^\s*(?:[-*]|\d+[.)]|[（(]?\d+[）)])\s*`)
 var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only output|output only)\b[\s\S]*$`)
 var taskCommandTrailingConnectorPattern = regexp.MustCompile(`(?:\s|，|,|、|；|;)*(?:和|以及|及|and|then|然后)\s*$`)
@@ -197,11 +227,15 @@ func isWeakFollowupTask(task string) bool {
 }
 
 func isToolResultSummaryMessage(text string) bool {
-	lower := strings.ToLower(strings.TrimSpace(text))
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
 	if lower == "" {
 		return false
 	}
-	return strings.HasPrefix(lower, "tool result") || strings.HasPrefix(lower, "tool output")
+	if strings.HasPrefix(lower, "tool result") || strings.HasPrefix(lower, "tool output") {
+		return true
+	}
+	return strings.HasPrefix(trimmed, "<subagent_notification>")
 }
 
 func extractBestActionableTaskBlock(text string) string {
@@ -358,6 +392,9 @@ func taskLikelyNeedsTools(task string) bool {
 			return true
 		}
 	}
+	if containsAny(lower, taskToolKeywords) {
+		return true
+	}
 
 	hasAction := containsAny(lower, taskActionKeywords)
 	hasTarget := containsAny(lower, taskTargetKeywords) || strings.ContainsAny(trimmed, "/\\`")
@@ -441,6 +478,297 @@ func buildTaskCompletionGate(task string) string {
 	b.WriteString("If required items are still pending, emit AI_ACTIONS with mode tool for the next concrete step.\n")
 	b.WriteString("If you are blocked after repeated failures, emit mode final with a concise blocker report and list unmet items.\n")
 	b.WriteString("</TASK_COMPLETION_GATE>\n")
+	return b.String()
+}
+
+func extractExplicitToolMentions(task string, toolCatalog map[string]responseToolDescriptor) []string {
+	task = strings.TrimSpace(task)
+	if task == "" || len(toolCatalog) == 0 {
+		return nil
+	}
+
+	type toolAlias struct {
+		declared string
+		alias    string
+		strict   bool
+	}
+	type matchedTool struct {
+		declared string
+		index    int
+		end      int
+	}
+
+	shortNameOwners := make(map[string]string)
+	shortNameAmbiguous := make(map[string]struct{})
+	for declared := range toolCatalog {
+		short := shortToolName(declared)
+		if short == "" || short == declared {
+			continue
+		}
+		key := strings.ToLower(short)
+		if owner, ok := shortNameOwners[key]; ok && owner != declared {
+			shortNameAmbiguous[key] = struct{}{}
+			continue
+		}
+		shortNameOwners[key] = declared
+	}
+
+	aliases := make([]toolAlias, 0, len(toolCatalog)*2)
+	for declared := range toolCatalog {
+		for _, alias := range toolNameAliasVariants(declared) {
+			alias = strings.TrimSpace(alias)
+			if alias == "" {
+				continue
+			}
+			aliases = append(aliases, toolAlias{
+				declared: declared,
+				alias:    alias,
+				strict:   strings.Contains(alias, ".") || strings.HasPrefix(alias, "mcp__"),
+			})
+		}
+
+		short := shortToolName(declared)
+		key := strings.ToLower(short)
+		if short == "" || short == declared {
+			continue
+		}
+		if _, ambiguous := shortNameAmbiguous[key]; ambiguous {
+			continue
+		}
+		if owner := shortNameOwners[key]; owner != declared {
+			continue
+		}
+		aliases = append(aliases, toolAlias{
+			declared: declared,
+			alias:    short,
+			strict:   false,
+		})
+	}
+
+	lowerTask := strings.ToLower(task)
+	matches := make([]matchedTool, 0, len(aliases))
+	for _, candidate := range aliases {
+		alias := strings.TrimSpace(candidate.alias)
+		if alias == "" {
+			continue
+		}
+		aliasLower := strings.ToLower(alias)
+		indices := []int(nil)
+		if candidate.strict {
+			searchFrom := 0
+			for searchFrom <= len(lowerTask)-len(aliasLower) {
+				index := strings.Index(lowerTask[searchFrom:], aliasLower)
+				if index < 0 {
+					break
+				}
+				index += searchFrom
+				indices = append(indices, index)
+				searchFrom = index + len(aliasLower)
+			}
+		} else {
+			indices = findAllTaskKeywordIndices(lowerTask, aliasLower)
+		}
+		if len(indices) == 0 {
+			continue
+		}
+		for _, index := range indices {
+			if isNegatedToolMention(lowerTask, aliasLower, index) {
+				continue
+			}
+			if isDescriptiveToolMention(lowerTask, aliasLower, index) {
+				continue
+			}
+			matches = append(matches, matchedTool{
+				declared: candidate.declared,
+				index:    index,
+				end:      index + len(aliasLower),
+			})
+		}
+	}
+
+	if len(matches) == 0 {
+		return nil
+	}
+
+	sort.SliceStable(matches, func(i, j int) bool {
+		if matches[i].index == matches[j].index {
+			return matches[i].declared < matches[j].declared
+		}
+		return matches[i].index < matches[j].index
+	})
+
+	ordered := make([]string, 0, len(matches))
+	lastRangeByTool := make(map[string][2]int, len(matches))
+	for _, match := range matches {
+		if lastRange, ok := lastRangeByTool[match.declared]; ok {
+			if match.index <= lastRange[1] && match.end >= lastRange[0] {
+				continue
+			}
+		}
+		lastRangeByTool[match.declared] = [2]int{match.index, match.end}
+		ordered = append(ordered, match.declared)
+	}
+	return ordered
+}
+
+func isNegatedToolMention(lowerTask, aliasLower string, index int) bool {
+	if index < 0 || aliasLower == "" {
+		return false
+	}
+	start := index - 64
+	if start < 0 {
+		start = 0
+	}
+	prefix := lowerTask[start:index]
+	suffixStart := index + len(aliasLower)
+	if suffixStart > len(lowerTask) {
+		suffixStart = len(lowerTask)
+	}
+	suffixEnd := suffixStart + 64
+	if suffixEnd > len(lowerTask) {
+		suffixEnd = len(lowerTask)
+	}
+	suffix := lowerTask[suffixStart:suffixEnd]
+
+	for _, marker := range []string{
+		"禁止使用",
+		"禁止调用",
+		"不要使用",
+		"不要调用",
+		"不得使用",
+		"不得调用",
+		"不能使用",
+		"不能调用",
+		"勿使用",
+		"勿调用",
+		"禁用",
+		"do not use",
+		"do not call",
+		"don't use",
+		"don't call",
+		"must not use",
+		"must not call",
+		"avoid using",
+		"avoid calling",
+		"rather than use",
+	} {
+		if strings.Contains(prefix, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{
+		"代替",
+		"替代",
+		"instead of",
+		"rather than",
+	} {
+		if strings.Contains(prefix, marker) || strings.Contains(suffix, marker) {
+			if strings.Contains(prefix, "禁止") || strings.Contains(prefix, "不要") || strings.Contains(prefix, "不得") || strings.Contains(prefix, "不能") || strings.Contains(prefix, "勿") || strings.Contains(prefix, "禁用") || strings.Contains(prefix, "do not") || strings.Contains(prefix, "don't") || strings.Contains(prefix, "must not") || strings.Contains(prefix, "avoid") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isDescriptiveToolMention(lowerTask, aliasLower string, index int) bool {
+	if index < 0 || aliasLower == "" {
+		return false
+	}
+	if isOutputLabelToolMention(lowerTask, aliasLower, index) {
+		return true
+	}
+
+	start := index - 64
+	if start < 0 {
+		start = 0
+	}
+	prefix := lowerTask[start:index]
+
+	suffixStart := index + len(aliasLower)
+	if suffixStart > len(lowerTask) {
+		suffixStart = len(lowerTask)
+	}
+	suffixEnd := suffixStart + 8
+	if suffixEnd > len(lowerTask) {
+		suffixEnd = len(lowerTask)
+	}
+	suffix := strings.TrimSpace(lowerTask[suffixStart:suffixEnd])
+	if !strings.HasPrefix(suffix, ":") && !strings.HasPrefix(suffix, "：") {
+		return false
+	}
+	for _, marker := range []string{
+		"验证",
+		"测试",
+		"核验",
+		"check",
+		"verify",
+		"probe",
+	} {
+		if strings.Contains(prefix, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isOutputLabelToolMention(lowerTask, aliasLower string, index int) bool {
+	if index < 0 || aliasLower == "" {
+		return false
+	}
+	start := index - 32
+	if start < 0 {
+		start = 0
+	}
+	prefix := lowerTask[start:index]
+	for _, marker := range []string{
+		"result:",
+		"files:",
+		"test:",
+		"note:",
+		"constraint:",
+		"evidence:",
+	} {
+		if strings.Contains(prefix, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func shortToolName(name string) string {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	if idx := strings.LastIndex(trimmed, "__"); strings.HasPrefix(trimmed, "mcp__") && idx >= len("mcp__") && idx+2 < len(trimmed) {
+		return strings.TrimSpace(trimmed[idx+2:])
+	}
+	if idx := strings.LastIndex(trimmed, "."); idx >= 0 && idx+1 < len(trimmed) {
+		return strings.TrimSpace(trimmed[idx+1:])
+	}
+	return strings.TrimSpace(path.Base(trimmed))
+}
+
+func buildExplicitToolUseBlock(task string, toolCatalog map[string]responseToolDescriptor) string {
+	tools := extractExplicitToolMentions(task, toolCatalog)
+	if len(tools) == 0 {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n<EXPLICIT_TOOL_REQUIREMENTS>\n")
+	b.WriteString("CURRENT_USER_TASK explicitly requires these tool names. Use them exactly as declared:\n")
+	for _, name := range tools {
+		b.WriteString("- ")
+		b.WriteString(name)
+		b.WriteByte('\n')
+	}
+	b.WriteString("Do not describe intended tool use in prose before the tool call.\n")
+	b.WriteString("Narration like \"I'll use web_search\" without a real tool call is invalid.\n")
+	b.WriteString("If the next required tool has not been called yet, emit AI_ACTIONS mode tool immediately with no visible text before the block.\n")
+	b.WriteString("Do not emit mode final until the explicit tool requirement is satisfied or a tool error blocks progress.\n")
+	b.WriteString("</EXPLICIT_TOOL_REQUIREMENTS>\n")
 	return b.String()
 }
 
@@ -564,10 +892,28 @@ func findTaskKeywordIndex(text, keyword string) int {
 	return -1
 }
 
+func findAllTaskKeywordIndices(text, keyword string) []int {
+	if text == "" || keyword == "" {
+		return nil
+	}
+	indices := make([]int, 0, 2)
+	searchFrom := 0
+	for searchFrom <= len(text)-len(keyword) {
+		idx := findTaskKeywordIndex(text[searchFrom:], keyword)
+		if idx < 0 {
+			break
+		}
+		idx += searchFrom
+		indices = append(indices, idx)
+		searchFrom = idx + len(keyword)
+	}
+	return indices
+}
+
 func isASCIIAlphaNumericKeyword(keyword string) bool {
 	for i := 0; i < len(keyword); i++ {
 		c := keyword[i]
-		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') {
+		if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
 			continue
 		}
 		return false
@@ -759,7 +1105,7 @@ func extractInlineCommands(task string) []string {
 		if i+1 < len(starts) && starts[i+1] < end {
 			end = starts[i+1]
 		}
-		if punct := strings.IndexAny(task[start:end], "\n。；;"); punct >= 0 {
+		if punct := strings.IndexAny(task[start:end], "\n。；;，"); punct >= 0 {
 			end = start + punct
 		}
 		cmd := strings.TrimSpace(task[start:end])
@@ -890,7 +1236,12 @@ func isLikelyTaskShellCommand(text string) bool {
 
 func extractRequiredOutputLabels(task string) []string {
 	lower := strings.ToLower(task)
-	if !strings.Contains(lower, "只输出") && !strings.Contains(lower, "only output") && !strings.Contains(lower, "output only") {
+	if !strings.Contains(lower, "只输出") &&
+		!strings.Contains(lower, "仅输出") &&
+		!strings.Contains(lower, "最终输出") &&
+		!strings.Contains(lower, "最后输出") &&
+		!strings.Contains(lower, "only output") &&
+		!strings.Contains(lower, "output only") {
 		return nil
 	}
 	if labels := extractPlainRequiredOutputLabels(task); len(labels) > 0 {
@@ -911,6 +1262,64 @@ func extractRequiredOutputLabels(task string) []string {
 	return dedupePreserveOrder(labels)
 }
 
+func extractRequiredOutputLabelHints(task string) map[string]string {
+	labels := extractRequiredOutputLabels(task)
+	if len(labels) == 0 {
+		return nil
+	}
+	section := requiredOutputSection(task)
+	matches := taskOutputLabelPattern.FindAllStringSubmatchIndex(section, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	allowed := make(map[string]string, len(labels))
+	for _, label := range labels {
+		allowed[strings.ToUpper(strings.TrimSpace(label))] = label
+	}
+	hints := make(map[string]string, len(labels))
+	for i, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+		rawLabel := strings.ToUpper(strings.TrimSpace(section[match[2]:match[3]]))
+		label, ok := allowed[rawLabel]
+		if !ok {
+			continue
+		}
+		valueStart := match[1]
+		valueEnd := len(section)
+		for j := i + 1; j < len(matches); j++ {
+			if len(matches[j]) < 4 {
+				continue
+			}
+			nextLabel := strings.ToUpper(strings.TrimSpace(section[matches[j][2]:matches[j][3]]))
+			if _, ok := allowed[nextLabel]; !ok {
+				continue
+			}
+			valueEnd = matches[j][0]
+			break
+		}
+		value := strings.TrimSpace(section[valueStart:valueEnd])
+		value = strings.Trim(value, " \t\r\n;；")
+		if value == "" {
+			continue
+		}
+		hints[label] = value
+	}
+	if len(hints) == 0 {
+		return nil
+	}
+	return hints
+}
+
+func extractRequiredOutputLabelHint(task, label string) string {
+	hints := extractRequiredOutputLabelHints(task)
+	if len(hints) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(hints[label])
+}
+
 func requiredOutputSection(task string) string {
 	trimmed := strings.TrimSpace(task)
 	if trimmed == "" {
@@ -926,6 +1335,8 @@ func requiredOutputSection(task string) string {
 		"最终仅输出",
 		"完成后仅输出",
 		"仅输出",
+		"最终输出",
+		"最后输出",
 		"only output",
 		"output only",
 	} {

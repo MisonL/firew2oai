@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"log/slog"
+	neturl "net/url"
 	"path"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,6 +15,8 @@ type executionPolicy struct {
 	Enabled              bool
 	Stage                string
 	RequireTool          bool
+	NextRequiredTool     string
+	ExplicitTools        []string
 	ReadLoop             bool
 	PendingWrite         bool
 	MissingFiles         []string
@@ -26,6 +30,7 @@ type executionPolicy struct {
 	SeenCommands         []string
 	ForceSingleToolCall  bool
 	AllowTruncateToMax   bool
+	SyntheticToolCall    *parsedToolCall
 }
 
 type executionHistorySignals struct {
@@ -44,7 +49,30 @@ type executionHistorySignals struct {
 	ReadResultPosByFile map[string]int
 }
 
+func buildInitialRequiredToolBlock(task string, toolCatalog map[string]responseToolDescriptor, historyItems []json.RawMessage) string {
+	if len(toolCatalog) == 0 {
+		return ""
+	}
+	nextTool := nextUnmetExplicitTool(task, toolCatalog, historyItems)
+	if nextTool == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n<INITIAL_REQUIRED_TOOL>\n")
+	b.WriteString("The first tool call for CURRENT_USER_TASK must be ")
+	b.WriteString(nextTool)
+	b.WriteString(".\n")
+	b.WriteString("Do not emit narration before that tool call.\n")
+	b.WriteString("</INITIAL_REQUIRED_TOOL>\n")
+	return b.String()
+}
+
 func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMessage, hasTools, toolsDisabled, autoRequireTool bool) executionPolicy {
+	return buildExecutionPolicyWithCatalog(model, currentTask, historyItems, nil, hasTools, toolsDisabled, autoRequireTool)
+}
+
+func buildExecutionPolicyWithCatalog(model, currentTask string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, hasTools, toolsDisabled, autoRequireTool bool) executionPolicy {
 	strictLoop := modelNeedsStrictToolLoop(model)
 	policy := executionPolicy{
 		ForceSingleToolCall: strictLoop,
@@ -57,6 +85,15 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 	}
 
 	signals := collectExecutionHistorySignals(historyItems)
+	explicitTools := extractExplicitToolMentions(task, toolCatalog)
+	nextRequiredTool := nextUnmetExplicitToolFromSequence(explicitTools, toolCatalog, historyItems)
+	if nextRequiredTool == "" && jsReplFollowupStillRequired(task, historyItems, toolCatalog) {
+		nextRequiredTool = "js_repl"
+	}
+	if len(explicitTools) > 1 {
+		policy.ForceSingleToolCall = true
+		policy.AllowTruncateToMax = true
+	}
 	requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
 	allMentionedFiles := dedupePreserveOrder(taskFilePathPattern.FindAllString(task, -1))
 	var requiredFiles []string
@@ -96,6 +133,8 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 	policy.MissingFiles = missingFiles
 	policy.EmptyFiles = emptyFiles
 	policy.RepeatedScaffold = repeatedScaffold
+	policy.ExplicitTools = explicitTools
+	policy.NextRequiredTool = nextRequiredTool
 	policy.AllRequiredFilesSeen = allRequiredFilesSeen(signals.Commands, requiredFiles)
 	policy.HasWriteObserved = signals.WriteCalls > 0
 	policy.SeenCommands = dedupePreserveOrder(signals.Commands)
@@ -118,6 +157,13 @@ func buildExecutionPolicy(model, currentTask string, historyItems []json.RawMess
 
 	if autoRequireTool && signals.ToolCalls == 0 {
 		policy.RequireTool = true
+	}
+	if nextRequiredTool != "" {
+		policy.RequireTool = true
+		if policy.Stage == "" || policy.Stage == "finalize" {
+			policy.Stage = "execute"
+		}
+		policy.SyntheticToolCall = buildSyntheticExplicitToolCall(nextRequiredTool, currentTask, historyItems, toolCatalog, nextCommand)
 	}
 	return policy
 }
@@ -179,6 +225,13 @@ func buildExecutionPolicyPromptBlock(policy executionPolicy) string {
 	if policy.RequireTool {
 		b.WriteString("This turn must emit AI_ACTIONS mode tool. Do not emit mode final yet.\n")
 	}
+	if policy.NextRequiredTool != "" {
+		b.WriteString("Explicit tool sequence is not complete yet.\n")
+		b.WriteString("Next required tool:\n- ")
+		b.WriteString(policy.NextRequiredTool)
+		b.WriteByte('\n')
+		b.WriteString("Do not emit mode final until that tool is called or a real tool error blocks progress.\n")
+	}
 	if policy.Stage == "finalize" {
 		b.WriteString("Stage finalize reached. Do not emit AI_ACTIONS mode tool. Return the final text answer now.\n")
 	}
@@ -237,6 +290,26 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 	if policy.Enabled && policy.Stage == "finalize" && !policy.RequireTool && constraints.RequiredTool == "" && len(result.calls) > 0 {
 		result.calls = nil
 		result.err = nil
+		result.candidateFound = true
+		return result
+	}
+	if policy.Enabled && policy.RequireTool && len(result.calls) == 0 && policy.SyntheticToolCall != nil {
+		result.calls = []parsedToolCall{*policy.SyntheticToolCall}
+		result.err = nil
+		result.visibleText = ""
+		result.mode = toolProtocolModeAIActionsTool
+		result.candidateFound = true
+		return result
+	}
+	if policy.Enabled && policy.RequireTool && len(result.calls) > 0 && policy.NextRequiredTool != "" && policy.SyntheticToolCall != nil && shouldRewriteCallsToSynthetic(result.calls, *policy.SyntheticToolCall) {
+		slog.Info("execution policy rewrite to synthetic required tool",
+			"stage", policy.Stage,
+			"next_required_tool", policy.NextRequiredTool,
+		)
+		result.calls = []parsedToolCall{*policy.SyntheticToolCall}
+		result.err = nil
+		result.visibleText = ""
+		result.mode = toolProtocolModeAIActionsTool
 		result.candidateFound = true
 		return result
 	}
@@ -547,6 +620,61 @@ func parsedCallsContainOnlyExecCommands(calls []parsedToolCall) bool {
 	return true
 }
 
+func shouldRewriteCallsToSynthetic(calls []parsedToolCall, synthetic parsedToolCall) bool {
+	if len(calls) != 1 {
+		return true
+	}
+	return !parsedToolCallsMatch(calls[0], synthetic)
+}
+
+func parsedToolCallsMatch(actual, expected parsedToolCall) bool {
+	actualName, actualCommand, actualOK := parsedToolCallInvocation(actual)
+	expectedName, expectedCommand, expectedOK := parsedToolCallInvocation(expected)
+	if !actualOK || !expectedOK || actualName != expectedName {
+		return false
+	}
+	if expectedName == "exec_command" {
+		return hasSatisfiedRequiredCommand([]string{actualCommand}, expectedCommand)
+	}
+
+	var actualItem map[string]any
+	if err := json.Unmarshal(actual.item, &actualItem); err != nil {
+		return false
+	}
+	var expectedItem map[string]any
+	if err := json.Unmarshal(expected.item, &expectedItem); err != nil {
+		return false
+	}
+
+	actualType, _ := actualItem["type"].(string)
+	expectedType, _ := expectedItem["type"].(string)
+	if actualType != expectedType {
+		return false
+	}
+
+	switch expectedType {
+	case "custom_tool_call":
+		return normalizeJSReplInput(asString(actualItem["input"])) == normalizeJSReplInput(asString(expectedItem["input"]))
+	case "function_call":
+		actualArgs := strings.TrimSpace(asString(actualItem["arguments"]))
+		expectedArgs := strings.TrimSpace(asString(expectedItem["arguments"]))
+		if actualArgs == expectedArgs {
+			return true
+		}
+		var actualDecoded any
+		if err := json.Unmarshal([]byte(actualArgs), &actualDecoded); err != nil {
+			return false
+		}
+		var expectedDecoded any
+		if err := json.Unmarshal([]byte(expectedArgs), &expectedDecoded); err != nil {
+			return false
+		}
+		return reflect.DeepEqual(actualDecoded, expectedDecoded)
+	default:
+		return false
+	}
+}
+
 func shouldAdvanceExplicitRequiredCommand(calls []parsedToolCall, nextCommand string, seenCommands []string) bool {
 	next := strings.TrimSpace(nextCommand)
 	if next == "" || len(calls) == 0 || len(seenCommands) == 0 {
@@ -650,6 +778,8 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			if isReadOnlyCommand(command) {
 				signals.ReadCalls++
 			}
+		case "web_search_call", "web_search":
+			signals.ToolCalls++
 		case "custom_tool_call":
 			name, _ := item["name"].(string)
 			normalizedName := normalizeToolName(name)
@@ -1468,6 +1598,9 @@ func inferToolOutputSuccess(text string) *bool {
 		"not found",
 		"permission denied",
 		"codex adapter guard:",
+		"upstream error",
+		"mcp error",
+		"tool error",
 		"process exited with code 1",
 		"process exited with code 2",
 		"process exited with code 126",
@@ -2068,4 +2201,686 @@ func buildSyntheticExecCommandCall(command string, toolCatalog map[string]respon
 		return parsedToolCall{}, false
 	}
 	return *call, true
+}
+
+func buildSyntheticStructuredToolCall(name string, arguments map[string]any, toolCatalog map[string]responseToolDescriptor, requiredTool string) (*parsedToolCall, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, false
+	}
+	if arguments == nil {
+		arguments = map[string]any{}
+	}
+	call, err := buildParsedToolCall(map[string]any{
+		"type":      "function_call",
+		"name":      name,
+		"arguments": arguments,
+	}, toolCatalog, requiredTool, false)
+	if err != nil {
+		return nil, false
+	}
+	return call, true
+}
+
+func nextUnmetExplicitTool(task string, toolCatalog map[string]responseToolDescriptor, historyItems []json.RawMessage) string {
+	return nextUnmetExplicitToolFromSequence(extractExplicitToolMentions(task, toolCatalog), toolCatalog, historyItems)
+}
+
+func nextUnmetExplicitToolFromSequence(explicitTools []string, toolCatalog map[string]responseToolDescriptor, historyItems []json.RawMessage) string {
+	if len(explicitTools) == 0 {
+		return ""
+	}
+	observed := collectObservedToolNames(historyItems, toolCatalog)
+	nextIndex := 0
+	for _, name := range observed {
+		if nextIndex >= len(explicitTools) {
+			break
+		}
+		if name == explicitTools[nextIndex] {
+			nextIndex++
+		}
+	}
+	if nextIndex >= len(explicitTools) {
+		return ""
+	}
+	return explicitTools[nextIndex]
+}
+
+func collectObservedToolNames(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) []string {
+	names := make([]string, 0, 8)
+	seenCallIDs := make(map[string]struct{}, len(historyItems))
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		if dedupeKey := observedToolHistoryDedupeKey(item, toolCatalog); dedupeKey != "" {
+			if _, exists := seenCallIDs[dedupeKey]; exists {
+				continue
+			}
+			seenCallIDs[dedupeKey] = struct{}{}
+		}
+		if name := observedToolNameFromHistoryItem(item, toolCatalog); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names
+}
+
+func observedToolHistoryDedupeKey(item map[string]any, toolCatalog map[string]responseToolDescriptor) string {
+	typ, _ := item["type"].(string)
+	switch typ {
+	case "function_call", "custom_tool_call":
+	default:
+		return ""
+	}
+	callID, _ := item["call_id"].(string)
+	callID = strings.TrimSpace(callID)
+	if callID == "" {
+		return ""
+	}
+	name := observedToolNameFromHistoryItem(item, toolCatalog)
+	if name == "" {
+		return ""
+	}
+	return typ + "|" + name + "|" + callID
+}
+
+func observedToolNameFromHistoryItem(item map[string]any, toolCatalog map[string]responseToolDescriptor) string {
+	typ, _ := item["type"].(string)
+	switch typ {
+	case "function_call", "custom_tool_call":
+		rawName, _ := item["name"].(string)
+		rawName = strings.TrimSpace(rawName)
+		if namespace, _ := item["namespace"].(string); namespace != "" && rawName != "" {
+			rawName = joinNamespaceToolName(namespace, rawName)
+		}
+		if rawName == "" {
+			return ""
+		}
+		normalized := normalizeToolName(rawName)
+		if normalized == "" {
+			return ""
+		}
+		if resolved, ok := resolveToolNameForCatalog(rawName, normalized, toolCatalog); ok {
+			if resolved == "js_repl" && typ == "custom_tool_call" {
+				slog.Info("observed js_repl tool call", "call_id", strings.TrimSpace(asString(item["call_id"])), "input", truncateForLog(extractJSReplInputFromHistoryItem(item), 200))
+			}
+			return resolved
+		}
+		if normalized == "js_repl" && typ == "custom_tool_call" {
+			slog.Info("observed js_repl tool call", "call_id", strings.TrimSpace(asString(item["call_id"])), "input", truncateForLog(extractJSReplInputFromHistoryItem(item), 200))
+		}
+		return normalized
+	case "mcp_tool_call":
+		server, _ := item["server"].(string)
+		tool, _ := item["tool"].(string)
+		server = strings.TrimSpace(server)
+		tool = strings.TrimSpace(tool)
+		if server == "" || tool == "" {
+			return ""
+		}
+		rawName := joinNamespaceToolName("mcp__"+server+"__", tool)
+		normalized := normalizeToolName(rawName)
+		if normalized == "" {
+			return ""
+		}
+		if resolved, ok := resolveToolNameForCatalog(rawName, normalized, toolCatalog); ok {
+			return resolved
+		}
+		return normalized
+	case "web_search", "web_search_call":
+		return "web_search"
+	default:
+		return ""
+	}
+}
+
+var explicitToolURLPattern = regexp.MustCompile(`https?://[^\s<>"')]+`)
+var syntheticToolURLTrailingReferencePattern = regexp.MustCompile(`(?:\[[0-9]+\]|【[0-9]+】)+$`)
+var taskJSReplFollowupPattern = regexp.MustCompile(`(?:再次|再一次|然后再次|然后再)\s*(?:使用\s+)?js_repl(?:\s*工具)?(?:\s*[:：])?(?:\s*(?:计算|执行|运行))?\s*([^\n。]+)`)
+var syntheticImagePathPattern = regexp.MustCompile(`(?i)(?:/)?(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:png|jpe?g|webp|gif)`)
+var syntheticChromeSnapshotButtonUIDPattern = regexp.MustCompile(`(?m)uid=([A-Za-z0-9_:.\\-]+)\s+button\b`)
+var syntheticWaitForTextPattern = regexp.MustCompile(`(?is)wait_for[\s\S]{0,160}?(?:出现|显示|包含|become|show|shows|contains?)\s+([A-Za-z0-9_./:-]+)`)
+var syntheticAgentIDPattern = regexp.MustCompile(`(?i)"agent_id"\s*:\s*"([^"]+)"`)
+var syntheticSpawnAgentTaskPattern = regexp.MustCompile(`(?is)(?:子代理任务(?:是|为)?|spawn_agent[\s\S]{0,80}?)(读取[\s\S]{0,120}?(?:返回结果|返回|汇报|并返回结果|即可返回|即可))`)
+
+func buildSyntheticExplicitToolCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, nextCommand string) *parsedToolCall {
+	switch shortToolName(nextRequiredTool) {
+	case "take_snapshot", "js_repl_reset", "list_mcp_resource_templates":
+		return buildSyntheticNoArgToolCall(nextRequiredTool, toolCatalog)
+	case "spawn_agent":
+		return buildSyntheticSpawnAgentCall(nextRequiredTool, task, toolCatalog)
+	case "exec_command":
+		return buildSyntheticRequiredExecCommandCall(nextRequiredTool, task, historyItems, toolCatalog, nextCommand)
+	case "js_repl":
+		return buildSyntheticJSReplCall(nextRequiredTool, task, historyItems, toolCatalog)
+	case "view_image":
+		return buildSyntheticViewImageCall(nextRequiredTool, task, historyItems, toolCatalog)
+	case "click":
+		return buildSyntheticChromeClickCall(nextRequiredTool, historyItems, toolCatalog)
+	case "wait_for":
+		return buildSyntheticChromeWaitForCall(nextRequiredTool, task, toolCatalog)
+	case "fetch_doc":
+		return buildSyntheticDocforkFetchDocCall(nextRequiredTool, historyItems, toolCatalog)
+	case "wait_agent":
+		return buildSyntheticWaitAgentCall(nextRequiredTool, historyItems, toolCatalog)
+	case "close_agent":
+		return buildSyntheticCloseAgentCall(nextRequiredTool, historyItems, toolCatalog)
+	default:
+		return nil
+	}
+}
+
+func buildSyntheticNoArgToolCall(nextRequiredTool string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func buildSyntheticCustomToolCall(name, input string, toolCatalog map[string]responseToolDescriptor, requiredTool string) (*parsedToolCall, bool) {
+	name = strings.TrimSpace(name)
+	input = strings.TrimSpace(input)
+	if name == "" || input == "" {
+		return nil, false
+	}
+	call, err := buildParsedToolCall(map[string]any{
+		"type":  "custom_tool_call",
+		"name":  name,
+		"input": input,
+	}, toolCatalog, requiredTool, false)
+	if err != nil {
+		return nil, false
+	}
+	return call, true
+}
+
+func buildSyntheticJSReplCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	if countObservedToolName(historyItems, toolCatalog, "js_repl") == 0 || countObservedToolName(historyItems, toolCatalog, "js_repl_reset") == 0 {
+		return nil
+	}
+	expr, ok := extractTaskJSReplFollowupInput(task)
+	if !ok {
+		return nil
+	}
+	call, ok := buildSyntheticCustomToolCall(nextRequiredTool, expr, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func buildSyntheticRequiredExecCommandCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, nextCommand string) *parsedToolCall {
+	command := strings.TrimSpace(nextCommand)
+	signals := collectExecutionHistorySignals(historyItems)
+	if command == "" {
+		requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
+		for _, candidate := range requiredCommands {
+			if hasSatisfiedRequiredCommand(signals.SuccessfulCommands, candidate) {
+				continue
+			}
+			if len(signals.SuccessfulCommands) == 0 && hasSatisfiedRequiredCommand(signals.Commands, candidate) {
+				continue
+			}
+			command = candidate
+			break
+		}
+	}
+	if command == "" {
+		command = chooseNextExecutionCommand(
+			dedupePreserveOrder(extractRequiredCommands(task)),
+			dedupePreserveOrder(taskFilePathPattern.FindAllString(task, -1)),
+			signals,
+			taskLikelyNeedsWrite(task),
+		)
+	}
+	call, ok := buildSyntheticExecCommandCall(command, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return &call
+}
+
+func buildSyntheticViewImageCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	imagePath := extractTaskImagePath(task)
+	if imagePath == "" {
+		return nil
+	}
+	if !path.IsAbs(imagePath) {
+		signals := collectExecutionHistorySignals(historyItems)
+		cwd := firstNonEmptyOutputLine(signals.CommandOutputs["pwd"])
+		if !path.IsAbs(cwd) {
+			return nil
+		}
+		imagePath = path.Join(cwd, imagePath)
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"path": imagePath}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func extractTaskImagePath(task string) string {
+	match := syntheticImagePathPattern.FindString(task)
+	return strings.TrimSpace(match)
+}
+
+func firstNonEmptyOutputLine(text string) string {
+	for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func buildSyntheticChromeClickCall(nextRequiredTool string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	text := latestToolOutputTextByName(historyItems, toolCatalog, "mcp__chrome_devtools__take_snapshot")
+	if text == "" {
+		return nil
+	}
+	matches := syntheticChromeSnapshotButtonUIDPattern.FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"uid": strings.TrimSpace(matches[1])}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func buildSyntheticChromeWaitForCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	matches := syntheticWaitForTextPattern.FindStringSubmatch(task)
+	if len(matches) < 2 {
+		return nil
+	}
+	target := strings.Trim(matches[1], " \t\r\n`'\"")
+	if target == "" {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"text": []string{target}}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func buildSyntheticSpawnAgentCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	message := extractSpawnAgentTask(task)
+	if message == "" {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"message": message}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func buildSyntheticWaitAgentCall(nextRequiredTool string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	agentID := latestSpawnedAgentID(historyItems)
+	if agentID == "" {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"targets": []string{agentID}}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func extractSpawnAgentTask(task string) string {
+	matches := syntheticSpawnAgentTaskPattern.FindStringSubmatch(task)
+	if len(matches) >= 2 {
+		message := strings.TrimSpace(matches[1])
+		message = strings.TrimRight(message, "。；; \t\r\n")
+		if message != "" {
+			return message
+		}
+	}
+
+	lines := strings.Split(task, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if !strings.Contains(line, "README.md") {
+			continue
+		}
+		if !strings.Contains(line, "读取") && !strings.Contains(strings.ToLower(line), "read") {
+			continue
+		}
+		line = strings.TrimLeft(line, "0123456789.)、- \t")
+		line = strings.TrimPrefix(line, "子代理任务是")
+		line = strings.TrimPrefix(line, "子代理任务为")
+		line = strings.TrimSpace(line)
+		line = strings.TrimRight(line, "。；; \t\r\n")
+		if line != "" {
+			return line
+		}
+	}
+	return ""
+}
+
+func buildSyntheticCloseAgentCall(nextRequiredTool string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	agentID := latestSpawnedAgentID(historyItems)
+	if agentID == "" {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"target": agentID}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func extractTaskJSReplFollowupInput(task string) (string, bool) {
+	matches := taskJSReplFollowupPattern.FindAllStringSubmatch(task, -1)
+	if len(matches) == 0 {
+		return "", false
+	}
+	expr := normalizeJSReplInput(matches[len(matches)-1][1])
+	if expr == "" {
+		return "", false
+	}
+	return expr, true
+}
+
+func normalizeJSReplInput(input string) string {
+	normalized := strings.TrimSpace(input)
+	normalized = strings.Trim(normalized, " \t\r\n`'\"")
+	return normalized
+}
+
+func extractJSReplInputFromHistoryItem(item map[string]any) string {
+	switch typ, _ := item["type"].(string); typ {
+	case "custom_tool_call":
+		if input, ok := item["input"].(string); ok {
+			return normalizeJSReplInput(input)
+		}
+	case "function_call":
+		if args, ok := item["arguments"].(string); ok {
+			return normalizeJSReplInput(args)
+		}
+		if args, ok := item["arguments"].(map[string]any); ok {
+			if input, ok := args["input"].(string); ok {
+				return normalizeJSReplInput(input)
+			}
+		}
+	}
+	return ""
+}
+
+func jsReplFollowupStillRequired(task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) bool {
+	want, ok := extractTaskJSReplFollowupInput(task)
+	if !ok {
+		return false
+	}
+
+	seenReset := false
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		switch observedToolNameFromHistoryItem(item, toolCatalog) {
+		case "js_repl_reset":
+			seenReset = true
+		case "js_repl":
+			if !seenReset {
+				continue
+			}
+			if extractJSReplInputFromHistoryItem(item) == want {
+				return false
+			}
+		}
+	}
+	return seenReset
+}
+
+func countObservedToolName(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, want string) int {
+	want = strings.TrimSpace(want)
+	if want == "" {
+		return 0
+	}
+	count := 0
+	for _, name := range collectObservedToolNames(historyItems, toolCatalog) {
+		if name == want {
+			count++
+		}
+	}
+	return count
+}
+
+func buildSyntheticDocforkFetchDocCall(nextRequiredTool string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	searchTool := "search_docs"
+	if strings.HasPrefix(nextRequiredTool, "mcp__") {
+		if idx := strings.LastIndex(nextRequiredTool, "__"); idx >= len("mcp__") {
+			namespace := strings.TrimSpace(nextRequiredTool[:idx])
+			if namespace != "" {
+				searchTool = joinNamespaceToolName(namespace, "search_docs")
+			}
+		}
+	}
+
+	callIDToTool := make(map[string]string, 8)
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		callID, _ := item["call_id"].(string)
+		if callID == "" {
+			continue
+		}
+		if name := observedToolNameFromHistoryItem(item, toolCatalog); name != "" {
+			callIDToTool[callID] = name
+		}
+	}
+
+	for i := len(historyItems) - 1; i >= 0; i-- {
+		var item map[string]any
+		if err := json.Unmarshal(historyItems[i], &item); err != nil {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		switch typ {
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+		default:
+			continue
+		}
+		callID, _ := item["call_id"].(string)
+		if callID == "" || callIDToTool[callID] != searchTool {
+			continue
+		}
+		text, _ := extractToolOutputText(item["output"])
+		url := sanitizeSyntheticToolURL(explicitToolURLPattern.FindString(text))
+		if url == "" {
+			continue
+		}
+		call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"url": url}, toolCatalog, nextRequiredTool)
+		if ok {
+			return call
+		}
+	}
+	return nil
+}
+
+func latestToolOutputTextByName(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, wantTool string) string {
+	wantTool = strings.TrimSpace(wantTool)
+	if wantTool == "" {
+		return ""
+	}
+	callIDToTool := make(map[string]string, len(historyItems))
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		callID := historyToolCallIdentifier(item)
+		if callID == "" {
+			continue
+		}
+		if name := observedToolNameFromHistoryItem(item, toolCatalog); name != "" {
+			callIDToTool[callID] = name
+		}
+	}
+	for i := len(historyItems) - 1; i >= 0; i-- {
+		var item map[string]any
+		if err := json.Unmarshal(historyItems[i], &item); err != nil {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		switch typ {
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+		default:
+			continue
+		}
+		callID := historyToolCallIdentifier(item)
+		if callID == "" || callIDToTool[callID] != wantTool {
+			continue
+		}
+		text, _ := extractToolOutputText(item["output"])
+		if strings.TrimSpace(text) != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func historyToolCallIdentifier(item map[string]any) string {
+	callID := strings.TrimSpace(asString(item["call_id"]))
+	if callID != "" {
+		return callID
+	}
+	return strings.TrimSpace(asString(item["id"]))
+}
+
+func latestSpawnedAgentID(historyItems []json.RawMessage) string {
+	for i := len(historyItems) - 1; i >= 0; i-- {
+		if len(historyItems[i]) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(historyItems[i], &item); err != nil {
+			continue
+		}
+		ids, ok := item["receiver_thread_ids"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range ids {
+			agentID := strings.TrimSpace(asString(raw))
+			if agentID != "" {
+				return agentID
+			}
+		}
+	}
+
+	callIDToTool := make(map[string]string, len(historyItems))
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		callID := historyToolCallIdentifier(item)
+		if callID == "" {
+			continue
+		}
+		if name := observedToolNameFromHistoryItem(item, nil); name != "" {
+			callIDToTool[callID] = name
+		}
+	}
+
+	for i := len(historyItems) - 1; i >= 0; i-- {
+		if len(historyItems[i]) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(historyItems[i], &item); err != nil {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		switch typ {
+		case "function_call_output", "custom_tool_call_output":
+		default:
+			continue
+		}
+		callID := historyToolCallIdentifier(item)
+		if callID == "" || callIDToTool[callID] != "spawn_agent" {
+			continue
+		}
+		text, _ := extractToolOutputText(item["output"])
+		if agentID := extractAgentIDFromText(text); agentID != "" {
+			return agentID
+		}
+	}
+	return ""
+}
+
+func extractAgentIDFromText(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+		if agentID, ok := firstStringField(decoded, "agent_id", "id", "target"); ok {
+			return strings.TrimSpace(agentID)
+		}
+	}
+	matches := syntheticAgentIDPattern.FindStringSubmatch(text)
+	if len(matches) >= 2 {
+		return strings.TrimSpace(matches[1])
+	}
+	return ""
+}
+
+func sanitizeSyntheticToolURL(raw string) string {
+	candidate := strings.TrimSpace(raw)
+	if candidate == "" {
+		return ""
+	}
+	for _, marker := range []string{`\n`, `\r`, `\t`, "\n", "\r", "\t"} {
+		if idx := strings.Index(candidate, marker); idx >= 0 {
+			candidate = candidate[:idx]
+		}
+	}
+	candidate = strings.TrimSpace(candidate)
+	candidate = strings.Trim(candidate, `"'()[]{}<>`)
+	for {
+		next := strings.TrimRight(candidate, `"'.,;:)]}>`)
+		next = syntheticToolURLTrailingReferencePattern.ReplaceAllString(next, "")
+		next = strings.TrimSpace(next)
+		if next == candidate {
+			break
+		}
+		candidate = next
+	}
+	parsed, err := neturl.Parse(candidate)
+	if err != nil {
+		return candidate
+	}
+	if (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != "" {
+		return candidate
+	}
+	return ""
 }

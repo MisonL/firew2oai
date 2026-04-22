@@ -157,6 +157,8 @@ type Proxy struct {
 	defaultShowThinking bool
 	upstreamURL         string
 	upstreamEmptyRetry  upstreamEmptyRetryPolicy
+	webSearchClient     *http.Client
+	webSearchEndpoint   string
 	metrics             *metricsCollector
 	responses           *responseStore
 }
@@ -190,6 +192,8 @@ func newProxy(transport *transport.FireworksTransport, version string, defaultSh
 		defaultShowThinking: defaultShowThinking,
 		upstreamURL:         upstream,
 		upstreamEmptyRetry:  retryPolicy,
+		webSearchClient:     &http.Client{Timeout: transport.Timeout()},
+		webSearchEndpoint:   defaultWebSearchEndpoint,
 		metrics:             newMetricsCollector(time.Now),
 		responses:           newResponseStore(defaultResponseStoreEntries),
 	}

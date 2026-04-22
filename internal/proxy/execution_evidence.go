@@ -15,7 +15,7 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 		return executionEvidence{}
 	}
 
-	callIDToCommand := make(map[string]string, 8)
+	callIDToAction := make(map[string]string, 8)
 	commands := make([]string, 0, 8)
 	outputs := make([]string, 0, 8)
 	for _, raw := range historyItems {
@@ -29,43 +29,61 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 
 		itemType, _ := item["type"].(string)
 		switch itemType {
-		case "function_call":
-			name, _ := item["name"].(string)
+		case "function_call", "mcp_tool_call":
+			name := evidenceActionNameFromHistoryItem(item)
 			normalizedName := normalizeToolName(name)
-			if normalizedName != "exec_command" {
+			action := normalizedName
+			if normalizedName == "exec_command" {
+				action = extractExecCommandFromFunctionCall(item, normalizedName)
+			}
+			action = strings.TrimSpace(action)
+			if action == "" {
 				continue
 			}
-			command := extractExecCommandFromFunctionCall(item, normalizedName)
-			if command == "" {
-				continue
-			}
-			commands = append(commands, command)
+			commands = append(commands, action)
 			callID, _ := item["call_id"].(string)
 			if callID != "" {
-				callIDToCommand[callID] = command
+				callIDToAction[callID] = action
+			}
+			if itemType == "mcp_tool_call" {
+				outputText, success := extractToolOutputText(item["result"])
+				if success == nil {
+					if _, hasError := item["error"]; hasError && item["error"] == nil {
+						flag := true
+						success = &flag
+					}
+				}
+				if success == nil {
+					if status, _ := item["status"].(string); strings.EqualFold(strings.TrimSpace(status), "completed") {
+						flag := true
+						success = &flag
+					}
+				}
+				outputs = appendExecutionEvidenceOutput(outputs, action, outputText, success)
 			}
 		case "custom_tool_call":
 			name, _ := item["name"].(string)
 			normalizedName := normalizeToolName(name)
-			if normalizedName != "exec_command" {
+			action := normalizedName
+			if normalizedName == "exec_command" {
+				input, _ := item["input"].(string)
+				action = strings.TrimSpace(input)
+			}
+			action = strings.TrimSpace(action)
+			if action == "" {
 				continue
 			}
-			input, _ := item["input"].(string)
-			command := strings.TrimSpace(input)
-			if command == "" {
-				continue
-			}
-			commands = append(commands, command)
+			commands = append(commands, action)
 			callID, _ := item["call_id"].(string)
 			if callID != "" {
-				callIDToCommand[callID] = command
+				callIDToAction[callID] = action
 			}
-		case "function_call_output", "custom_tool_call_output":
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
 			callID, _ := item["call_id"].(string)
-			command := strings.TrimSpace(callIDToCommand[callID])
+			action := strings.TrimSpace(callIDToAction[callID])
 			text, success := extractToolOutputText(item["output"])
 			if success == nil {
-				if isTestCommand(command) {
+				if isTestCommand(action) {
 					success = inferTestCommandOutputSuccess(text)
 				} else {
 					success = inferToolOutputSuccess(text)
@@ -76,24 +94,10 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 					text = string(encoded)
 				}
 			}
-			text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
-			if text == "" {
-				continue
+			if success == nil {
+				success = inferCollaborationToolOutputSuccess(action, text)
 			}
-			var summary strings.Builder
-			if command != "" {
-				summary.WriteString(command)
-				summary.WriteString(" => ")
-			}
-			if success != nil {
-				if *success {
-					summary.WriteString("success=true ")
-				} else {
-					summary.WriteString("success=false ")
-				}
-			}
-			summary.WriteString(truncateString(text, 180))
-			outputs = append(outputs, summary.String())
+			outputs = appendExecutionEvidenceOutput(outputs, action, text, success)
 		}
 	}
 
@@ -109,6 +113,73 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 		Commands: commands,
 		Outputs:  outputs,
 	}
+}
+
+func inferCollaborationToolOutputSuccess(action, text string) *bool {
+	action = normalizeToolName(strings.TrimSpace(action))
+	lower := strings.ToLower(strings.TrimSpace(text))
+	switch action {
+	case "spawn_agent":
+		if strings.Contains(lower, `"agent_id"`) {
+			flag := true
+			return &flag
+		}
+	case "wait_agent":
+		if strings.Contains(lower, `"timed_out":true`) {
+			flag := false
+			return &flag
+		}
+		if strings.Contains(lower, `"completed"`) || strings.Contains(lower, `"status"`) {
+			flag := true
+			return &flag
+		}
+	case "close_agent":
+		if strings.Contains(lower, `"previous_status"`) || strings.Contains(lower, `"completed"`) {
+			flag := true
+			return &flag
+		}
+	}
+	return nil
+}
+
+func evidenceActionNameFromHistoryItem(item map[string]any) string {
+	name, _ := item["name"].(string)
+	if namespace, _ := item["namespace"].(string); namespace != "" && name != "" {
+		return joinNamespaceToolName(namespace, name)
+	}
+	server, _ := item["server"].(string)
+	tool, _ := item["tool"].(string)
+	server = strings.TrimSpace(server)
+	tool = strings.TrimSpace(tool)
+	if server != "" && tool != "" {
+		return joinNamespaceToolName("mcp__"+server+"__", tool)
+	}
+	return name
+}
+
+func appendExecutionEvidenceOutput(outputs []string, action, text string, success *bool) []string {
+	text = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if strings.Contains(strings.ToLower(text), "source:") {
+		text = evidenceSourcePrefixPattern.ReplaceAllString(text, "")
+		text = strings.TrimSpace(strings.TrimLeft(text, "# "))
+	}
+	if text == "" {
+		return outputs
+	}
+	var summary strings.Builder
+	if action != "" {
+		summary.WriteString(action)
+		summary.WriteString(" => ")
+	}
+	if success != nil {
+		if *success {
+			summary.WriteString("success=true ")
+		} else {
+			summary.WriteString("success=false ")
+		}
+	}
+	summary.WriteString(truncateString(text, 180))
+	return append(outputs, summary.String())
 }
 
 func buildExecutionEvidencePromptBlock(evidence executionEvidence) string {
