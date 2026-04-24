@@ -18,18 +18,83 @@ from codex_realchain_scenarios import MODELS, SCENARIOS, Scenario, prepare_fixtu
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_NAMES_PATTERN = re.compile(r'tool_names="\[([^\"]*)\]"')
 CODE_FENCE_PATTERN = re.compile(r"```(?:bash|sh|shell)?\n([\s\S]*?)```", re.IGNORECASE)
+EXPLICIT_EXECUTION_FAILURE_MARKERS = (
+    "adapter error",
+    "upstream error",
+    "mcp error",
+    "tool error",
+    "failed to parse function arguments",
+    "missing field `session_id`",
+    "unknown process id",
+    "write_stdin failed",
+    "tool_choice requires",
+    "upstream response ended",
+    "process exited with code 1",
+    "process exited with code 2",
+    "process exited with code 126",
+    "process exited with code 127",
+)
 
 
-def run(cmd: list[str], cwd: Path | None = None, timeout: int | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        text=True,
-        capture_output=True,
-        stdin=subprocess.DEVNULL,
-        timeout=timeout,
-        check=False,
-    )
+def run(
+    cmd: list[str],
+    cwd: Path | None = None,
+    timeout: int | None = None,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    kwargs = {
+        "cwd": cwd,
+        "text": True,
+        "capture_output": True,
+        "timeout": timeout,
+        "check": False,
+    }
+    if input_text is None:
+        kwargs["stdin"] = subprocess.DEVNULL
+    else:
+        kwargs["input"] = input_text
+    return subprocess.run(cmd, **kwargs)
+
+
+def resolve_codex_executable() -> str:
+    explicit = os.environ.get("CODEX_MATRIX_CODEX_BIN", "").strip()
+    if explicit:
+        return explicit
+
+    resolved = shutil.which("codex")
+    if resolved:
+        return resolved
+
+    raise FileNotFoundError("codex")
+
+
+def configure_codex_home(output_dir: Path) -> None:
+    explicit = os.environ.get("CODEX_MATRIX_CODEX_HOME", "").strip()
+    if explicit == "":
+        return
+    home = Path(explicit)
+    if not home.is_absolute():
+        home = output_dir / home
+    home.mkdir(parents=True, exist_ok=True)
+    os.environ["CODEX_HOME"] = str(home)
+
+
+def configure_child_tool_environment() -> None:
+    go_cache = os.environ.get("CODEX_MATRIX_GOCACHE", "").strip()
+    if go_cache == "":
+        go_cache = os.environ.get("GOCACHE", "").strip()
+    if go_cache == "":
+        go_cache = str(Path(tempfile.gettempdir()) / "firew2oai-go-cache")
+    Path(go_cache).mkdir(parents=True, exist_ok=True)
+    os.environ["GOCACHE"] = go_cache
+
+    npm_cache = os.environ.get("CODEX_MATRIX_NPM_CACHE", "").strip()
+    if npm_cache == "":
+        npm_cache = os.environ.get("NPM_CONFIG_CACHE", "").strip()
+    if npm_cache == "":
+        npm_cache = str(Path(tempfile.gettempdir()) / "firew2oai-npm-cache")
+    Path(npm_cache).mkdir(parents=True, exist_ok=True)
+    os.environ["NPM_CONFIG_CACHE"] = npm_cache
 
 
 def append_config_override(cmd: list[str], key: str, value: str) -> None:
@@ -39,9 +104,9 @@ def append_config_override(cmd: list[str], key: str, value: str) -> None:
     cmd.extend(["-c", f"{key}={value}"])
 
 
-def build_codex_exec_command(worktree: Path, last_path: Path, model: str, prompt: str) -> list[str]:
+def build_codex_exec_command(codex_executable: str, worktree: Path, last_path: Path, model: str, prompt: str) -> list[str]:
     cmd = [
-        "codex",
+        codex_executable,
         "exec",
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
@@ -122,6 +187,55 @@ def parse_commands(jsonl_path: Path) -> list[str]:
                     if isinstance(message, str) and message:
                         append_commands_from_text(message)
     return commands
+
+
+def collect_file_change_paths(jsonl_path: Path) -> list[str]:
+    changed_paths: list[str] = []
+    for raw_line in jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") != "file_change":
+            continue
+        changes = item.get("changes")
+        if not isinstance(changes, list):
+            continue
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            path = change.get("path")
+            if isinstance(path, str) and path.strip():
+                changed_paths.append(path.strip())
+    return changed_paths
+
+
+def extract_terminal_jsonl_message(jsonl_path: Path) -> str:
+    latest = ""
+    for raw_line in jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        payload_type = payload.get("type")
+        if payload_type == "error":
+            message = payload.get("message")
+            if isinstance(message, str) and message.strip():
+                latest = message.strip()
+        elif payload_type == "turn.failed":
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str) and message.strip():
+                    latest = message.strip()
+    return latest
 
 
 def is_mutation_command(command: str) -> bool:
@@ -244,6 +358,7 @@ def scenario_log_hint(scenario: Scenario) -> str:
 
 def extract_response_ids_from_logs(log_text: str, model: str, scenario: Scenario) -> list[str]:
     ids: list[str] = []
+    seen: set[str] = set()
     hint = scenario_log_hint(scenario)
     for raw_line in log_text.splitlines():
         line = normalize_inline_text(raw_line)
@@ -254,21 +369,34 @@ def extract_response_ids_from_logs(log_text: str, model: str, scenario: Scenario
         if hint and hint not in line:
             continue
         match = re.search(r"\bresponse_id=(resp_[A-Za-z0-9]+)\b", line)
-        if match:
+        if match and match.group(1) not in seen:
             ids.append(match.group(1))
+            seen.add(match.group(1))
     return ids
 
 
+def resolve_history_endpoint() -> tuple[str, str]:
+    explicit_base = os.environ.get("CODEX_MATRIX_HISTORY_BASE_URL", "").strip()
+    explicit_token = os.environ.get("CODEX_MATRIX_HISTORY_BEARER_TOKEN", "").strip()
+    if explicit_base:
+        return explicit_base, explicit_token
+
+    provider_name = os.environ.get("CODEX_MATRIX_PROVIDER", "").strip()
+    base_url = os.environ.get("CODEX_MATRIX_BASE_URL", "").strip()
+    token = os.environ.get("CODEX_MATRIX_BEARER_TOKEN", "").strip()
+    if (
+        provider_name in {"firew2oai", "direct-firew2oai"}
+        or provider_name.startswith("firew2oai-")
+        or provider_name.startswith("direct-firew2oai-")
+    ) and base_url and token:
+        return base_url, token
+
+    return "", ""
+
+
 def load_response_input_items(response_id: str) -> list[dict]:
-    base_url = os.environ.get("CODEX_MATRIX_HISTORY_BASE_URL", "").strip()
-    if not base_url:
-        base_url = os.environ.get("CODEX_MATRIX_BASE_URL", "").strip()
-    if not base_url:
-        return []
-    token = os.environ.get("CODEX_MATRIX_HISTORY_BEARER_TOKEN", "").strip()
-    if not token:
-        token = os.environ.get("CODEX_MATRIX_BEARER_TOKEN", "").strip()
-    if not token:
+    base_url, token = resolve_history_endpoint()
+    if not base_url or not token:
         return []
 
     url = base_url.rstrip("/") + f"/responses/{response_id}/input_items"
@@ -313,6 +441,24 @@ def parse_response_history_signals(items: list[dict]) -> list[str]:
 
 
 def collect_firew2oai_history_signals(started_at: float, model: str, scenario: Scenario) -> tuple[list[str], str]:
+    log_file = os.environ.get("CODEX_MATRIX_HISTORY_LOG_FILE", "").strip()
+    if log_file:
+        path = Path(log_file)
+        if not path.exists():
+            return [], ""
+        log_text = path.read_text(encoding="utf-8", errors="ignore")
+        response_ids = extract_response_ids_from_logs(log_text, model, scenario)
+        if not response_ids:
+            return [], ""
+
+        signals: list[str] = []
+        for response_id in response_ids:
+            items = load_response_input_items(response_id)
+            if not items:
+                continue
+            signals.extend(parse_response_history_signals(items))
+        return list(dict.fromkeys(signals)), response_ids[-1]
+
     container = os.environ.get("CODEX_MATRIX_HISTORY_CONTAINER", "firew2oai").strip()
     if not container:
         return [], ""
@@ -324,11 +470,13 @@ def collect_firew2oai_history_signals(started_at: float, model: str, scenario: S
     if not response_ids:
         return [], ""
 
-    response_id = response_ids[-1]
-    items = load_response_input_items(response_id)
-    if not items:
-        return [], response_id
-    return parse_response_history_signals(items), response_id
+    signals: list[str] = []
+    for response_id in response_ids:
+        items = load_response_input_items(response_id)
+        if not items:
+            continue
+        signals.extend(parse_response_history_signals(items))
+    return list(dict.fromkeys(signals)), response_ids[-1]
 
 
 def parse_declared_tools_from_logs(log_text: str, marker: str) -> list[str]:
@@ -353,7 +501,7 @@ def build_tool_discovery_prompt(marker: str) -> str:
     )
 
 
-def detect_declared_tools(output_dir: Path, model: str, timeout_s: int) -> list[str]:
+def detect_declared_tools(output_dir: Path, codex_executable: str, model: str, timeout_s: int) -> list[str]:
     explicit = os.environ.get("CODEX_MATRIX_DECLARED_TOOLS", "").strip()
     if explicit:
         return [item.strip() for item in explicit.split(",") if item.strip()]
@@ -367,7 +515,7 @@ def detect_declared_tools(output_dir: Path, model: str, timeout_s: int) -> list[
     try:
         worktree = create_worktree(output_dir / "worktrees", "__tool_probe__")
         last_path = output_dir / "__tool_probe__.last.txt"
-        cmd = build_codex_exec_command(worktree, last_path, model, build_tool_discovery_prompt(marker))
+        cmd = build_codex_exec_command(codex_executable, worktree, last_path, model, build_tool_discovery_prompt(marker))
         started = time.time()
         run(cmd, cwd=REPO_ROOT, timeout=timeout_s)
         container = os.environ.get("CODEX_MATRIX_HISTORY_CONTAINER", "firew2oai").strip()
@@ -408,12 +556,21 @@ def extract_required_label_block(text: str) -> list[str] | None:
 
 
 def changed_path_matches(expected_path: str, changed_paths: list[str]) -> bool:
+    expected = expected_path.strip().lstrip("./")
     for changed in changed_paths:
-        if changed == expected_path:
+        normalized = changed.strip().lstrip("./")
+        if normalized == expected:
             return True
-        if changed.endswith("/") and expected_path.startswith(changed):
+        if normalized.endswith("/" + expected):
+            return True
+        if normalized.endswith("/") and expected.startswith(normalized.rstrip("/") + "/"):
             return True
     return False
+
+
+def contains_explicit_execution_failure(text: str) -> bool:
+    combined = text.lower()
+    return any(marker in combined for marker in EXPLICIT_EXECUTION_FAILURE_MARKERS)
 
 
 def collect_changed_paths(worktree: Path) -> list[str]:
@@ -448,12 +605,85 @@ def path_changed_from_snapshot(worktree: Path, rel_path: str, snapshot: dict[str
     return fingerprint_path(worktree / rel_path) != before
 
 
+def include_dirty_workspace() -> bool:
+    return os.environ.get("CODEX_MATRIX_INCLUDE_DIRTY_WORKSPACE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_untracked_paths(status_output: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in status_output.splitlines():
+        line = raw_line.rstrip()
+        if not line.startswith("?? "):
+            continue
+        path = line[3:].strip()
+        if path:
+            paths.append(path)
+    return paths
+
+
+def copy_workspace_path_into_worktree(rel_path: str, worktree: Path) -> None:
+    source = REPO_ROOT / rel_path
+    target = worktree / rel_path
+    if not source.exists():
+        return
+    if source.is_dir():
+        if target.exists():
+            shutil.rmtree(target)
+        shutil.copytree(source, target)
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+
+
+def sync_dirty_workspace_into_worktree(worktree: Path) -> None:
+    diff_result = run(["git", "diff", "--binary", "HEAD"], cwd=REPO_ROOT)
+    if diff_result.returncode != 0:
+        raise RuntimeError(diff_result.stderr or diff_result.stdout)
+    patch_text = diff_result.stdout or ""
+    if patch_text.strip():
+        apply_result = run(
+            ["git", "apply", "--allow-empty", "--binary", "-"],
+            cwd=worktree,
+            input_text=patch_text,
+        )
+        if apply_result.returncode != 0:
+            raise RuntimeError(apply_result.stderr or apply_result.stdout)
+
+    status_result = run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=REPO_ROOT)
+    if status_result.returncode != 0:
+        raise RuntimeError(status_result.stderr or status_result.stdout)
+    for rel_path in parse_untracked_paths(status_result.stdout or ""):
+        copy_workspace_path_into_worktree(rel_path, worktree)
+
+
 def create_worktree(base_dir: Path, tag: str) -> Path:
     worktree = base_dir / tag
     result = run(["git", "worktree", "add", "--detach", str(worktree), "HEAD"], cwd=REPO_ROOT)
     if result.returncode != 0:
-        raise RuntimeError(result.stderr or result.stdout)
+        create_clone_worktree(worktree, result.stderr or result.stdout)
+    if include_dirty_workspace():
+        sync_dirty_workspace_into_worktree(worktree)
     return worktree
+
+
+def create_clone_worktree(worktree: Path, worktree_error: str) -> None:
+    head_result = run(["git", "rev-parse", "HEAD"], cwd=REPO_ROOT)
+    if head_result.returncode != 0:
+        raise RuntimeError(head_result.stderr or head_result.stdout or worktree_error)
+    head = (head_result.stdout or "").strip()
+    if not head:
+        raise RuntimeError(worktree_error)
+
+    clone_result = run(
+        ["git", "clone", "--no-hardlinks", "--no-checkout", str(REPO_ROOT), str(worktree)],
+        cwd=REPO_ROOT,
+    )
+    if clone_result.returncode != 0:
+        raise RuntimeError(clone_result.stderr or clone_result.stdout or worktree_error)
+
+    checkout_result = run(["git", "checkout", "--detach", head], cwd=worktree)
+    if checkout_result.returncode != 0:
+        raise RuntimeError(checkout_result.stderr or checkout_result.stdout or worktree_error)
 
 
 def remove_worktree(worktree: Path) -> None:
@@ -543,10 +773,60 @@ def classify_failure_reason(
 
     combined = "\n".join([stderr_preview, final_preview]).lower()
     observed = set(observed_signals)
+    if ("cloudflare_api" in expected_signals or "mcp__cloudflare_api" in combined) and (
+        "authrequired" in combined or "missing or invalid access token" in combined
+    ):
+        return "mcp_auth_required"
     if "unsupported call:" in combined:
         return "runtime_unsupported_tool"
     if "is not declared in request tools" in combined:
         return "undeclared_tool_name"
+    if "currently experiencing high demand" in combined:
+        return "provider_high_demand"
+    if "no available channel for model" in combined:
+        return "provider_no_available_channel"
+    if "invalid responses api request" in combined or '"code":"invalid_prompt"' in combined:
+        return "upstream_invalid_prompt"
+    if "tls: bad record mac" in combined:
+        return "upstream_tls_bad_record_mac"
+    if "upstream error: 503" in combined or "service unavailable" in combined:
+        return "upstream_service_unavailable"
+    if "upstream stream failed before content: local error:" in combined:
+        return "upstream_transport_error"
+    if "upstream stream failed before content: unexpected eof" in combined:
+        return "upstream_stream_eof"
+    if "upstream response ended without a completion signal" in combined:
+        return "upstream_incomplete_completion"
+    if 'tool_choice requires "write_stdin"' in combined:
+        return "missed_write_stdin"
+    if "write_stdin failed" in combined or "unknown process id" in combined:
+        return "write_stdin_runtime_error"
+    if 'tool_choice requires "mcp__docfork__fetch_doc"' in combined:
+        return "missed_docfork_fetch_doc"
+    if 'tool_choice requires "apply_patch"' in combined:
+        return "missed_apply_patch"
+    if 'tool_choice requires "mcp__cloudflare_api__search"' in combined:
+        return "missed_cloudflare_search"
+    if 'tool_choice requires "mcp__chrome_devtools__' in combined:
+        return "missed_chrome_devtools_sequence"
+    if "web_search follow-up did not answer from captured results" in combined:
+        return "web_search_followup_not_grounded"
+    if "web_search follow-up omitted required output labels" in combined:
+        return "web_search_followup_unstructured"
+    if "execute web search request:" in combined:
+        return "web_search_transport_error"
+    if "is not a function" in combined:
+        return "mcp_search_runtime_error"
+    if "invalid arguments for tool search" in combined:
+        return "mcp_search_invalid_args"
+    if "invalid arguments for tool fetch_doc" in combined:
+        return "mcp_fetch_doc_invalid_args"
+    if 'function_call for "mcp__cloudflare_api__search" must use arguments, not input' in combined:
+        return "cloudflare_search_used_input_field"
+    if 'no path found with tags containing "workers"' in combined:
+        return "cloudflare_workers_path_not_found"
+    if "tool call json decode failed" in combined:
+        return "malformed_tool_json"
     if expected_signals and not all(token in observed for token in expected_signals):
         meaningful_progress = any(
             token in observed
@@ -563,6 +843,10 @@ def classify_failure_reason(
         if meaningful_progress:
             return "partial_tool_progress"
         return "narration_only"
+    if not final_preview.strip() and observed:
+        return "empty_final_after_tool"
+    if labels_ok and not result_pass:
+        return "semantic_result_fail"
     if result_pass and not labels_ok:
         return "unstructured_final"
     if exit_code not in {"0", "timeout"}:
@@ -570,7 +854,7 @@ def classify_failure_reason(
     return ""
 
 
-def run_case(output_dir: Path, model: str, scenario: Scenario, timeout_s: int) -> dict[str, str]:
+def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scenario, timeout_s: int) -> dict[str, str]:
     slug = f"{model}__{scenario.name}".replace("/", "_")
     worktree: Path | None = None
     jsonl_path = output_dir / f"{slug}.jsonl"
@@ -585,13 +869,16 @@ def run_case(output_dir: Path, model: str, scenario: Scenario, timeout_s: int) -
             worktree,
             sorted({*baseline_diff_files, *scenario.expected_files}),
         )
-        cmd = build_codex_exec_command(worktree, last_path, model, scenario.prompt)
+        cmd = build_codex_exec_command(codex_executable, worktree, last_path, model, scenario.prompt)
         result = run(cmd, cwd=REPO_ROOT, timeout=timeout_s)
         duration = f"{time.time() - started:.1f}"
         jsonl_path.write_text(result.stdout or "", encoding="utf-8")
         stderr_path.write_text(result.stderr or "", encoding="utf-8")
         final_text = last_path.read_text(encoding="utf-8", errors="ignore").strip() if last_path.exists() else ""
+        if not final_text and jsonl_path.exists():
+            final_text = extract_terminal_jsonl_message(jsonl_path)
         commands = parse_commands(jsonl_path) if jsonl_path.exists() else []
+        file_change_paths = collect_file_change_paths(jsonl_path) if jsonl_path.exists() else []
         observed_signals, _ = parse_trace_signals(jsonl_path) if jsonl_path.exists() else ([], "")
         history_signals, _ = collect_firew2oai_history_signals(started, model, scenario)
         observed_signals = list(dict.fromkeys([*observed_signals, *history_signals]))
@@ -607,24 +894,41 @@ def run_case(output_dir: Path, model: str, scenario: Scenario, timeout_s: int) -
         signals_ok = all(token in observed_signal_set for token in scenario.expected_signals)
         mutated_expected_files = collect_mutated_expected_files(commands, scenario.expected_files)
         files_ok = all(
-            changed_path_matches(path, diff_files) or path in mutated_expected_files for path in scenario.expected_files
+            changed_path_matches(path, diff_files)
+            or changed_path_matches(path, file_change_paths)
+            or path in mutated_expected_files
+            for path in scenario.expected_files
         )
         if scenario.expect_clean_diff:
             files_ok = not diff_files
         labels_ok = has_required_labels(final_text)
         result_pass = bool(re.search(r"(?m)^RESULT:\s*PASS\b", final_text))
-        strict_ok = reads_and_tests_ok and signals_ok and files_ok and labels_ok and result_pass and result.returncode == 0
+        final_substrings_ok = all(token in final_text for token in scenario.expected_final_substrings)
+        explicit_failure = contains_explicit_execution_failure("\n".join([final_text, result.stderr or ""]))
+        strict_ok = (
+            reads_and_tests_ok
+            and signals_ok
+            and files_ok
+            and labels_ok
+            and result_pass
+            and final_substrings_ok
+            and not explicit_failure
+            and result.returncode == 0
+        )
         failure_reason = ""
         if not strict_ok:
-            failure_reason = classify_failure_reason(
-                exit_code=str(result.returncode),
-                expected_signals=scenario.expected_signals,
-                observed_signals=observed_signals,
-                final_preview=final_text,
-                stderr_preview=result.stderr or "",
-                labels_ok=labels_ok,
-                result_pass=result_pass,
-            )
+            if not final_substrings_ok:
+                failure_reason = "final_content_mismatch"
+            else:
+                failure_reason = classify_failure_reason(
+                    exit_code=str(result.returncode),
+                    expected_signals=scenario.expected_signals,
+                    observed_signals=observed_signals,
+                    final_preview=final_text,
+                    stderr_preview=result.stderr or "",
+                    labels_ok=labels_ok,
+                    result_pass=result_pass,
+                )
         return build_case_row(
             model=model,
             scenario=scenario,
@@ -708,16 +1012,34 @@ def filter_items(items, env_key: str):
     raw = os.environ.get(env_key, "").strip()
     if raw == "":
         return list(items)
-    allowed = {item.strip() for item in raw.split(",") if item.strip()}
-    return [item for item in items if getattr(item, "name", item) in allowed]
+    requested = [item.strip() for item in raw.split(",") if item.strip()]
+    if not requested:
+        return []
+    if not items:
+        return requested
+    if isinstance(items[0], str):
+        return requested
+
+    by_name = {getattr(item, "name", item): item for item in items}
+    return [by_name[name] for name in requested if name in by_name]
+
+
+def effective_case_timeout(model: str, scenario: Scenario, timeout_s: int) -> int:
+    required_tools = set(scenario.required_tools)
+    if {"spawn_agent", "wait_agent", "close_agent"}.issubset(required_tools):
+        return max(timeout_s, 900)
+    return timeout_s
 
 
 def main() -> int:
     max_workers = int(os.environ.get("CODEX_MATRIX_WORKERS", "2"))
     timeout_s = int(os.environ.get("CODEX_MATRIX_TIMEOUT", "900"))
+    codex_executable = resolve_codex_executable()
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(tempfile.gettempdir()) / f"firew2oai-realchain-matrix-{stamp}"
     (output_dir / "worktrees").mkdir(parents=True, exist_ok=True)
+    configure_codex_home(output_dir)
+    configure_child_tool_environment()
     summary_path = output_dir / "summary.tsv"
     rows: list[dict[str, str]] = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -725,16 +1047,29 @@ def main() -> int:
     futures = {}
     models = filter_items(MODELS, "CODEX_MATRIX_MODELS")
     scenarios = filter_items(SCENARIOS, "CODEX_MATRIX_SCENARIOS")
-    declared_tools = detect_declared_tools(output_dir, models[0], min(timeout_s, 120)) if models else []
-    declared_tool_set = set(declared_tools)
+    if not models:
+        raise SystemExit("No models selected. Check CODEX_MATRIX_MODELS.")
+    if not scenarios:
+        raise SystemExit("No scenarios selected. Check CODEX_MATRIX_SCENARIOS.")
+    declared_tool_sets: dict[str, set[str]] = {}
+    for model in models:
+        declared_tools = detect_declared_tools(output_dir, codex_executable, model, min(timeout_s, 120))
+        declared_tool_sets[model] = set(declared_tools)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for model in models:
             for scenario in scenarios:
-                missing_tools = unsupported_required_tools(scenario, declared_tool_set)
+                missing_tools = unsupported_required_tools(scenario, declared_tool_sets.get(model, set()))
                 if missing_tools:
                     rows.append(build_skip_row(model, scenario, missing_tools))
                     continue
-                future = pool.submit(run_case, output_dir, model, scenario, timeout_s)
+                future = pool.submit(
+                    run_case,
+                    output_dir,
+                    codex_executable,
+                    model,
+                    scenario,
+                    effective_case_timeout(model, scenario, timeout_s),
+                )
                 futures[future] = (model, scenario)
         for future in as_completed(futures):
             model, scenario = futures[future]

@@ -29,6 +29,7 @@ class Scenario:
     capabilities: tuple[str, ...]
     required_tools: tuple[str, ...] = ()
     expected_signals: tuple[str, ...] = ()
+    expected_final_substrings: tuple[str, ...] = ()
     expect_clean_diff: bool = False
 
 
@@ -212,20 +213,22 @@ SCENARIOS = (
         expect_clean_diff=True,
     ),
     Scenario(
-        name="context7_probe",
+        name="cloudflare_execute_probe",
         prompt=(
-            "你是测试代理。请验证 Context7 MCP：\n"
-            "1) 必须使用 mcp__context7__resolve-library-id 查找 react。\n"
-            "2) 必须再使用 mcp__context7__get-library-docs 获取 useEffectEvent 相关文档。\n"
-            "3) 禁止使用 exec_command、docfork 或其他工具代替 Context7。\n"
-            "4) 不要修改任何文件。\n"
-            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
+            "你是测试代理。请验证 Cloudflare API MCP 的 execute：\n"
+            "1) 必须使用 mcp__cloudflare_api__execute。\n"
+            "2) code 必须是 async 箭头函数，并通过 cloudflare.request 发起一个只读 GET 请求："
+            "/accounts/${accountId}/workers/scripts。\n"
+            "3) 不要调用 search，也不要做任何写操作。\n"
+            "4) 如果结果为空，要如实说明为空，不要虚构脚本名称。\n"
+            "5) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 返回的脚本数量或 empty。"
         ),
         expected_operations=(),
         expected_files=(),
-        capabilities=("mcp_context7", "structured_final"),
-        required_tools=("mcp__context7__resolve-library-id", "mcp__context7__get-library-docs"),
-        expected_signals=("context7", "resolve_library_id", "get_library_docs"),
+        capabilities=("mcp_cloudflare_execute", "structured_final"),
+        required_tools=("mcp__cloudflare_api__execute",),
+        expected_signals=("cloudflare_api", "execute"),
         expect_clean_diff=True,
     ),
     Scenario(
@@ -343,6 +346,7 @@ SCENARIOS = (
         capabilities=("spawn_agent", "wait_agent", "close_agent", "structured_final"),
         required_tools=("spawn_agent", "wait_agent", "close_agent"),
         expected_signals=("spawn_agent", "wait_agent", "close_agent"),
+        expected_final_substrings=("# firew2oai",),
         expect_clean_diff=True,
     ),
     Scenario(
