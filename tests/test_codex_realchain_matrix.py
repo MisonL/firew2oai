@@ -420,8 +420,8 @@ class RunHelperTests(TestCase):
         self.assertEqual(
             matrix.classify_failure_reason(
                 exit_code="0",
-                expected_signals=("cloudflare_api", "search"),
-                observed_signals=["cloudflare_api", "search"],
+                expected_signals=("docfork", "search_docs"),
+                observed_signals=["docfork", "search_docs"],
                 final_preview="RESULT: FAIL FILES: none TEST: N/A NOTE: MCP error -32602: Input validation error: Invalid arguments for tool search",
                 stderr_preview="",
                 labels_ok=True,
@@ -444,18 +444,17 @@ class RunHelperTests(TestCase):
             "semantic_result_fail",
         )
 
-    def test_classify_failure_reason_marks_mcp_auth_required(self) -> None:
+    def test_filter_declared_tools_for_matrix_keeps_only_allowed_mcp_tools(self) -> None:
         self.assertEqual(
-            matrix.classify_failure_reason(
-                exit_code="0",
-                expected_signals=("cloudflare_api", "search"),
-                observed_signals=[],
-                final_preview='Codex adapter error: tool "mcp__cloudflare_api__search" is not declared in request tools',
-                stderr_preview='AuthRequired: Missing or invalid access token',
-                labels_ok=False,
-                result_pass=False,
+            matrix.filter_declared_tools_for_matrix(
+                [
+                    "exec_command",
+                    "mcp__cloudflare_api__search",
+                    "mcp__docfork__search_docs",
+                    "mcp__chrome_devtools__new_page",
+                ]
             ),
-            "mcp_auth_required",
+            ["exec_command", "mcp__docfork__search_docs", "mcp__chrome_devtools__new_page"],
         )
 
     def test_classify_failure_reason_ignores_unrelated_mcp_auth_stderr(self) -> None:
@@ -629,20 +628,6 @@ class RunHelperTests(TestCase):
             "empty_final_after_tool",
         )
 
-    def test_classify_failure_reason_marks_missed_cloudflare_search(self) -> None:
-        self.assertEqual(
-            matrix.classify_failure_reason(
-                exit_code="0",
-                expected_signals=("cloudflare_api", "search"),
-                observed_signals=["message"],
-                final_preview='Codex adapter error: tool_choice requires "mcp__cloudflare_api__search", got non-tool response',
-                stderr_preview="",
-                labels_ok=False,
-                result_pass=False,
-            ),
-            "missed_cloudflare_search",
-        )
-
     def test_classify_failure_reason_marks_missed_chrome_devtools_sequence(self) -> None:
         self.assertEqual(
             matrix.classify_failure_reason(
@@ -664,8 +649,8 @@ class RunHelperTests(TestCase):
         self.assertEqual(
             matrix.classify_failure_reason(
                 exit_code="0",
-                expected_signals=("cloudflare_api", "search"),
-                observed_signals=["cloudflare_api", "search"],
+                expected_signals=("docfork", "search_docs"),
+                observed_signals=["docfork", "search_docs"],
                 final_preview="RESULT: FAIL FILES: none TEST: N/A NOTE: Error: (intermediate value)(...) is not a function",
                 stderr_preview="",
                 labels_ok=True,

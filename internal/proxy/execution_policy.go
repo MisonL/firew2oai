@@ -2634,10 +2634,6 @@ func buildSyntheticExplicitToolCall(nextRequiredTool, task string, historyItems 
 		return buildSyntheticDocforkSearchDocsCall(nextRequiredTool, task, toolCatalog)
 	case "fetch_doc":
 		return buildSyntheticDocforkFetchDocCall(nextRequiredTool, historyItems, toolCatalog)
-	case "search":
-		return buildSyntheticCloudflareSearchCall(nextRequiredTool, task, toolCatalog)
-	case "execute":
-		return buildSyntheticCloudflareExecuteCall(nextRequiredTool, task, toolCatalog)
 	case "web_search":
 		return buildSyntheticWebSearchCall(nextRequiredTool, task, toolCatalog)
 	case "resolve-library-id":
@@ -3386,46 +3382,6 @@ func extractSyntheticDocforkSearchInputs(task string) (string, string) {
 	return "", ""
 }
 
-func buildSyntheticCloudflareSearchCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
-	if !strings.Contains(strings.TrimSpace(nextRequiredTool), "mcp__cloudflare_api__") {
-		return nil
-	}
-	code := buildSyntheticCloudflareSearchCode(task)
-	if code == "" {
-		return nil
-	}
-	call, ok := buildSyntheticStructuredToolCall(
-		nextRequiredTool,
-		map[string]any{"code": code},
-		toolCatalog,
-		nextRequiredTool,
-	)
-	if !ok {
-		return nil
-	}
-	return call
-}
-
-func buildSyntheticCloudflareExecuteCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
-	if !strings.Contains(strings.TrimSpace(nextRequiredTool), "mcp__cloudflare_api__") {
-		return nil
-	}
-	code := buildSyntheticCloudflareExecuteCode(task)
-	if code == "" {
-		return nil
-	}
-	call, ok := buildSyntheticStructuredToolCall(
-		nextRequiredTool,
-		map[string]any{"code": code},
-		toolCatalog,
-		nextRequiredTool,
-	)
-	if !ok {
-		return nil
-	}
-	return call
-}
-
 func buildSyntheticWebSearchCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
 	if shortToolName(nextRequiredTool) != "web_search" {
 		return nil
@@ -3460,21 +3416,6 @@ func extractSyntheticWebSearchQuery(task string) string {
 	query := strings.TrimSpace(matches[1])
 	query = strings.Trim(query, " \t\r\n`'\"")
 	return query
-}
-
-func buildSyntheticCloudflareSearchCode(task string) string {
-	if !strings.Contains(strings.ToLower(task), "workers") {
-		return ""
-	}
-	return "async () => { const results = []; for (const [path, methods] of Object.entries(spec.paths)) { for (const [method, op] of Object.entries(methods)) { if (op.tags?.some(t => String(t).toLowerCase() === 'workers')) { results.push({ method: method.toUpperCase(), path }); if (results.length === 2) { return results; } } } } return results; }"
-}
-
-func buildSyntheticCloudflareExecuteCode(task string) string {
-	lowerTask := strings.ToLower(task)
-	if !strings.Contains(lowerTask, "cloudflare.request") || !strings.Contains(lowerTask, "workers/scripts") {
-		return ""
-	}
-	return "async () => { return cloudflare.request({ method: \"GET\", path: `/accounts/${accountId}/workers/scripts` }); }"
 }
 
 func latestToolOutputTextByName(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, wantTool string) string {

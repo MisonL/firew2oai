@@ -8,6 +8,7 @@
 
 - 本文只代表直连 `firew2oai` 的 17 维结果。
 - 如果需要对外表述 `Codex -> new-api -> firew2oai` 的最终兼容性，应以 `docs/reviews/CR-NEWAPI-FULL-DIMENSION-MATRIX-2026-04-24.md` 为准。
+- 当前矩阵口径已移除 Cloudflare 相关 MCP 场景，MCP 只保留 Chrome DevTools 与 Docfork；本文保留为历史直连对照。
 
 ## 证据
 
@@ -54,7 +55,7 @@
 
 - `docs/reviews/CR-NEWAPI-CODING-MATRIX-2026-04-22.md` 记录 `deepseek-v3p1`、`qwen3-8b`、`qwen3-vl-30b-a3b-instruct` 在 `Codex -> new-api -> firew2oai` 的 5 个 Coding 场景均为 `5/5 PASS`。
 - `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md` 记录大多数模型在 5 个 Coding 场景达到 `5/5 PASS`，`qwen3-vl-30b-a3b-thinking` 属于长尾不稳定。
-- `docs/reviews/CR-NEWAPI-FULL-DIMENSION-MATRIX-2026-04-24.md` 是当前 `Codex -> new-api -> firew2oai` 的全 17 维权威结果。
+- `docs/reviews/CR-NEWAPI-FULL-DIMENSION-MATRIX-2026-04-24.md` 是当前 `Codex -> new-api -> firew2oai` 的 15 维权威结果。
 - 本轮直接链路结果与上述 coding 口径基本一致；差异主要来自新增的 MCP、图像、js_repl、子代理、交互 shell 等全维度探针，而不是 5 个核心 Coding 场景整体回退。
 
 ## 本轮优化
@@ -63,7 +64,7 @@
 - `subagent_probe` 增加严格最终内容校验，必须包含 README 第一行 `# firew2oai`，避免把命令叙述、`completed:null`、`previous_status:running` 判为通过。
 - 矩阵脚本支持从本地 firew2oai 日志解析 `/responses/{id}/input_items`，用于恢复工具信号。
 - 失败分类新增 `upstream_service_unavailable`、`upstream_tls_bad_record_mac`、`upstream_transport_error`、`missed_chrome_devtools_sequence`、`empty_final_after_tool`。
-- Cloudflare auth stderr 不再污染非 Cloudflare 场景。
+- MCP 评测口径已收敛为 Chrome DevTools 与 Docfork，不再纳入 Cloudflare 相关场景。
 
 ## 验证
 

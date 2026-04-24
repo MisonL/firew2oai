@@ -1184,24 +1184,6 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		}
 		normalized["library"] = source
 		return normalized, true
-	case "mcp__cloudflare_api__search":
-		value, ok := args.(map[string]any)
-		if !ok {
-			return args, false
-		}
-		if _, hasCode := value["code"]; hasCode {
-			return args, false
-		}
-		rawCode, ok := firstStringField(value, "input", "query", "pattern", "script", "js")
-		if !ok {
-			return args, false
-		}
-		normalized := cloneMap(value)
-		for _, alias := range []string{"input", "query", "pattern", "script", "js"} {
-			delete(normalized, alias)
-		}
-		normalized["code"] = normalizeCloudflareSearchCode(rawCode)
-		return normalized, true
 	case "spawn_agent":
 		value, ok := args.(map[string]any)
 		if !ok {
@@ -1245,23 +1227,9 @@ func normalizeStructuredToolInputArgument(toolName, sourceToolName string, input
 	switch firstNonEmptyNormalizedToolName(toolName, sourceToolName) {
 	case "exec_command":
 		return map[string]any{"cmd": text}, true
-	case "mcp__cloudflare_api__search":
-		return map[string]any{"code": normalizeCloudflareSearchCode(text)}, true
 	default:
 		return nil, false
 	}
-}
-
-func normalizeCloudflareSearchCode(text string) string {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return ""
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, "async") || strings.Contains(lower, "spec.paths") || strings.Contains(lower, "object.entries(spec.paths") {
-		return trimmed
-	}
-	return "async () => { const needle = " + mustMarshalJSONText(lower) + "; const results = []; for (const [path, methods] of Object.entries(spec.paths || {})) { for (const [method, op] of Object.entries(methods || {})) { const tags = Array.isArray(op?.tags) ? op.tags : []; const summary = typeof op?.summary === 'string' ? op.summary : ''; const description = typeof op?.description === 'string' ? op.description : ''; const haystacks = [path, method, summary, description, ...tags].map(v => String(v).toLowerCase()); if (haystacks.some(v => v.includes(needle))) { results.push({ method: method.toUpperCase(), path }); if (results.length === 2) { return results; } } } } return results; }"
 }
 
 func normalizeCustomToolInputArgument(args any) (string, bool) {

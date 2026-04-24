@@ -7,24 +7,22 @@
 - 链路：`Codex -> new-api -> firew2oai`
 - new-api 入口：`http://localhost:3000/v1`
 - 接口：`/v1/responses`
-- 场景：17 个预设场景
+- 场景：15 个预设场景，MCP 场景只保留 Chrome DevTools 与 Docfork
 
 ## 证据
 
 | 项目 | 值 |
 |---|---|
 | 主矩阵 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260424-165129/summary.tsv` |
-| 严格重算 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260424-165129/summary.strict-20260424-newapi.tsv` |
+| 严格重算 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260424-165129/summary.strict-20260424-newapi-no-cloudflare.tsv` |
 | provider | `newapi-firew2oai-3000` |
 | workers | `2` |
 | timeout | `900s` |
 | declared tools | `exec_command`、`write_stdin`、`update_plan`、`view_image`、`web_search`、`js_repl`、`js_repl_reset`、`spawn_agent`、`wait_agent`、`close_agent`、`list_mcp_resources`、`list_mcp_resource_templates`、`mcp__docfork__search_docs`、`mcp__docfork__fetch_doc`、`mcp__chrome_devtools__new_page`、`mcp__chrome_devtools__take_snapshot`、`mcp__chrome_devtools__click`、`mcp__chrome_devtools__wait_for` |
 
-本轮 17 个场景中，当前环境实际可执行 14 个。以下 3 个场景不计入模型能力：
+本轮移除 Cloudflare 相关 MCP 场景后，剩余 15 个场景中当前环境实际可执行 14 个。以下 1 个场景不计入模型能力：
 
 - `apply_patch_probe`：当前 Codex CLI 请求工具列表未声明 `apply_patch`
-- `cloudflare_execute_probe`：Cloudflare API MCP 未声明或未认证
-- `cloudflare_spec_probe`：Cloudflare API MCP 未声明或未认证
 
 ## 总体结果
 
@@ -32,7 +30,7 @@
 
 - `105 ok`
 - `63 fail`
-- `36 skip`
+- `12 skip`
 
 失败类型分布：
 
@@ -121,6 +119,13 @@
   - `subagent_probe`
 
 基于这组差异，当前更像是 `new-api` 链路对工具历史、工具序列或 finalize 收口信号的保真度不足，而不是 `firew2oai` 主转换层在 5 个核心 Coding 场景上发生整体回退。
+
+移除 Cloudflare 场景后的复核结论：
+
+- `interactive_shell_session` 样本中模型启动了 shell 进程，但没有按场景要求调用 `write_stdin`，属于真实工具编排失败，不应在矩阵层改判通过。
+- `js_repl_roundtrip` 样本中模型连续调用 `js_repl`，没有调用 `js_repl_reset`，属于真实工具编排失败。
+- `subagent_probe` 样本中已出现 `spawn_agent` 和 `close_agent`，但未完成期望的最终内容，仍按 `final_content_mismatch` 归类。
+- 因此本轮优化只收敛评测工具范围和诊断口径，不把真实失败静默降级为成功。
 
 ## 当前优化空间
 

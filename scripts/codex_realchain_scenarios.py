@@ -213,25 +213,6 @@ SCENARIOS = (
         expect_clean_diff=True,
     ),
     Scenario(
-        name="cloudflare_execute_probe",
-        prompt=(
-            "你是测试代理。请验证 Cloudflare API MCP 的 execute：\n"
-            "1) 必须使用 mcp__cloudflare_api__execute。\n"
-            "2) code 必须是 async 箭头函数，并通过 cloudflare.request 发起一个只读 GET 请求："
-            "/accounts/${accountId}/workers/scripts。\n"
-            "3) 不要调用 search，也不要做任何写操作。\n"
-            "4) 如果结果为空，要如实说明为空，不要虚构脚本名称。\n"
-            "5) 不要修改任何文件。\n"
-            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 返回的脚本数量或 empty。"
-        ),
-        expected_operations=(),
-        expected_files=(),
-        capabilities=("mcp_cloudflare_execute", "structured_final"),
-        required_tools=("mcp__cloudflare_api__execute",),
-        expected_signals=("cloudflare_api", "execute"),
-        expect_clean_diff=True,
-    ),
-    Scenario(
         name="docfork_probe",
         prompt=(
             "你是测试代理。请验证 Docfork MCP：\n"
@@ -246,24 +227,6 @@ SCENARIOS = (
         capabilities=("mcp_docfork", "structured_final"),
         required_tools=("mcp__docfork__search_docs", "mcp__docfork__fetch_doc"),
         expected_signals=("docfork", "search_docs", "fetch_doc"),
-        expect_clean_diff=True,
-    ),
-    Scenario(
-        name="cloudflare_spec_probe",
-        prompt=(
-            "你是测试代理。请验证 Cloudflare API MCP：\n"
-            "1) 必须使用 mcp__cloudflare_api__search。\n"
-            "2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n"
-            "3) 返回两个对象即可，每个对象至少包含 method 和 path。\n"
-            "4) 禁止调用 execute。\n"
-            "5) 不要修改任何文件。\n"
-            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你找到的两个 path。"
-        ),
-        expected_operations=(),
-        expected_files=(),
-        capabilities=("mcp_cloudflare", "structured_final"),
-        required_tools=("mcp__cloudflare_api__search",),
-        expected_signals=("cloudflare_api", "search"),
         expect_clean_diff=True,
     ),
     Scenario(

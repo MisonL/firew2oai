@@ -3020,18 +3020,6 @@ func TestExtractEvidenceSummarySnippet_PrefersFetchDocOverSearchDocs(t *testing.
 	}
 }
 
-func TestExtractEvidenceSummarySnippet_ExtractsCloudflarePathsFromSearchResults(t *testing.T) {
-	outputs := []string{
-		`mcp__cloudflare_api__search => success=true [{"method":"GET","path":"/accounts/{account_id}/builds/workers/{external_script_id}/builds"},{"method":"GET","path":"/accounts/{account_id}/builds/workers/{external_script_id}/triggers"}]`,
-	}
-
-	got := extractEvidenceSummarySnippet(outputs)
-	want := "/accounts/{account_id}/builds/workers/{external_script_id}/builds; /accounts/{account_id}/builds/workers/{external_script_id}/triggers"
-	if got != want {
-		t.Fatalf("snippet = %q, want %q", got, want)
-	}
-}
-
 func TestExtractEvidenceSummarySnippet_PrefersWaitAgentCompletedOverCloseAgentPreviousStatus(t *testing.T) {
 	outputs := []string{
 		`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
@@ -3105,65 +3093,6 @@ func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocfor
 	}
 	if !strings.Contains(got, "NOTE: useEffectEvent in Dependencies") {
 		t.Fatalf("constrained text = %q, want NOTE from fetch_doc heading", got)
-	}
-}
-
-func TestConstrainFinalText_OverridesCloudflareFailBlockFromSuccessfulSearchEvidence(t *testing.T) {
-	task := "你是测试代理。请验证 Cloudflare API MCP：\n" +
-		"1) 必须使用 mcp__cloudflare_api__search。\n" +
-		"2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n" +
-		"3) 返回两个对象即可，每个对象至少包含 method 和 path。\n" +
-		"4) 禁止调用 execute。\n" +
-		"5) 不要修改任何文件。\n" +
-		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你找到的两个 path。"
-	history := []json.RawMessage{
-		mustMarshalRawJSON(map[string]any{
-			"id":     "item_0",
-			"type":   "mcp_tool_call",
-			"server": "cloudflare-api",
-			"tool":   "search",
-			"arguments": map[string]any{
-				"code": "async () => { return []; }",
-			},
-			"result": map[string]any{
-				"content": []map[string]any{{
-					"type": "text",
-					"text": "[\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/builds\"\n  },\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/triggers\"\n  }\n]",
-				}},
-				"structured_content": nil,
-			},
-			"error":  nil,
-			"status": "completed",
-		}),
-		mustMarshalRawJSON(map[string]any{
-			"id":     "item_1",
-			"type":   "mcp_tool_call",
-			"server": "cloudflare-api",
-			"tool":   "search",
-			"arguments": map[string]any{
-				"code": "async () => { return []; }",
-			},
-			"result": map[string]any{
-				"content": []map[string]any{{
-					"type": "text",
-					"text": "[\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/builds\"\n  },\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/triggers\"\n  }\n]",
-				}},
-				"structured_content": nil,
-			},
-			"error":  nil,
-			"status": "completed",
-		}),
-	}
-	evidence := buildExecutionEvidence(history)
-	text := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: No path found with tags containing \"workers\""
-
-	got := constrainFinalText(task, text, evidence, true)
-	want := "RESULT: PASS\n" +
-		"FILES: none\n" +
-		"TEST: N/A\n" +
-		"NOTE: /accounts/{account_id}/builds/workers/{external_script_id}/builds; /accounts/{account_id}/builds/workers/{external_script_id}/triggers"
-	if got != want {
-		t.Fatalf("constrained text = %q, want %q", got, want)
 	}
 }
 

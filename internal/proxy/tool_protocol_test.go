@@ -906,68 +906,6 @@ func TestParseToolCallOutputs_NormalizesDocforkSearchDocsDocsAlias(t *testing.T)
 	}
 }
 
-func TestParseToolCallOutputs_NormalizesCloudflareSearchInputToCode(t *testing.T) {
-	result := parseToolCallOutputs(
-		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__search\",\"input\":\"async () => [{ method: 'GET', path: '/workers' }]\"}]}\n<<<END_AI_ACTIONS_V1>>>",
-		map[string]responseToolDescriptor{
-			"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
-		},
-		"",
-	)
-
-	if result.err != nil {
-		t.Fatalf("unexpected parse error: %v", result.err)
-	}
-	if len(result.calls) != 1 {
-		t.Fatalf("tool call count = %d, want 1", len(result.calls))
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
-		t.Fatalf("decode tool call: %v", err)
-	}
-	argumentsText, _ := decoded["arguments"].(string)
-	var arguments map[string]any
-	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
-		t.Fatalf("decode arguments: %v", err)
-	}
-	if arguments["code"] != "async () => [{ method: 'GET', path: '/workers' }]" {
-		t.Fatalf("code = %v, want input copied into code", arguments["code"])
-	}
-}
-
-func TestParseToolCallOutputs_NormalizesCloudflareSearchQueryToCode(t *testing.T) {
-	result := parseToolCallOutputs(
-		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__search\",\"arguments\":{\"query\":\"workers\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
-		map[string]responseToolDescriptor{
-			"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
-		},
-		"",
-	)
-
-	if result.err != nil {
-		t.Fatalf("unexpected parse error: %v", result.err)
-	}
-	if len(result.calls) != 1 {
-		t.Fatalf("tool call count = %d, want 1", len(result.calls))
-	}
-	var decoded map[string]any
-	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
-		t.Fatalf("decode tool call: %v", err)
-	}
-	argumentsText, _ := decoded["arguments"].(string)
-	var arguments map[string]any
-	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
-		t.Fatalf("decode arguments: %v", err)
-	}
-	code, _ := arguments["code"].(string)
-	if !strings.Contains(code, "async () =>") || !strings.Contains(code, "workers") {
-		t.Fatalf("code = %q, want synthesized async workers search", code)
-	}
-	if _, ok := arguments["query"]; ok {
-		t.Fatalf("query alias should be removed, arguments=%#v", arguments)
-	}
-}
-
 func TestParseToolCallOutputs_LegacyJSONSequence(t *testing.T) {
 	result := parseToolCallOutputs(
 		"{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",

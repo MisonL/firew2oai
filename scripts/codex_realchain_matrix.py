@@ -532,6 +532,21 @@ def detect_declared_tools(output_dir: Path, codex_executable: str, model: str, t
             remove_worktree(worktree)
 
 
+def filter_declared_tools_for_matrix(tools: list[str]) -> list[str]:
+    raw = os.environ.get("CODEX_MATRIX_ALLOWED_MCP_TOOLS", "chrome-devtools,docfork").strip()
+    if raw == "":
+        return tools
+    allowed_prefixes = {
+        "chrome-devtools": "mcp__chrome_devtools__",
+        "docfork": "mcp__docfork__",
+    }
+    allowed = {item.strip().lower() for item in raw.split(",") if item.strip()}
+    prefixes = tuple(prefix for name, prefix in allowed_prefixes.items() if name in allowed)
+    if not prefixes:
+        return [tool for tool in tools if not tool.startswith("mcp__")]
+    return [tool for tool in tools if not tool.startswith("mcp__") or tool.startswith(prefixes)]
+
+
 def unsupported_required_tools(scenario: Scenario, available_tools: set[str]) -> list[str]:
     if not available_tools:
         return []
@@ -773,10 +788,6 @@ def classify_failure_reason(
 
     combined = "\n".join([stderr_preview, final_preview]).lower()
     observed = set(observed_signals)
-    if ("cloudflare_api" in expected_signals or "mcp__cloudflare_api" in combined) and (
-        "authrequired" in combined or "missing or invalid access token" in combined
-    ):
-        return "mcp_auth_required"
     if "unsupported call:" in combined:
         return "runtime_unsupported_tool"
     if "is not declared in request tools" in combined:
@@ -805,8 +816,6 @@ def classify_failure_reason(
         return "missed_docfork_fetch_doc"
     if 'tool_choice requires "apply_patch"' in combined:
         return "missed_apply_patch"
-    if 'tool_choice requires "mcp__cloudflare_api__search"' in combined:
-        return "missed_cloudflare_search"
     if 'tool_choice requires "mcp__chrome_devtools__' in combined:
         return "missed_chrome_devtools_sequence"
     if "web_search follow-up did not answer from captured results" in combined:
@@ -821,10 +830,6 @@ def classify_failure_reason(
         return "mcp_search_invalid_args"
     if "invalid arguments for tool fetch_doc" in combined:
         return "mcp_fetch_doc_invalid_args"
-    if 'function_call for "mcp__cloudflare_api__search" must use arguments, not input' in combined:
-        return "cloudflare_search_used_input_field"
-    if 'no path found with tags containing "workers"' in combined:
-        return "cloudflare_workers_path_not_found"
     if "tool call json decode failed" in combined:
         return "malformed_tool_json"
     if expected_signals and not all(token in observed for token in expected_signals):
@@ -1053,7 +1058,9 @@ def main() -> int:
         raise SystemExit("No scenarios selected. Check CODEX_MATRIX_SCENARIOS.")
     declared_tool_sets: dict[str, set[str]] = {}
     for model in models:
-        declared_tools = detect_declared_tools(output_dir, codex_executable, model, min(timeout_s, 120))
+        declared_tools = filter_declared_tools_for_matrix(
+            detect_declared_tools(output_dir, codex_executable, model, min(timeout_s, 120))
+        )
         declared_tool_sets[model] = set(declared_tools)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         for model in models:
