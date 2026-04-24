@@ -99,6 +99,30 @@ class RunHelperTests(TestCase):
                 ["web_search_probe", "readonly_audit"],
             )
 
+    def test_select_scenarios_supports_realistic_suite(self) -> None:
+        with patch.dict("os.environ", {"CODEX_MATRIX_SUITE": "realistic"}, clear=False):
+            self.assertEqual(
+                [scenario.name for scenario in matrix.select_scenarios()],
+                [
+                    "real_debug_regression",
+                    "real_refactor_with_tests",
+                    "real_docs_sync",
+                    "real_test_diagnosis_no_write",
+                    "real_docfork_api_lookup",
+                ],
+            )
+
+    def test_select_scenarios_filters_realistic_suite(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"CODEX_MATRIX_SUITE": "realistic", "CODEX_MATRIX_SCENARIOS": "real_docs_sync,real_debug_regression"},
+            clear=False,
+        ):
+            self.assertEqual(
+                [scenario.name for scenario in matrix.select_scenarios()],
+                ["real_docs_sync", "real_debug_regression"],
+            )
+
     def test_effective_case_timeout_raises_subagent_probe_floor(self) -> None:
         scenario = next(item for item in matrix.SCENARIOS if item.name == "subagent_probe")
         self.assertEqual(matrix.effective_case_timeout("qwen3-vl-30b-a3b-thinking", scenario, 420), 900)

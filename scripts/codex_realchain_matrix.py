@@ -13,7 +13,7 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from codex_realchain_scenarios import MODELS, SCENARIOS, Scenario, prepare_fixture
+from codex_realchain_scenarios import MODELS, REALISTIC_SCENARIOS, SCENARIOS, Scenario, prepare_fixture
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_NAMES_PATTERN = re.compile(r'tool_names="\[([^\"]*)\]"')
@@ -1029,6 +1029,15 @@ def filter_items(items, env_key: str):
     return [by_name[name] for name in requested if name in by_name]
 
 
+def select_scenarios() -> list[Scenario]:
+    suite = os.environ.get("CODEX_MATRIX_SUITE", "full").strip().lower()
+    if suite in {"real", "realistic", "realworld", "real-world"}:
+        return filter_items(REALISTIC_SCENARIOS, "CODEX_MATRIX_SCENARIOS")
+    if suite in {"all", "combined"}:
+        return filter_items((*SCENARIOS, *REALISTIC_SCENARIOS), "CODEX_MATRIX_SCENARIOS")
+    return filter_items(SCENARIOS, "CODEX_MATRIX_SCENARIOS")
+
+
 def effective_case_timeout(model: str, scenario: Scenario, timeout_s: int) -> int:
     required_tools = set(scenario.required_tools)
     if {"spawn_agent", "wait_agent", "close_agent"}.issubset(required_tools):
@@ -1051,7 +1060,7 @@ def main() -> int:
 
     futures = {}
     models = filter_items(MODELS, "CODEX_MATRIX_MODELS")
-    scenarios = filter_items(SCENARIOS, "CODEX_MATRIX_SCENARIOS")
+    scenarios = select_scenarios()
     if not models:
         raise SystemExit("No models selected. Check CODEX_MATRIX_MODELS.")
     if not scenarios:

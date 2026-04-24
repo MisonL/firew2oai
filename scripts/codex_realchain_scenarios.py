@@ -332,6 +332,109 @@ SCENARIOS = (
 )
 
 
+REALISTIC_SCENARIOS = (
+    Scenario(
+        name="real_debug_regression",
+        prompt=(
+            "你是资深 Go 工程师。请模拟真实 Codex 调试任务：\n"
+            "1) 先执行 go test ./internal/codexfixture/realdebug，观察失败。\n"
+            "2) 阅读 internal/codexfixture/realdebug/*.go。\n"
+            "3) 定位根因并修复 internal/codexfixture/realdebug/parser.go，使测试通过。\n"
+            "4) 不要新增无关文件。\n"
+            "5) 再执行 go test ./internal/codexfixture/realdebug。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: 测试结果；NOTE: 根因和修复摘要。"
+        ),
+        expected_operations=(
+            "go test ./internal/codexfixture/realdebug",
+            "internal/codexfixture/realdebug/parser.go",
+        ),
+        expected_files=("internal/codexfixture/realdebug/parser.go",),
+        capabilities=("debug", "read", "edit_existing", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
+    ),
+    Scenario(
+        name="real_refactor_with_tests",
+        prompt=(
+            "你是资深 Go 工程师。请模拟真实 Codex 小重构任务：\n"
+            "1) 阅读 internal/codexfixture/realrefactor/formatter.go 与 formatter_test.go。\n"
+            "2) 将 BuildUserLine 中的清洗逻辑拆到新增文件 internal/codexfixture/realrefactor/normalize.go。\n"
+            "3) 让 name 执行 strings.TrimSpace，role 执行 strings.TrimSpace + strings.ToLower。\n"
+            "4) 在 formatter_test.go 追加 role 大小写混合的测试。\n"
+            "5) 执行 go test ./internal/codexfixture/realrefactor。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你新增或修改的文件；TEST: 测试结果；NOTE: 重构摘要。"
+        ),
+        expected_operations=(
+            "internal/codexfixture/realrefactor/formatter.go",
+            "internal/codexfixture/realrefactor/formatter_test.go",
+            "go test ./internal/codexfixture/realrefactor",
+        ),
+        expected_files=(
+            "internal/codexfixture/realrefactor/formatter.go",
+            "internal/codexfixture/realrefactor/formatter_test.go",
+            "internal/codexfixture/realrefactor/normalize.go",
+        ),
+        capabilities=("refactor", "cross_file", "update_tests", "targeted_test", "structured_final"),
+        required_tools=("exec_command",),
+    ),
+    Scenario(
+        name="real_docs_sync",
+        prompt=(
+            "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n"
+            "1) 阅读 internal/codexfixture/realdocs/config.go。\n"
+            "2) 阅读 docs/codexfixture/realdocs.md。\n"
+            "3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。\n"
+            "4) 不要修改 Go 代码。\n"
+            "5) 执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"
+        ),
+        expected_operations=(
+            "internal/codexfixture/realdocs/config.go",
+            "docs/codexfixture/realdocs.md",
+            "rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md",
+        ),
+        expected_files=("docs/codexfixture/realdocs.md",),
+        capabilities=("read", "documentation", "targeted_check", "structured_final"),
+        required_tools=("exec_command",),
+    ),
+    Scenario(
+        name="real_test_diagnosis_no_write",
+        prompt=(
+            "你是资深 Go 工程师。请模拟真实 Codex 只读测试诊断任务：\n"
+            "1) 执行 go test ./internal/codexfixture/realdiagnose。\n"
+            "2) 阅读 internal/codexfixture/realdiagnose/*.go。\n"
+            "3) 不要修改任何文件。\n"
+            "4) 说明失败根因和最小修复位置。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你读取的文件；TEST: 测试结果；NOTE: 根因和建议修复。"
+        ),
+        expected_operations=(
+            "go test ./internal/codexfixture/realdiagnose",
+            "internal/codexfixture/realdiagnose",
+        ),
+        expected_files=(),
+        capabilities=("debug", "read", "no_write", "structured_final"),
+        required_tools=("exec_command",),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="real_docfork_api_lookup",
+        prompt=(
+            "你是资深 Go 工程师。请模拟真实 Codex 查文档任务：\n"
+            "1) 必须使用 mcp__docfork__search_docs 搜索 react useEffectEvent。\n"
+            "2) 必须使用 mcp__docfork__fetch_doc 获取相关页面。\n"
+            "3) 阅读 README.md 的项目描述。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: README.md；TEST: N/A；NOTE: 说明 useEffectEvent 适合解决哪类非响应式逻辑问题。"
+        ),
+        expected_operations=("README.md",),
+        expected_files=(),
+        capabilities=("mcp_docfork", "read", "structured_final"),
+        required_tools=("mcp__docfork__search_docs", "mcp__docfork__fetch_doc", "exec_command"),
+        expected_signals=("docfork", "search_docs", "fetch_doc", "command_execution"),
+        expect_clean_diff=True,
+    ),
+)
+
+
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -440,6 +543,110 @@ func TestBuildSummary_NormalizesTitleAndBody(t *testing.T) {
 
 func BuildTicketSummary(title, body string) string {
 \treturn title + ": " + body
+}
+""",
+        )
+    if scenario_name == "real_debug_regression":
+        write_text(
+            worktree / "internal/codexfixture/realdebug/parser.go",
+            """package realdebug
+
+import "strconv"
+
+func ParsePort(value string) (int, error) {
+	port, err := strconv.Atoi(value)
+	if err != nil {
+		return 0, err
+	}
+	return port + 1, nil
+}
+""",
+        )
+        write_text(
+            worktree / "internal/codexfixture/realdebug/parser_test.go",
+            """package realdebug
+
+import "testing"
+
+func TestParsePortKeepsConfiguredValue(t *testing.T) {
+	got, err := ParsePort("39527")
+	if err != nil {
+		t.Fatalf("ParsePort returned error: %v", err)
+	}
+	if got != 39527 {
+		t.Fatalf("ParsePort() = %d, want 39527", got)
+	}
+}
+""",
+        )
+    if scenario_name == "real_refactor_with_tests":
+        write_text(
+            worktree / "internal/codexfixture/realrefactor/formatter.go",
+            """package realrefactor
+
+func BuildUserLine(name, role string) string {
+	return name + " (" + role + ")"
+}
+""",
+        )
+        write_text(
+            worktree / "internal/codexfixture/realrefactor/formatter_test.go",
+            """package realrefactor
+
+import "testing"
+
+func TestBuildUserLineNormalizesWhitespace(t *testing.T) {
+	got := BuildUserLine("  Mison  ", " ADMIN ")
+	want := "Mison (admin)"
+	if got != want {
+		t.Fatalf("BuildUserLine() = %q, want %q", got, want)
+	}
+}
+""",
+        )
+    if scenario_name == "real_docs_sync":
+        write_text(
+            worktree / "internal/codexfixture/realdocs/config.go",
+            """package realdocs
+
+type Config struct {
+	TimeoutSeconds int
+	Retries        int
+}
+
+const TimeoutEnv = "REALDOCS_TIMEOUT"
+const RetriesEnv = "REALDOCS_RETRIES"
+""",
+        )
+        write_text(
+            worktree / "docs/codexfixture/realdocs.md",
+            """# Real Docs Fixture
+
+| 环境变量 | 说明 |
+|---|---|
+| REALDOCS_TIMEOUT | 请求超时时间，单位秒 |
+""",
+        )
+    if scenario_name == "real_test_diagnosis_no_write":
+        write_text(
+            worktree / "internal/codexfixture/realdiagnose/math.go",
+            """package realdiagnose
+
+func Double(value int) int {
+	return value + value + 1
+}
+""",
+        )
+        write_text(
+            worktree / "internal/codexfixture/realdiagnose/math_test.go",
+            """package realdiagnose
+
+import "testing"
+
+func TestDouble(t *testing.T) {
+	if got := Double(21); got != 42 {
+		t.Fatalf("Double(21) = %d, want 42", got)
+	}
 }
 """,
         )
