@@ -265,6 +265,22 @@ func TestBuildResponseToolCatalog_IncludesNamespaceCustomAndWebSearch(t *testing
 	}
 }
 
+func TestBuildResponseToolCatalog_UsesInlineNamespaceField(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"function","name":"resolve-library-id","namespace":"mcp__context7__","description":"resolve context7 id","parameters":{"type":"object","properties":{"libraryName":{"type":"string"},"query":{"type":"string"}}}},
+		{"type":"function","name":"get-library-docs","namespace":"mcp__context7__","description":"fetch context7 docs","parameters":{"type":"object","properties":{"context7CompatibleLibraryID":{"type":"string"},"topic":{"type":"string"}}}}
+	]`)
+
+	got := buildResponseToolCatalog(raw)
+	want := map[string]responseToolDescriptor{
+		"mcp__context7__resolve-library-id": {Name: "mcp__context7__resolve-library-id", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+		"mcp__context7__get-library-docs":   {Name: "mcp__context7__get-library-docs", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("buildResponseToolCatalog mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestSummarizeToolParameters_IncludesNestedTypesAndRequiredFields(t *testing.T) {
 	params := map[string]any{
 		"type": "object",
@@ -791,6 +807,62 @@ func TestHandleResponseByIDAndInputItems(t *testing.T) {
 	}
 }
 
+func TestFormatToolOutputSummary_IncludesSessionID(t *testing.T) {
+	output := map[string]any{
+		"content":    "Process running with session ID 19834",
+		"session_id": 19834,
+		"success":    true,
+	}
+
+	got := formatToolOutputSummaryFromOutput("call_shell_1", output)
+	for _, want := range []string{
+		"Tool result (call_id=call_shell_1)",
+		"Success: true",
+		"Session ID: 19834",
+		"Output:\nProcess running with session ID 19834",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatToolOutputSummary missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestNormalizeToolSummaryStringItems_PreservesSessionID(t *testing.T) {
+	text := "Tool result (call_id=call_shell_1)\n" +
+		"Success: true\n" +
+		"Session ID: 19834\n" +
+		"Output:\nProcess running with session ID 19834"
+
+	items := normalizeToolSummaryStringItems(text)
+	if len(items) != 1 {
+		t.Fatalf("len(items) = %d, want 1", len(items))
+	}
+
+	var item map[string]any
+	if err := json.Unmarshal(items[0], &item); err != nil {
+		t.Fatalf("decode normalized item: %v", err)
+	}
+	if item["type"] != "function_call_output" {
+		t.Fatalf("type = %#v, want function_call_output", item["type"])
+	}
+	if got := asString(item["call_id"]); got != "call_shell_1" {
+		t.Fatalf("call_id = %q, want call_shell_1", got)
+	}
+	output, _ := item["output"].(map[string]any)
+	if output == nil {
+		t.Fatalf("output = %#v, want object", item["output"])
+	}
+	if got := asString(output["content"]); got != "Process running with session ID 19834" {
+		t.Fatalf("output.content = %q, want session banner", got)
+	}
+	if got, ok := output["session_id"].(float64); !ok || int(got) != 19834 {
+		t.Fatalf("output.session_id = %#v, want 19834", output["session_id"])
+	}
+	if got, ok := output["success"].(bool); !ok || !got {
+		t.Fatalf("output.success = %#v, want true", output["success"])
+	}
+}
+
 func TestHandleResponses_PreviousResponseIDNotFound(t *testing.T) {
 	p := newTestProxy()
 	mux := newTestMux(t, p, "*")
@@ -1028,11 +1100,29 @@ func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForReadOnlyTask(t *
 		"RESULT: PASS",
 		"FILES: README.md",
 		"TEST: N/A",
-		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`,
+		`NOTE: # firew2oai`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("fallback text missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForSingleReadReply(t *testing.T) {
+	task := "必须使用 exec_command 执行 `head -n 1 README.md`，只返回 README.md 第一行内容，不要额外解释。"
+	evidence := executionEvidence{
+		Commands: []string{"head -n 1 README.md"},
+		Outputs: []string{
+			"head -n 1 README.md => success=true # firew2oai",
+		},
+	}
+
+	got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil)
+	if !ok {
+		t.Fatal("fallbackFinalTextForIncompleteResponses ok = false, want true")
+	}
+	if got != "# firew2oai" {
+		t.Fatalf("fallback text = %q, want %q", got, "# firew2oai")
 	}
 }
 
@@ -1814,6 +1904,108 @@ func TestBuildExecutionEvidence_InfersSubagentToolSuccess(t *testing.T) {
 	}
 }
 
+func TestBuildExecutionEvidence_InfersCollabSubagentToolSuccess(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"agents_states":{"agent_789":{"status":"completed","message":"# firew2oai"}},"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","previous_status":{"completed":"# firew2oai"},"status":"completed"}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	if !reflect.DeepEqual(evidence.Commands, []string{"spawn_agent", "wait_agent", "close_agent"}) {
+		t.Fatalf("evidence.Commands = %#v, want subagent collab sequence", evidence.Commands)
+	}
+	blob := strings.Join(evidence.Outputs, "\n")
+	for _, token := range []string{
+		`spawn_agent => success=true`,
+		`wait_agent => success=true`,
+		`close_agent => success=true`,
+		`# firew2oai`,
+	} {
+		if !strings.Contains(blob, token) {
+			t.Fatalf("evidence outputs = %q, want token %q", blob, token)
+		}
+	}
+}
+
+func TestBuildExecutionEvidence_InfersCloseAgentCompletionFromAgentsStates(t *testing.T) {
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","agents_states":{"agent_789":{"status":"completed","message":"The first line of README.md is: ` + "`# My Awesome Project`" + `"}},"status":"completed"}`),
+	}
+
+	evidence := buildExecutionEvidence(history)
+	blob := strings.Join(evidence.Outputs, "\n")
+	if !strings.Contains(blob, `close_agent => success=true {"previous_status":{"agent_id":"agent_789","completed":"The first line of README.md is: `+"`# My Awesome Project`"+`"}}`) {
+		t.Fatalf("evidence outputs = %q, want close_agent completion synthesized from agents_states", blob)
+	}
+	if snippet := extractEvidenceSummarySnippet(evidence.Outputs); !strings.Contains(snippet, "My Awesome Project") {
+		t.Fatalf("extractEvidenceSummarySnippet = %q, want synthesized close_agent completion", snippet)
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_UsesCollabHistoryEvidenceForReadOnlyTask(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"agents_states":{"agent_789":{"status":"completed","message":"# firew2oai"}},"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","previous_status":{"completed":"# firew2oai"},"status":"completed"}`),
+	}
+
+	got, ok := fallbackFinalTextForIncompleteResponses(task, buildExecutionEvidence(history), true, nil)
+	if !ok {
+		t.Fatal("fallbackFinalTextForIncompleteResponses ok = false, want true")
+	}
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: README.md",
+		"TEST: N/A",
+		"NOTE: # firew2oai",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback text missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_RejectsPartialSubagentEvidence(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Ampere"}`,
+		},
+	}
+
+	if taskCompletionSatisfied(task, evidence) {
+		t.Fatal("taskCompletionSatisfied = true, want false for partial tool progress")
+	}
+	if got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil); ok {
+		t.Fatalf("fallbackFinalTextForIncompleteResponses unexpectedly returned %q", got)
+	}
+}
+
 func TestConstrainFinalText_OverridesSubagentFailLabelWhenEvidencePassed(t *testing.T) {
 	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
 		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
@@ -1846,7 +2038,7 @@ func TestConstrainFinalText_OverridesSubagentFailLabelWhenEvidencePassed(t *test
 	}
 	if corrected, ok := overrideStructuredFailBlockWithEvidence(task, text, evidence); !ok {
 		t.Fatalf("overrideStructuredFailBlockWithEvidence returned ok=false")
-	} else if corrected != "RESULT: PASS\nFILES: README.md\nTEST: N/A\nNOTE: {\"previous_status\":{\"completed\":\"# firew2oai\"}}" {
+	} else if corrected != "RESULT: PASS\nFILES: README.md\nTEST: N/A\nNOTE: # firew2oai" {
 		t.Fatalf("overrideStructuredFailBlockWithEvidence = %q", corrected)
 	}
 
@@ -1854,9 +2046,537 @@ func TestConstrainFinalText_OverridesSubagentFailLabelWhenEvidencePassed(t *test
 	want := "RESULT: PASS\n" +
 		"FILES: README.md\n" +
 		"TEST: N/A\n" +
-		"NOTE: {\"previous_status\":{\"completed\":\"# firew2oai\"}}"
+		"NOTE: # firew2oai"
 	if got != want {
 		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestExtractEvidenceSummarySnippet_PrefersRecoveredCloseAgentCompletion(t *testing.T) {
+	outputs := []string{
+		`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+		`wait_agent => success=false {"status":{},"timed_out":true}`,
+		`close_agent => success=true {"previous_status":{"completed":"The first line of README.md is: ` + "`# My Awesome Project`" + `"}}`,
+	}
+
+	got := extractEvidenceSummarySnippet(outputs)
+	if !strings.Contains(got, "My Awesome Project") {
+		t.Fatalf("extractEvidenceSummarySnippet = %q, want close_agent completion", got)
+	}
+}
+
+func TestConstrainFinalText_OverridesSubagentFailLabelWhenWaitTimedOutButCloseSucceeded(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"status":{},"timed_out":true}`
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Hume"}`,
+			`wait_agent => success=false {"status":{},"timed_out":true}`,
+			`close_agent => success=true {"previous_status":{"completed":"The first line of README.md is: ` + "`# My Awesome Project`" + `"}}`,
+		},
+	}
+
+	if !allObservedOutputsSucceeded(evidence) {
+		t.Fatalf("allObservedOutputsSucceeded = false, want recoverable success")
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	if !strings.Contains(got, "RESULT: PASS") {
+		t.Fatalf("constrained text missing RESULT: PASS:\n%s", got)
+	}
+	if !strings.Contains(got, "My Awesome Project") {
+		t.Fatalf("constrained text missing recovered close_agent completion:\n%s", got)
+	}
+}
+
+func TestConstrainFinalText_OverridesSubagentFailLabelForRealQwenRecoverableTimeout(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: head -n 1 README.md This is the first line of the README.md file."
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent", "wait_agent", "close_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Ampere"}`,
+			`wait_agent => success=false {"status":{},"timed_out":true}`,
+			`close_agent => success=true {"previous_status":{"completed":"head -n 1 README.md\nThis is the first line of the README.md file."}}`,
+		},
+	}
+
+	if !taskCompletionSatisfied(task, evidence) {
+		t.Fatal("taskCompletionSatisfied = false, want true for recovered subagent flow")
+	}
+	if !allObservedOutputsSucceeded(evidence) {
+		t.Fatalf("allObservedOutputsSucceeded = false, outputs=%q", evidence.Outputs)
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: head -n 1 README.md This is the first line of the README.md file."
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_OverridesSubagentFailLabelForNewAPIQwenCloseAgentAgentsStates(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","agents_states":{"agent_789":{"status":"completed","message":"The first line of README.md is: ` + "`# My Awesome Project`" + `"}},"status":"completed"}`),
+	}
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: The first line of README.md is: `# My Awesome Project`"
+	evidence := buildExecutionEvidence(history)
+
+	if !taskCompletionSatisfied(task, evidence) {
+		t.Fatal("taskCompletionSatisfied = false, want true")
+	}
+	if !allObservedOutputsSucceeded(evidence) {
+		t.Fatalf("allObservedOutputsSucceeded = false, outputs=%q", evidence.Outputs)
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: The first line of README.md is: `# My Awesome Project`"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenConcreteNotePayloadMissing(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"agents_states":{"agent_789":{"status":"completed","message":null}},"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","agents_states":{"agent_789":{"status":"completed","message":null}},"status":"completed"}`),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"previous_status":{"completed":null}}`
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenConcreteNotePayloadMissingRealKimiShape(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"root","receiver_thread_ids":[],"prompt":"必须使用 exec_command 执行 \u0060head -n 1 README.md\u0060，只返回 README.md 第一行内容，不要额外解释。","agents_states":{},"status":"in_progress"}`),
+		json.RawMessage(`{"id":"item_0","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":"必须使用 exec_command 执行 \u0060head -n 1 README.md\u0060，只返回 README.md 第一行内容，不要额外解释。","agents_states":{"agent_1":{"status":"pending_init","message":null}},"status":"completed"}`),
+		json.RawMessage(`{"id":"item_1","type":"collab_tool_call","tool":"wait","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":null,"agents_states":{},"status":"in_progress"}`),
+		json.RawMessage(`{"id":"item_1","type":"collab_tool_call","tool":"wait","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":null,"agents_states":{"agent_1":{"status":"completed","message":null}},"status":"completed"}`),
+		json.RawMessage(`{"id":"item_2","type":"collab_tool_call","tool":"close_agent","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":null,"agents_states":{},"status":"in_progress"}`),
+		json.RawMessage(`{"id":"item_2","type":"collab_tool_call","tool":"close_agent","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":null,"agents_states":{"agent_1":{"status":"completed","message":null}},"status":"completed"}`),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"previous_status":{"completed":null}}`
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_PrefersCompletedSubagentPayloadOverSpawnMetadataWhenWrappedInCodeFence(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"root","receiver_thread_ids":[],"prompt":"必须使用 exec_command 执行 \u0060head -n 1 README.md\u0060，只返回 README.md 第一行内容，不要额外解释。","agents_states":{},"status":"in_progress"}`),
+		json.RawMessage(`{"id":"item_0","type":"collab_tool_call","tool":"spawn_agent","sender_thread_id":"root","receiver_thread_ids":["agent_1"],"prompt":"必须使用 exec_command 执行 \u0060head -n 1 README.md\u0060，只返回 README.md 第一行内容，不要额外解释。","agents_states":{"agent_1":{"status":"pending_init","message":null}},"status":"completed"}`),
+		json.RawMessage("{\"id\":\"item_1\",\"type\":\"collab_tool_call\",\"tool\":\"wait\",\"sender_thread_id\":\"root\",\"receiver_thread_ids\":[\"agent_1\"],\"prompt\":null,\"agents_states\":{\"agent_1\":{\"status\":\"completed\",\"message\":\"```\\n# OpenAI Responses API\\n```\"}},\"status\":\"completed\"}"),
+		json.RawMessage("{\"id\":\"item_2\",\"type\":\"collab_tool_call\",\"tool\":\"close_agent\",\"sender_thread_id\":\"root\",\"receiver_thread_ids\":[\"agent_1\"],\"prompt\":null,\"agents_states\":{\"agent_1\":{\"status\":\"completed\",\"message\":\"```\\n# OpenAI Responses API\\n```\"}},\"status\":\"completed\"}"),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: {"agent_id":"agent_1","nickname":"Copernicus"}`
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: # OpenAI Responses API"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsOnlyCommandEcho(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_1"],"agents_states":{"agent_1":{"status":"completed","message":"exec_command(\"head -n 1 README.md\")"}},"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","receiver_thread_ids":["agent_1"],"agents_states":{"agent_1":{"status":"completed","message":"exec_command(\"head -n 1 README.md\")"}},"status":"completed"}`),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		`NOTE: exec_command("head -n 1 README.md")`
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsOnlyExecutionNarration(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	message := "### Executing `head -n 1 README.md`\nTo fulfill the current task, the command `head -n 1 README.md` needs to be executed to retrieve the first line of the `README.md` file.\n\n```bash\nexec_command: head -n 1 README.md\n```"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "wait",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "close_agent",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: " + message
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsOnlyPlanNarration(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	message := "I'll execute the command to get the first line of README.md."
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "wait",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "close_agent",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: " + message
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsRequiredCommandNarration(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	message := "### Executing the Required Command\nTo satisfy the current task, we need to execute the `head -n 1 README.md` command."
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "wait",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "close_agent",
+			"receiver_thread_ids": []string{"agent_1"},
+			"previous_status": map[string]any{
+				"completed": message,
+			},
+			"status": "completed",
+		}),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: " + mustMarshalJSONText(map[string]any{
+		"previous_status": map[string]any{"completed": message},
+	})
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsOnlyToolJSON(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	message := `{ "tool": "exec_command", "action": "run", "arguments": { "cmd": ["head", "-n", "1", "README.md"] } }`
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "wait",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":                "collab_tool_call",
+			"tool":                "close_agent",
+			"receiver_thread_ids": []string{"agent_1"},
+			"agents_states": map[string]any{
+				"agent_1": map[string]any{"status": "completed", "message": message},
+			},
+			"status": "completed",
+		}),
+	}
+	text := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: " + message
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_DoesNotOverrideIncompleteReadOnlyToolChain(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理还未返回结果。"
+	evidence := executionEvidence{
+		Commands: []string{"spawn_agent"},
+		Outputs: []string{
+			`spawn_agent => success=true {"agent_id":"agent_123","nickname":"Ampere"}`,
+		},
+	}
+
+	if taskCompletionSatisfied(task, evidence) {
+		t.Fatal("taskCompletionSatisfied = true, want false for incomplete subagent flow")
+	}
+	if corrected, ok := overrideStructuredFailBlockWithEvidence(task, text, evidence); ok {
+		t.Fatalf("overrideStructuredFailBlockWithEvidence unexpectedly returned %q", corrected)
+	}
+}
+
+func TestConstrainFinalText_DoesNotOverrideInteractiveSessionParseFailure(t *testing.T) {
+	task := "你是测试代理。请验证交互式 shell 会话能力：\n" +
+		"1) 必须使用 exec_command 启动一个交互式 python3 会话。\n" +
+		"2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。\n" +
+		"3) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 交互式会话结果。"
+	text := "RESULT: FAIL\n" +
+		"FILES: none\n" +
+		"TEST: N/A\n" +
+		"NOTE: failed to parse function arguments: missing field `session_id` at line 1 column 34"
+	evidence := executionEvidence{
+		Commands: []string{"python3"},
+		Outputs: []string{
+			"python3 => success=true Process running with session ID 19834",
+		},
+	}
+	if corrected, ok := overrideStructuredFailBlockWithEvidence(task, text, evidence); ok {
+		t.Fatalf("overrideStructuredFailBlockWithEvidence unexpectedly returned %q", corrected)
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	if got != text {
+		t.Fatalf("constrained text = %q, want unchanged fail block %q", got, text)
 	}
 }
 
@@ -1886,7 +2606,7 @@ func TestConstrainFinalText_StripsPlainTextAIActionsAndSynthesizesReadOnlyProbe(
 	want := "RESULT: PASS\n" +
 		"FILES: README.md\n" +
 		"TEST: N/A\n" +
-		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`
+		`NOTE: # firew2oai`
 	if got != want {
 		t.Fatalf("constrained text = %q, want %q", got, want)
 	}
@@ -1918,7 +2638,7 @@ func TestConstrainFinalText_StripsInlinePlainTextAIActionsBeforeLabels(t *testin
 	want := "RESULT: PASS\n" +
 		"FILES: README.md\n" +
 		"TEST: N/A\n" +
-		`NOTE: {"previous_status":{"completed":"# firew2oai"}}`
+		`NOTE: # firew2oai`
 	if got != want {
 		t.Fatalf("constrained text = %q, want %q", got, want)
 	}
@@ -2300,6 +3020,41 @@ func TestExtractEvidenceSummarySnippet_PrefersFetchDocOverSearchDocs(t *testing.
 	}
 }
 
+func TestExtractEvidenceSummarySnippet_ExtractsCloudflarePathsFromSearchResults(t *testing.T) {
+	outputs := []string{
+		`mcp__cloudflare_api__search => success=true [{"method":"GET","path":"/accounts/{account_id}/builds/workers/{external_script_id}/builds"},{"method":"GET","path":"/accounts/{account_id}/builds/workers/{external_script_id}/triggers"}]`,
+	}
+
+	got := extractEvidenceSummarySnippet(outputs)
+	want := "/accounts/{account_id}/builds/workers/{external_script_id}/builds; /accounts/{account_id}/builds/workers/{external_script_id}/triggers"
+	if got != want {
+		t.Fatalf("snippet = %q, want %q", got, want)
+	}
+}
+
+func TestExtractEvidenceSummarySnippet_PrefersWaitAgentCompletedOverCloseAgentPreviousStatus(t *testing.T) {
+	outputs := []string{
+		`wait_agent => success=true {"status":{"agent_123":{"completed":"# firew2oai"}},"timed_out":false}`,
+		`close_agent => success=true {"previous_status":{"completed":"Codex adapter error: tool call JSON decode failed: invalid character '<' after object key:value pair <<<AI_ACTIONS_V1"}}`,
+	}
+
+	got := extractEvidenceSummarySnippet(outputs)
+	if got != "# firew2oai" {
+		t.Fatalf("snippet = %q, want %q", got, "# firew2oai")
+	}
+}
+
+func TestExtractEvidenceSummarySnippet_StripsInteractiveTerminalControlSequences(t *testing.T) {
+	outputs := []string{
+		"write_stdin => success=true \x1b[@p\x1b[@r\x1b[@i\x1b[@n\x1b[@t\x1b[@(\x1b[@2\x1b[@ \x1b[@+\x1b[@ \x1b[@3\x1b[@)\x1b[16D\n\r\x1b[?2004l\x1b[?1l\x1b>5\r\n\x1b[?2004h\x1b[?1h\x1b=\x1b[?25l>>> \x1b[?12l\x1b[?25h\x1b[@e\x1b[@x\x1b[@i\x1b[@t\x1b[@(\x1b[@)\x1b[10D\n\r\x1b[?2004l\x1b[?1l\x1b>",
+	}
+
+	got := extractEvidenceSummarySnippet(outputs)
+	if got != "5" {
+		t.Fatalf("snippet = %q, want %q", got, "5")
+	}
+}
+
 func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocforkSample(t *testing.T) {
 	task := "你是测试代理。请验证 Docfork MCP：\n" +
 		"1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n" +
@@ -2350,6 +3105,65 @@ func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocfor
 	}
 	if !strings.Contains(got, "NOTE: useEffectEvent in Dependencies") {
 		t.Fatalf("constrained text = %q, want NOTE from fetch_doc heading", got)
+	}
+}
+
+func TestConstrainFinalText_OverridesCloudflareFailBlockFromSuccessfulSearchEvidence(t *testing.T) {
+	task := "你是测试代理。请验证 Cloudflare API MCP：\n" +
+		"1) 必须使用 mcp__cloudflare_api__search。\n" +
+		"2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n" +
+		"3) 返回两个对象即可，每个对象至少包含 method 和 path。\n" +
+		"4) 禁止调用 execute。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你找到的两个 path。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{
+			"id":     "item_0",
+			"type":   "mcp_tool_call",
+			"server": "cloudflare-api",
+			"tool":   "search",
+			"arguments": map[string]any{
+				"code": "async () => { return []; }",
+			},
+			"result": map[string]any{
+				"content": []map[string]any{{
+					"type": "text",
+					"text": "[\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/builds\"\n  },\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/triggers\"\n  }\n]",
+				}},
+				"structured_content": nil,
+			},
+			"error":  nil,
+			"status": "completed",
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"id":     "item_1",
+			"type":   "mcp_tool_call",
+			"server": "cloudflare-api",
+			"tool":   "search",
+			"arguments": map[string]any{
+				"code": "async () => { return []; }",
+			},
+			"result": map[string]any{
+				"content": []map[string]any{{
+					"type": "text",
+					"text": "[\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/builds\"\n  },\n  {\n    \"method\": \"GET\",\n    \"path\": \"/accounts/{account_id}/builds/workers/{external_script_id}/triggers\"\n  }\n]",
+				}},
+				"structured_content": nil,
+			},
+			"error":  nil,
+			"status": "completed",
+		}),
+	}
+	evidence := buildExecutionEvidence(history)
+	text := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: No path found with tags containing \"workers\""
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: none\n" +
+		"TEST: N/A\n" +
+		"NOTE: /accounts/{account_id}/builds/workers/{external_script_id}/builds; /accounts/{account_id}/builds/workers/{external_script_id}/triggers"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
 	}
 }
 

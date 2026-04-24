@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -82,6 +83,9 @@ func appendToolProtocolInstructionsForCatalog(builder *strings.Builder, supports
 	}
 	if _, ok := toolCatalog["js_repl"]; ok {
 		builder.WriteString("For js_repl, send raw JavaScript source in input. Do not wrap js_repl input in JSON, quotes, or markdown fences.\n")
+	}
+	if _, ok := toolCatalog["write_stdin"]; ok {
+		builder.WriteString("For write_stdin, arguments must be an object with session_id:number and chars:string. Do not use input in place of chars.\n")
 	}
 	if catalogHasNamespacedTools(toolCatalog) {
 		builder.WriteString("For namespaced MCP tools, use the full declared name exactly as shown, including the namespace prefix and double-underscore separator.\n")
@@ -811,6 +815,12 @@ func toolNameAliasVariants(name string) []string {
 	}
 
 	variants := []string{trimmed}
+	switch strings.ToLower(trimmed) {
+	case "wait":
+		variants = append(variants, "wait_agent")
+	case "wait_agent":
+		variants = append(variants, "wait")
+	}
 	if normalized, ok := normalizeNamespacedToolName(trimmed); ok {
 		variants = append(variants, normalized)
 	}
@@ -842,6 +852,21 @@ func toolNameAliasVariants(name string) []string {
 		if strings.Contains(toolPart, "-") {
 			variants = append(variants, prefix+strings.ReplaceAll(toolPart, "-", "_"))
 		}
+	}
+	appendContext7DocToolVariants := func(prefix, toolPart string) {
+		switch toolPart {
+		case "query-docs", "query_docs":
+			variants = append(variants, prefix+"get-library-docs", prefix+"get_library_docs")
+		case "get-library-docs", "get_library_docs":
+			variants = append(variants, prefix+"query-docs", prefix+"query_docs")
+		}
+	}
+	appendContext7DocToolVariants("", trimmed)
+	if idx := strings.LastIndex(trimmed, "__"); idx >= 0 && idx+2 < len(trimmed) {
+		appendContext7DocToolVariants(trimmed[:idx+2], trimmed[idx+2:])
+	}
+	if idx := strings.LastIndex(trimmed, "."); idx >= 0 && idx+1 < len(trimmed) {
+		appendContext7DocToolVariants(trimmed[:idx+1], trimmed[idx+1:])
 	}
 	return dedupePreserveOrder(variants)
 }
@@ -958,14 +983,19 @@ func normalizeExecCommandArguments(args any, sourceToolName string) (any, bool) 
 			if cmd == "" {
 				return args, false
 			}
-			return map[string]any{"cmd": cmd}, true
+			normalized := cloneMap(value)
+			normalized["cmd"] = cmd
+			return normalized, true
 		}
-		if command, ok := firstStringField(value, "command", "command_line", "cmdline", "shell_command", "input"); ok {
+		if matchedKey, command, ok := firstStringFieldWithKey(value, "command", "command_line", "cmdline", "shell_command", "input"); ok {
 			command = sanitizeExecCommandText(command)
 			if command == "" {
 				return args, false
 			}
-			return map[string]any{"cmd": command}, true
+			normalized := cloneMap(value)
+			delete(normalized, matchedKey)
+			normalized["cmd"] = command
+			return normalized, true
 		}
 
 		toolName := strings.ToLower(strings.TrimSpace(sourceToolName))
@@ -983,10 +1013,159 @@ func normalizeExecCommandArguments(args any, sourceToolName string) (any, bool) 
 	return args, false
 }
 
+func normalizeWriteStdinArguments(args any) (any, bool) {
+	value, ok := args.(map[string]any)
+	if !ok {
+		return args, false
+	}
+
+	normalized := cloneMap(value)
+	changed := false
+	if _, hasChars := normalized["chars"]; !hasChars {
+		if matchedKey, chars, ok := firstWriteStdinCharsAlias(value, "input", "text", "stdin", "value", "message"); ok {
+			delete(normalized, matchedKey)
+			normalized["chars"] = chars
+			changed = true
+		}
+	}
+
+	if rawSessionID, ok := normalized["session_id"]; ok {
+		if sessionID, sessionChanged := normalizeWriteStdinSessionID(rawSessionID); sessionChanged {
+			normalized["session_id"] = sessionID
+			changed = true
+		}
+	} else if matchedKey, sessionIDText, ok := firstStringFieldWithKey(value, "sessionId", "session", "id"); ok {
+		sessionID := any(sessionIDText)
+		if normalizedSessionID, sessionChanged := normalizeWriteStdinSessionID(sessionIDText); sessionChanged {
+			sessionID = normalizedSessionID
+		}
+		delete(normalized, matchedKey)
+		normalized["session_id"] = sessionID
+		changed = true
+	}
+
+	if !changed {
+		return args, false
+	}
+	return normalized, true
+}
+
+func firstWriteStdinCharsAlias(values map[string]any, keys ...string) (string, string, bool) {
+	for _, key := range keys {
+		raw, ok := values[key]
+		if !ok {
+			continue
+		}
+		text, ok := raw.(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			continue
+		}
+		return key, text, true
+	}
+	return "", "", false
+}
+
+func normalizeWriteStdinSessionID(value any) (any, bool) {
+	switch raw := value.(type) {
+	case string:
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return value, false
+		}
+		if parsed, err := strconv.Atoi(trimmed); err == nil {
+			return parsed, true
+		}
+		if trimmed != raw {
+			return trimmed, true
+		}
+	case float64:
+		if raw == float64(int(raw)) {
+			return int(raw), true
+		}
+	}
+	return value, false
+}
+
 func normalizeStructuredToolArguments(toolName, sourceToolName string, args any) (any, bool) {
-	switch normalizeToolName(sourceToolName) {
+	switch firstNonEmptyNormalizedToolName(toolName, sourceToolName) {
 	case "exec_command":
 		return normalizeExecCommandArguments(args, sourceToolName)
+	case "write_stdin":
+		return normalizeWriteStdinArguments(args)
+	case "mcp__context7__resolve-library-id":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		normalized := cloneMap(value)
+		changed := false
+		if _, hasLibraryName := normalized["libraryName"]; !hasLibraryName {
+			if matchedKey, libraryName, ok := firstStringFieldWithKey(value, "library_name", "library", "name"); ok {
+				delete(normalized, matchedKey)
+				normalized["libraryName"] = libraryName
+				changed = true
+			}
+		}
+		if _, hasQuery := normalized["query"]; !hasQuery {
+			if libraryName, ok := firstStringField(normalized, "libraryName"); ok {
+				normalized["query"] = libraryName
+				changed = true
+			}
+		}
+		if !changed {
+			return args, false
+		}
+		return normalized, true
+	case "mcp__context7__get-library-docs":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		normalized := cloneMap(value)
+		changed := false
+		if _, hasLibraryID := normalized["context7CompatibleLibraryID"]; !hasLibraryID {
+			if matchedKey, libraryID, ok := firstStringFieldWithKey(value, "libraryId", "library_id", "context7CompatibleLibraryId"); ok {
+				delete(normalized, matchedKey)
+				normalized["context7CompatibleLibraryID"] = libraryID
+				changed = true
+			}
+		}
+		if _, hasTopic := normalized["topic"]; !hasTopic {
+			if matchedKey, topic, ok := firstStringFieldWithKey(value, "query", "topic_name"); ok {
+				delete(normalized, matchedKey)
+				normalized["topic"] = topic
+				changed = true
+			}
+		}
+		if !changed {
+			return args, false
+		}
+		return normalized, true
+	case "mcp__context7__query-docs":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		normalized := cloneMap(value)
+		changed := false
+		if _, hasLibraryID := normalized["libraryId"]; !hasLibraryID {
+			if matchedKey, libraryID, ok := firstStringFieldWithKey(value, "context7CompatibleLibraryID", "context7CompatibleLibraryId", "library_id"); ok {
+				delete(normalized, matchedKey)
+				normalized["libraryId"] = libraryID
+				changed = true
+			}
+		}
+		if _, hasQuery := normalized["query"]; !hasQuery {
+			if matchedKey, query, ok := firstStringFieldWithKey(value, "topic", "topic_name"); ok {
+				delete(normalized, matchedKey)
+				normalized["query"] = query
+				changed = true
+			}
+		}
+		if !changed {
+			return args, false
+		}
+		return normalized, true
 	case "mcp__docfork__search_docs":
 		value, ok := args.(map[string]any)
 		if !ok {
@@ -995,13 +1174,33 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		if _, hasLibrary := value["library"]; hasLibrary {
 			return args, false
 		}
-		source, ok := firstStringField(value, "source")
+		source, ok := firstStringField(value, "source", "docs", "docset", "library_name", "libraryName")
 		if !ok {
 			return args, false
 		}
 		normalized := cloneMap(value)
-		delete(normalized, "source")
+		for _, alias := range []string{"source", "docs", "docset", "library_name", "libraryName"} {
+			delete(normalized, alias)
+		}
 		normalized["library"] = source
+		return normalized, true
+	case "mcp__cloudflare_api__search":
+		value, ok := args.(map[string]any)
+		if !ok {
+			return args, false
+		}
+		if _, hasCode := value["code"]; hasCode {
+			return args, false
+		}
+		rawCode, ok := firstStringField(value, "input", "query", "pattern", "script", "js")
+		if !ok {
+			return args, false
+		}
+		normalized := cloneMap(value)
+		for _, alias := range []string{"input", "query", "pattern", "script", "js"} {
+			delete(normalized, alias)
+		}
+		normalized["code"] = normalizeCloudflareSearchCode(rawCode)
 		return normalized, true
 	case "spawn_agent":
 		value, ok := args.(map[string]any)
@@ -1022,6 +1221,47 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		}
 	}
 	return args, false
+}
+
+func firstNonEmptyNormalizedToolName(names ...string) string {
+	for _, name := range names {
+		if normalized := normalizeToolName(name); normalized != "" {
+			return normalized
+		}
+	}
+	return ""
+}
+
+func normalizeStructuredToolInputArgument(toolName, sourceToolName string, input any) (any, bool) {
+	text, ok := input.(string)
+	if !ok {
+		return nil, false
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil, false
+	}
+
+	switch firstNonEmptyNormalizedToolName(toolName, sourceToolName) {
+	case "exec_command":
+		return map[string]any{"cmd": text}, true
+	case "mcp__cloudflare_api__search":
+		return map[string]any{"code": normalizeCloudflareSearchCode(text)}, true
+	default:
+		return nil, false
+	}
+}
+
+func normalizeCloudflareSearchCode(text string) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return ""
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.Contains(lower, "async") || strings.Contains(lower, "spec.paths") || strings.Contains(lower, "object.entries(spec.paths") {
+		return trimmed
+	}
+	return "async () => { const needle = " + mustMarshalJSONText(lower) + "; const results = []; for (const [path, methods] of Object.entries(spec.paths || {})) { for (const [method, op] of Object.entries(methods || {})) { const tags = Array.isArray(op?.tags) ? op.tags : []; const summary = typeof op?.summary === 'string' ? op.summary : ''; const description = typeof op?.description === 'string' ? op.description : ''; const haystacks = [path, method, summary, description, ...tags].map(v => String(v).toLowerCase()); if (haystacks.some(v => v.includes(needle))) { results.push({ method: method.toUpperCase(), path }); if (results.length === 2) { return results; } } } } return results; }"
 }
 
 func normalizeCustomToolInputArgument(args any) (string, bool) {
@@ -1070,9 +1310,9 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 	if hasArguments && hasInput {
 		return nil, fmt.Errorf("tool call for %q must not provide both arguments and input", name)
 	}
-	if hasInput && !hasArguments && name == "exec_command" && ok && toolDesc.Structured {
-		if inputText, inputOK := raw["input"].(string); inputOK && strings.TrimSpace(inputText) != "" {
-			raw["arguments"] = map[string]any{"cmd": inputText}
+	if hasInput && !hasArguments && ok && toolDesc.Structured {
+		if normalizedArgs, changed := normalizeStructuredToolInputArgument(name, rawName, raw["input"]); changed {
+			raw["arguments"] = normalizedArgs
 			delete(raw, "input")
 			hasArguments = true
 			hasInput = false

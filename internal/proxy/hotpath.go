@@ -160,7 +160,7 @@ func promptMessageContent(msg ChatMessage) string {
 		}
 	}
 	if msg.Role == "tool" {
-		parts = append(parts, formatToolOutputSummary(msg.ToolCallID, nil, msg.Content))
+		parts = append(parts, formatToolOutputSummary(msg.ToolCallID, nil, msg.Content, ""))
 	}
 	return strings.Join(filterNonEmptyStrings(parts), "\n")
 }

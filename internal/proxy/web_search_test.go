@@ -207,6 +207,44 @@ func TestHandleResponses_StreamServerSideWebSearchFollowup(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesWebSearchFollowupPrompt_OmitsBaseInstructionsAndKeepsTaskAndResults(t *testing.T) {
+	followupItems := []json.RawMessage{
+		buildInputMessageItem("user", "Tool output for call call_ws_1:\nSuccess: true\nOutput:\nWeb search query: latest Go release\n1. Go 1.25.3 is released\nURL: https://go.dev/doc/devel/release#go1.25.3\nSnippet: Go 1.25.3 was released on September 29, 2025."),
+	}
+
+	prompt := buildResponsesWebSearchFollowupPrompt(
+		nil,
+		followupItems,
+		"你是 Codex 代理。先阅读仓库约束，再等待用户指定任务。",
+		"必须使用 web_search 查询 Go 官方最新稳定版本与发布日期，并最终输出三行：RESULT、VERSION、DATE。",
+	)
+
+	if strings.Contains(prompt, "<BASE_INSTRUCTIONS>") {
+		t.Fatalf("prompt should omit BASE_INSTRUCTIONS for web_search follow-up:\n%s", prompt)
+	}
+	for _, want := range []string{
+		"<CURRENT_USER_TASK>",
+		"<SEARCH_RESULTS>",
+		"Web search query: latest Go release",
+		"RESULT、VERSION、DATE",
+		"Go 官方最新稳定版本与发布日期",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, prompt)
+		}
+	}
+	for _, unwanted := range []string{
+		"User: Tool result",
+		"User: Tool output",
+		"必须使用 web_search",
+		"禁止使用 exec_command",
+	} {
+		if strings.Contains(prompt, unwanted) {
+			t.Fatalf("prompt should not keep message-role wrapper %q:\n%s", unwanted, prompt)
+		}
+	}
+}
+
 func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturnsAdapterError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -268,6 +306,78 @@ func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturn
 	}
 	if strings.Contains(got, "RESULT: PASS") {
 		t.Fatalf("final text = %q, should not silently claim PASS", got)
+	}
+}
+
+func TestHandleResponses_NonStreamServerSideWebSearchFollowupUpstream500UsesFallbackFinal(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		var fwReq FireworksRequest
+		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		if strings.Contains(fwReq.Messages[0].Content, "Web search query: latest Go release") {
+			http.Error(w, "upstream exploded", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		content := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest Go release\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+		_, _ = w.Write([]byte(marshalSSEContent(t, content)))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go 1.25.3 is released","url":"https://go.dev/doc/devel/release#go1.25.3","snippet":"Go 1.25.3 was released on September 29, 2025."}]}`))
+	}))
+	defer search.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	p.webSearchEndpoint = search.URL
+	p.webSearchClient = search.Client()
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"gpt-oss-20b","stream":false,"input":"你是测试代理。请验证 web_search：\n1) 必须使用 web_search 查询 Go 官方最新稳定版本与发布日期。\n2) 禁止使用 exec_command、docfork 或其他工具代替 web_search。\n3) web_search 返回后，必须直接用四行格式收口，不要输出前言或解释工具行为。\n4) 不要修改任何文件。\n最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。","tools":[{"type":"web_search","external_web_access":true}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Output) != 2 {
+		t.Fatalf("output len = %d, want 2", len(resp.Output))
+	}
+
+	var messageItem ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[1], &messageItem); err != nil {
+		t.Fatalf("decode message item: %v", err)
+	}
+	if len(messageItem.Content) == 0 {
+		t.Fatal("expected at least one content item in ResponseOutputMessage, got 0")
+	}
+	got := messageItem.Content[0].Text
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: none",
+		"TEST: N/A",
+		"NOTE:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("final text missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Codex adapter error:") {
+		t.Fatalf("final text = %q, should not expose adapter error", got)
 	}
 }
 

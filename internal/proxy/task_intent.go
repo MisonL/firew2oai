@@ -107,7 +107,7 @@ var taskShellCommandPrefixes = []string{
 	"git show",
 }
 
-var taskFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql)`)
+var taskFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql|txt)`)
 var taskTestStyleGlobPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+\*_test\.go`)
 var taskCommandLinePattern = regexp.MustCompile(`(?im)^\s*(?:[-*]|\d+[.)])?\s*((?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^\n]*)$`)
 var taskCommandLabelPattern = regexp.MustCompile(`(?i)(?:执行命令|run command|execute command)\s*[:：]`)
@@ -770,6 +770,39 @@ func buildExplicitToolUseBlock(task string, toolCatalog map[string]responseToolD
 	b.WriteString("Do not emit mode final until the explicit tool requirement is satisfied or a tool error blocks progress.\n")
 	b.WriteString("</EXPLICIT_TOOL_REQUIREMENTS>\n")
 	return b.String()
+}
+
+func extractRequiredToolNames(task string) []string {
+	candidateTools := []string{
+		"exec_command",
+		"update_plan",
+		"write_stdin",
+		"js_repl",
+		"js_repl_reset",
+		"web_search",
+		"view_image",
+		"spawn_agent",
+		"send_input",
+		"resume_agent",
+		"wait_agent",
+		"close_agent",
+		"list_mcp_resources",
+		"list_mcp_resource_templates",
+		"read_mcp_resource",
+		"mcp__docfork__search_docs",
+		"mcp__docfork__fetch_doc",
+		"mcp__cloudflare_api__search",
+		"mcp__cloudflare_api__execute",
+		"mcp__chrome_devtools__new_page",
+		"mcp__chrome_devtools__take_snapshot",
+		"mcp__chrome_devtools__click",
+		"mcp__chrome_devtools__wait_for",
+	}
+	toolCatalog := make(map[string]responseToolDescriptor, len(candidateTools))
+	for _, name := range candidateTools {
+		toolCatalog[name] = responseToolDescriptor{Name: name}
+	}
+	return extractExplicitToolMentions(task, toolCatalog)
 }
 
 func extractRequiredCommands(task string) []string {

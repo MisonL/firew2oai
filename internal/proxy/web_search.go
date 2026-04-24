@@ -111,6 +111,7 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 	callOutputItems := buildParsedToolOutputItems(calls)
 	followupRequestItems := cloneRawItems(requestItems)
 	historyRequestItems := append(cloneRawItems(requestItems), cloneRawItems(callOutputItems)...)
+	searchSummaries := make([]string, 0, len(decodedCalls))
 
 	for _, call := range decodedCalls {
 		summary, searchErr := p.runWebSearch(ctx, call.Query)
@@ -118,12 +119,13 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 		if searchErr != nil {
 			summary = "web_search failed: " + searchErr.Error()
 		}
-		resultItem := buildInputMessageItem("user", formatToolOutputSummary(call.ID, &success, summary))
+		resultItem := buildInputMessageItem("user", formatToolOutputSummary(call.ID, &success, summary, ""))
 		followupRequestItems = append(followupRequestItems, resultItem)
 		historyRequestItems = append(historyRequestItems, resultItem)
 		if searchErr != nil {
 			return buildToolProtocolErrorMessage(searchErr, ""), callOutputItems, historyRequestItems, true, nil
 		}
+		searchSummaries = append(searchSummaries, summary)
 	}
 
 	followupPrompt := buildResponsesWebSearchFollowupPrompt(baseHistoryItems, followupRequestItems, instructions, currentTask)
@@ -134,6 +136,9 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 
 	finalText, err := p.collectResponseText(ctx, authToken, model, bodyBytes, showThinking)
 	if err != nil {
+		if taskRequestsNoFilesLabel(currentTask) && taskRequestsNotApplicableLabel(currentTask, "TEST") {
+			return buildWebSearchFallbackFinalText(currentTask, searchSummaries), callOutputItems, historyRequestItems, true, nil
+		}
 		return "", callOutputItems, historyRequestItems, true, err
 	}
 	if shouldUseWebSearchFallback(finalText) {
@@ -145,22 +150,18 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 	return finalText, callOutputItems, historyRequestItems, true, nil
 }
 
-func buildResponsesWebSearchFollowupPrompt(_ []json.RawMessage, followupRequestItems []json.RawMessage, instructions, currentTask string) string {
+func buildResponsesWebSearchFollowupPrompt(_ []json.RawMessage, followupRequestItems []json.RawMessage, _ string, currentTask string) string {
 	currentMessages := rawItemsToMessages(followupRequestItems)
+	followupTask := sanitizeWebSearchFollowupTask(currentTask)
 
 	var builder strings.Builder
 	builder.WriteString("You are serving an OpenAI Responses follow-up after web_search was already executed by the proxy.\n")
 	builder.WriteString("Do not mention searching, tool calls, or tool availability.\n")
 	builder.WriteString("Use the provided search results to answer the task directly.\n")
 	builder.WriteString("Return the final answer only.\n")
-	if strings.TrimSpace(instructions) != "" {
-		builder.WriteString("\n<BASE_INSTRUCTIONS>\n")
-		builder.WriteString(strings.TrimSpace(instructions))
-		builder.WriteString("\n</BASE_INSTRUCTIONS>\n")
-	}
-	if strings.TrimSpace(currentTask) != "" {
+	if strings.TrimSpace(followupTask) != "" {
 		builder.WriteString("\n<CURRENT_USER_TASK>\n")
-		builder.WriteString(strings.TrimSpace(currentTask))
+		builder.WriteString(strings.TrimSpace(followupTask))
 		builder.WriteString("\n</CURRENT_USER_TASK>\n")
 	}
 	if formatBlock := buildFinalizeOutputFormatBlock(currentTask); formatBlock != "" {
@@ -180,24 +181,109 @@ func buildResponsesWebSearchFollowupPrompt(_ []json.RawMessage, followupRequestI
 	return builder.String()
 }
 
+func sanitizeWebSearchFollowupTask(task string) string {
+	task = strings.TrimSpace(task)
+	if task == "" {
+		return ""
+	}
+
+	lines := strings.Split(task, "\n")
+	kept := make([]string, 0, len(lines))
+	for _, rawLine := range lines {
+		line := strings.TrimSpace(rawLine)
+		if line == "" {
+			continue
+		}
+		line = stripWebSearchFollowupTaskNoise(line)
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if shouldDropWebSearchFollowupTaskLine(line) {
+			continue
+		}
+		line = strings.TrimPrefix(line, "你是测试代理。")
+		line = strings.TrimSpace(line)
+		if line != "" {
+			kept = append(kept, line)
+		}
+	}
+	if len(kept) == 0 {
+		return task
+	}
+	return strings.Join(kept, "\n")
+}
+
+func stripWebSearchFollowupTaskNoise(line string) string {
+	replacements := []string{
+		"必须使用 web_search",
+		"web_search 返回后，",
+		"web_search 返回后",
+		"不要输出前言或解释工具行为。",
+		"不要输出前言或解释工具行为",
+	}
+	normalized := strings.TrimSpace(line)
+	for _, token := range replacements {
+		normalized = strings.ReplaceAll(normalized, token, "")
+	}
+	normalized = strings.TrimLeft(normalized, "：:，,。.；; ")
+	return normalized
+}
+
+func shouldDropWebSearchFollowupTaskLine(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if lower == "" {
+		return false
+	}
+	for _, token := range []string{
+		"必须使用 web_search",
+		"禁止使用",
+		"不要输出前言或解释工具行为",
+		"不要修改任何文件",
+		"tool calls",
+		"tool availability",
+	} {
+		if strings.Contains(lower, strings.ToLower(token)) {
+			return true
+		}
+	}
+	return false
+}
+
 func buildWebSearchPromptContext(messages []ChatMessage) string {
 	if len(messages) == 0 {
 		return ""
 	}
-	filtered := make([]ChatMessage, 0, len(messages))
+	blocks := make([]string, 0, len(messages))
 	for _, msg := range messages {
 		text := strings.TrimSpace(msg.Content)
 		if text == "" {
 			continue
 		}
 		if isToolResultSummaryMessage(text) {
-			filtered = append(filtered, msg)
+			if output := extractToolResultOutputBody(text); output != "" {
+				blocks = append(blocks, output)
+			}
 		}
 	}
-	if len(filtered) == 0 {
+	if len(blocks) == 0 {
 		return ""
 	}
-	return messagesToPrompt(filtered)
+	return strings.Join(blocks, "\n\n")
+}
+
+func extractToolResultOutputBody(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	if idx := strings.Index(text, "\nOutput:\n"); idx >= 0 {
+		output := strings.TrimSpace(text[idx+len("\nOutput:\n"):])
+		if output != "" {
+			return output
+		}
+	}
+	return text
 }
 
 func (p *Proxy) collectResponseText(ctx context.Context, authToken, model string, body []byte, showThinking bool) (string, error) {

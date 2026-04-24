@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -366,6 +367,43 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceRequiresNextTool(t *testing.T)
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsDocforkSearchAfterFailedSearch(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"search_docs","namespace":"mcp__docfork__","call_id":"call_docfork_1","arguments":"{\"query\":\"useEffectEvent\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_docfork_1","output":{"content":"MCP error -32602: Input validation error: Invalid arguments for tool search_docs: [{\"path\":[\"library\"],\"message\":\"Invalid input: expected string, received undefined\"}]","success":false}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p2",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n3) 禁止使用 web_search 代替 Docfork。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__search_docs" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__search_docs after failed search", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want corrected synthetic search_docs call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search_docs" {
+		t.Fatalf("synthetic tool name = %q, want search_docs", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "library"); got != "react" {
+		t.Fatalf("synthetic search_docs library = %q, want react", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "query"); got != "useEffectEvent" {
+		t.Fatalf("synthetic search_docs query = %q, want useEffectEvent", got)
+	}
+}
+
 func TestApplyExecutionPolicyToParseResult_ExplicitToolSequenceSynthesizesDocforkFetchDoc(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
@@ -399,6 +437,36 @@ func TestApplyExecutionPolicyToParseResult_ExplicitToolSequenceSynthesizesDocfor
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesDocforkFetchDocFromEmbeddedMCPHistory(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"mcp_tool_call","server":"docfork","tool":"search_docs","arguments":{"library":"react","query":"useEffectEvent"},"result":{"content":[{"type":"text","text":"Searched: react | 1 results\n\n[1] useEffectEvent\n    https://react.dev/reference/react/useEffectEvent\n\nUse fetch_doc on any URL above for full content."}],"structured_content":null},"error":null,"status":"completed"}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"glm-5",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__fetch_doc" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__fetch_doc", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic fetch_doc call from embedded mcp_tool_call result")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "url"); got != "https://react.dev/reference/react/useEffectEvent" {
+		t.Fatalf("synthetic fetch_doc url = %q, want https://react.dev/reference/react/useEffectEvent", got)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceSanitizesSyntheticDocforkURL(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
@@ -415,6 +483,307 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSanitizesSyntheticDocforkURL(t
 	}
 	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "url"); got != "https://react.dev/reference/react/useEffectEvent#usage" {
 		t.Fatalf("synthetic fetch_doc url = %q", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesDocforkSearchDocsArguments(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p1",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__search_docs" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__search_docs", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic search_docs call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search_docs" {
+		t.Fatalf("synthetic tool name = %q, want search_docs", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "library"); got != "react" {
+		t.Fatalf("synthetic search_docs library = %q, want react", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "query"); got != "useEffectEvent" {
+		t.Fatalf("synthetic search_docs query = %q, want useEffectEvent", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesDocforkSearchDocsArguments(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	content := "先搜文档。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"query\":\"useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p1",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if name := parsedCallName(t, got.calls[0]); name != "search_docs" {
+		t.Fatalf("tool name = %q, want search_docs", name)
+	}
+	if library := parsedCallArgument(t, got.calls[0], "library"); library != "react" {
+		t.Fatalf("search_docs library = %q, want react", library)
+	}
+	if query := parsedCallArgument(t, got.calls[0], "query"); query != "useEffectEvent" {
+		t.Fatalf("search_docs query = %q, want useEffectEvent", query)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesCloudflareSearchCode(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p1",
+		"你是测试代理。请验证 Cloudflare API MCP：\n1) 必须使用 mcp__cloudflare_api__search。\n2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n3) 返回两个对象即可，每个对象至少包含 method 和 path。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__cloudflare_api__search" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__cloudflare_api__search", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic cloudflare search call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search" {
+		t.Fatalf("synthetic tool name = %q, want search", got)
+	}
+	code := parsedCallArgument(t, *policy.SyntheticToolCall, "code")
+	if !strings.Contains(code, "async () =>") {
+		t.Fatalf("synthetic cloudflare search code = %q, want async arrow function", code)
+	}
+	if !strings.Contains(code, "workers") {
+		t.Fatalf("synthetic cloudflare search code = %q, want workers tag filter", code)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesCloudflareSearchArguments(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+	}
+	content := "先查 workers。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__search\",\"arguments\":{\"query\":\"workers\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p1",
+		"你是测试代理。请验证 Cloudflare API MCP：\n1) 必须使用 mcp__cloudflare_api__search。\n2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n3) 返回两个对象即可，每个对象至少包含 method 和 path。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if name := parsedCallName(t, got.calls[0]); name != "search" {
+		t.Fatalf("tool name = %q, want search", name)
+	}
+	code := parsedCallArgument(t, got.calls[0], "code")
+	if !strings.Contains(code, "async () =>") || !strings.Contains(code, "workers") {
+		t.Fatalf("cloudflare search code = %q, want synthetic async workers search", code)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsCloudflareSearchAfterFailedSearch(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"search","namespace":"mcp__cloudflare_api__","call_id":"call_cf_1","arguments":"{\"query\":\"workers\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_cf_1","output":{"content":"MCP error -32602: Input validation error: Invalid arguments for tool search: [{\"path\":[\"code\"],\"message\":\"Invalid input: expected string, received undefined\"}]","success":false}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p2",
+		"你是测试代理。请验证 Cloudflare API MCP：\n1) 必须使用 mcp__cloudflare_api__search。\n2) search 的 code 必须是 async 箭头函数，并遍历 spec.paths，筛出 tags 包含 workers 的 endpoint。\n3) 返回两个对象即可，每个对象至少包含 method 和 path。\n4) 禁止调用 execute。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__cloudflare_api__search" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__cloudflare_api__search after failed search", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want corrected synthetic cloudflare search call")
+	}
+	code := parsedCallArgument(t, *policy.SyntheticToolCall, "code")
+	if !strings.Contains(code, "async () =>") || !strings.Contains(code, "workers") {
+		t.Fatalf("synthetic cloudflare search code = %q, want async workers search", code)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesCloudflareExecute(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__cloudflare_api__execute": {Name: "mcp__cloudflare_api__execute", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+	}
+	task := "你是测试代理。请验证 Cloudflare API MCP 的 execute：\n" +
+		"1) 必须使用 mcp__cloudflare_api__execute。\n" +
+		"2) code 必须是 async 箭头函数，并通过 cloudflare.request 发起一个只读 GET 请求：/accounts/${accountId}/workers/scripts。\n" +
+		"3) 不要调用 search，也不要做任何写操作。\n" +
+		"4) 如果结果为空，要如实说明为空，不要虚构脚本名称。\n" +
+		"5) 不要修改任何文件。"
+
+	policy := buildExecutionPolicyWithCatalog("llama-v3p3-70b-instruct", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "mcp__cloudflare_api__execute" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__cloudflare_api__execute", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic cloudflare execute call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "execute" {
+		t.Fatalf("synthetic tool name = %q, want execute", got)
+	}
+	code := parsedCallArgument(t, *policy.SyntheticToolCall, "code")
+	for _, want := range []string{"async () =>", "cloudflare.request", "method: \"GET\"", "/accounts/${accountId}/workers/scripts"} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("synthetic cloudflare execute code = %q, want substring %q", code, want)
+		}
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesCloudflareExecuteArguments(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__cloudflare_api__execute": {Name: "mcp__cloudflare_api__execute", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+	}
+	content := "先执行只读 GET。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__execute\",\"arguments\":{\"code\":\"async () => { return 'broken'; }\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	task := "你是测试代理。请验证 Cloudflare API MCP 的 execute：\n" +
+		"1) 必须使用 mcp__cloudflare_api__execute。\n" +
+		"2) code 必须是 async 箭头函数，并通过 cloudflare.request 发起一个只读 GET 请求：/accounts/${accountId}/workers/scripts。\n" +
+		"3) 不要调用 search，也不要做任何写操作。\n" +
+		"4) 如果结果为空，要如实说明为空，不要虚构脚本名称。\n" +
+		"5) 不要修改任何文件。"
+
+	policy := buildExecutionPolicyWithCatalog("llama-v3p3-70b-instruct", task, nil, toolCatalog, true, false, true)
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if name := parsedCallName(t, got.calls[0]); name != "execute" {
+		t.Fatalf("tool name = %q, want execute", name)
+	}
+	code := parsedCallArgument(t, got.calls[0], "code")
+	for _, want := range []string{"async () =>", "cloudflare.request", "method: \"GET\"", "/accounts/${accountId}/workers/scripts"} {
+		if !strings.Contains(code, want) {
+			t.Fatalf("rewritten cloudflare execute code = %q, want substring %q", code, want)
+		}
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesWebSearchCall(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"web_search": {Name: "web_search", Type: "web_search", Structured: true},
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"gpt-oss-20b",
+		"你是测试代理。请验证 web_search：\n1) 必须使用 web_search 查询 Go 官方最新稳定版本与发布日期。\n2) 禁止使用 exec_command、docfork 或其他工具代替 web_search。\n3) web_search 返回后，必须直接用四行格式收口，不要输出前言或解释工具行为。\n4) 不要修改任何文件。\n最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "web_search" {
+		t.Fatalf("policy.NextRequiredTool = %q, want web_search", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic web_search call")
+	}
+	var item map[string]any
+	if err := json.Unmarshal(policy.SyntheticToolCall.item, &item); err != nil {
+		t.Fatalf("decode synthetic web_search item: %v", err)
+	}
+	if got, _ := item["type"].(string); got != "web_search_call" {
+		t.Fatalf("synthetic item type = %q, want web_search_call", got)
+	}
+	action, _ := item["action"].(map[string]any)
+	if got := strings.TrimSpace(asString(action["query"])); got != "latest Go release" {
+		t.Fatalf("synthetic web_search query = %q, want latest Go release", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesNarrationOnlyToSyntheticWebSearch(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"web_search": {Name: "web_search", Type: "web_search", Structured: true},
+	}
+	parseResult := parseToolCallOutputsWithConstraints(
+		"我会使用 web_search 查询 Go 官方最新稳定版本与发布日期。",
+		toolCatalog,
+		toolProtocolConstraints{RequireTool: true, RequiredTool: "web_search"},
+	)
+	policy := buildExecutionPolicyWithCatalog(
+		"gpt-oss-20b",
+		"你是测试代理。请验证 web_search：\n1) 必须使用 web_search 查询 Go 官方最新稳定版本与发布日期。\n2) 禁止使用 exec_command、docfork 或其他工具代替 web_search。\n3) web_search 返回后，必须直接用四行格式收口，不要输出前言或解释工具行为。\n4) 不要修改任何文件。\n最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{RequireTool: true, RequiredTool: "web_search"})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if got.mode != toolProtocolModeAIActionsTool {
+		t.Fatalf("got.mode = %q, want %q", got.mode, toolProtocolModeAIActionsTool)
+	}
+	var item map[string]any
+	if err := json.Unmarshal(got.calls[0].item, &item); err != nil {
+		t.Fatalf("decode rewritten web_search item: %v", err)
+	}
+	if typ, _ := item["type"].(string); typ != "web_search_call" {
+		t.Fatalf("tool item type = %q, want web_search_call", typ)
+	}
+	action, _ := item["action"].(map[string]any)
+	if query := strings.TrimSpace(asString(action["query"])); query != "latest Go release" {
+		t.Fatalf("web_search query = %q, want latest Go release", query)
 	}
 }
 
@@ -774,6 +1143,383 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesExecCommand(t *test
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesUpdatePlan(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"update_plan":  {Name: "update_plan", Type: "function", Structured: true},
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	task := "你是测试代理。请在当前仓库完成一个计划驱动的只读任务：\n" +
+		"1) 必须先调用 update_plan。\n" +
+		"2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n" +
+		"3) plan 里只写两个步骤：Inspect README.md、Reply with summary。\n" +
+		"4) 然后必须使用 exec_command 执行 `head -n 3 README.md`。\n" +
+		"5) 不要修改任何文件。"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "update_plan" {
+		t.Fatalf("policy.NextRequiredTool = %q, want update_plan", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic update_plan call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "update_plan" {
+		t.Fatalf("synthetic tool name = %q, want update_plan", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "explanation"); got == "" {
+		t.Fatal("synthetic update_plan explanation is empty")
+	}
+	if got := parsedCallArgumentListOfObjects(t, *policy.SyntheticToolCall, "plan"); !reflect.DeepEqual(got, []map[string]string{
+		{"step": "Inspect README.md", "status": "in_progress"},
+		{"step": "Reply with summary", "status": "pending"},
+	}) {
+		t.Fatalf("synthetic update_plan plan = %#v", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesContext7ResolveAndGetDocs(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__context7__resolve-library-id": {Name: "mcp__context7__resolve-library-id", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+		"mcp__context7__get-library-docs":   {Name: "mcp__context7__get-library-docs", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+	}
+	task := "你是测试代理。请验证 Context7 MCP：\n" +
+		"1) 必须使用 mcp__context7__resolve-library-id 查找 react。\n" +
+		"2) 必须再使用 mcp__context7__get-library-docs 获取 useEffectEvent 相关文档。\n" +
+		"3) 禁止使用 exec_command、docfork 或其他工具代替 Context7。"
+
+	resolvePolicy := buildExecutionPolicyWithCatalog("glm-4p7", task, nil, toolCatalog, true, false, true)
+	if resolvePolicy.NextRequiredTool != "mcp__context7__resolve-library-id" {
+		t.Fatalf("resolvePolicy.NextRequiredTool = %q, want mcp__context7__resolve-library-id", resolvePolicy.NextRequiredTool)
+	}
+	if resolvePolicy.SyntheticToolCall == nil {
+		t.Fatal("resolvePolicy.SyntheticToolCall = nil, want synthetic context7 resolve call")
+	}
+	if got := parsedCallName(t, *resolvePolicy.SyntheticToolCall); got != "resolve-library-id" {
+		t.Fatalf("synthetic tool name = %q, want resolve-library-id", got)
+	}
+	if got := parsedCallArgument(t, *resolvePolicy.SyntheticToolCall, "libraryName"); got != "react" {
+		t.Fatalf("synthetic context7 libraryName = %q, want react", got)
+	}
+
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"resolve-library-id","namespace":"mcp__context7__","call_id":"call_ctx_1","arguments":"{\"libraryName\":\"react\",\"query\":\"react\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_ctx_1","output":{"content":"Available Libraries:\n- Title: React\n- Context7-compatible library ID: /reactjs/react.dev\n","success":true}}`),
+	}
+	docsPolicy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if docsPolicy.NextRequiredTool != "mcp__context7__get-library-docs" {
+		t.Fatalf("docsPolicy.NextRequiredTool = %q, want mcp__context7__get-library-docs", docsPolicy.NextRequiredTool)
+	}
+	if docsPolicy.SyntheticToolCall == nil {
+		t.Fatal("docsPolicy.SyntheticToolCall = nil, want synthetic context7 get docs call")
+	}
+	if got := parsedCallName(t, *docsPolicy.SyntheticToolCall); got != "get-library-docs" {
+		t.Fatalf("synthetic tool name = %q, want get-library-docs", got)
+	}
+	if got := parsedCallArgument(t, *docsPolicy.SyntheticToolCall, "context7CompatibleLibraryID"); got != "/reactjs/react.dev" {
+		t.Fatalf("synthetic context7 library ID = %q, want /reactjs/react.dev", got)
+	}
+	if got := parsedCallArgument(t, *docsPolicy.SyntheticToolCall, "topic"); got != "useEffectEvent" {
+		t.Fatalf("synthetic context7 topic = %q, want useEffectEvent", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesInteractiveExecCommandWithTTY(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	task := "你是测试代理。请验证交互式 shell 会话能力：\n" +
+		"1) 必须使用 exec_command 启动一个交互式 python3 会话。\n" +
+		"2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。\n" +
+		"3) 禁止使用 python3 -c、here-doc 或一次性命令替代 write_stdin。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "exec_command" {
+		t.Fatalf("policy.NextRequiredTool = %q, want exec_command", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic exec_command call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "exec_command" {
+		t.Fatalf("synthetic tool name = %q, want exec_command", got)
+	}
+	if got := parsedCallCommand(t, *policy.SyntheticToolCall); got != "python3" {
+		t.Fatalf("synthetic exec_command cmd = %q, want python3", got)
+	}
+	if !parsedCallBoolArgument(t, *policy.SyntheticToolCall, "tty") {
+		t.Fatal("synthetic exec_command tty = false, want true")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "yield_time_ms"); got != "1000" {
+		t.Fatalf("synthetic exec_command yield_time_ms = %q, want 1000", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_SynthesizesInteractiveExecCommandWhenTTYMissing(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	task := "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, nil, toolCatalog, true, false, true)
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic exec_command call")
+	}
+
+	content := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"python3\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	constraints := toolProtocolConstraints{RequiredTool: "exec_command"}
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, constraints)
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, constraints)
+
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if gotName := parsedCallName(t, got.calls[0]); gotName != "exec_command" {
+		t.Fatalf("tool name = %q, want exec_command", gotName)
+	}
+	if gotCmd := parsedCallCommand(t, got.calls[0]); gotCmd != "python3" {
+		t.Fatalf("tool cmd = %q, want python3", gotCmd)
+	}
+	if !parsedCallBoolArgument(t, got.calls[0], "tty") {
+		t.Fatal("rewritten exec_command tty = false, want true")
+	}
+	if gotYield := parsedCallArgument(t, got.calls[0], "yield_time_ms"); gotYield != "1000" {
+		t.Fatalf("rewritten exec_command yield_time_ms = %q, want 1000", gotYield)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesWriteStdin(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"python3\",\"tty\":true}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_shell_1","output":{"content":"Process running with session ID 19834","session_id":19834,"success":true}}`),
+	}
+	task := "你是测试代理。请验证交互式 shell 会话能力：\n" +
+		"1) 必须使用 exec_command 启动一个交互式 python3 会话。\n" +
+		"2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。\n" +
+		"3) 禁止使用 python3 -c、here-doc 或一次性命令替代 write_stdin。\n" +
+		"4) 不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 交互式会话结果。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = %q, want write_stdin", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic write_stdin call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "write_stdin" {
+		t.Fatalf("synthetic tool name = %q, want write_stdin", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "session_id"); got != "19834" {
+		t.Fatalf("synthetic write_stdin session_id = %q, want 19834", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "chars"); got != "print(2 + 3)\nexit()" {
+		t.Fatalf("synthetic write_stdin chars = %q, want interactive follow-up", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_SynthesizesWriteStdinWhenRequiredToolIsMissed(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"python3\",\"tty\":true}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_shell_1","output":{"content":"Process running with session ID 19834","session_id":19834,"success":true}}`),
+	}
+	task := "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic write_stdin call")
+	}
+
+	content := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"python3\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	constraints := toolProtocolConstraints{RequiredTool: "write_stdin"}
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, constraints)
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, constraints)
+
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if gotName := parsedCallName(t, got.calls[0]); gotName != "write_stdin" {
+		t.Fatalf("tool name = %q, want write_stdin", gotName)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsWriteStdinRequiredAfterFailedAttempt(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"python3\",\"tty\":true}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_shell_1","output":"Process running with session ID 88590"}`),
+		json.RawMessage(`{"type":"function_call","name":"write_stdin","call_id":"call_stdin_1","arguments":"{\"input\":\"exit()\\n\",\"session_id\":\"0\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_stdin_1","output":"failed to parse function arguments: invalid type: string \"0\", expected i32 at line 1 column 36"}`),
+	}
+	task := "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = %q, want write_stdin after failed write_stdin output", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want repaired synthetic write_stdin call")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "session_id"); got != "88590" {
+		t.Fatalf("synthetic write_stdin session_id = %q, want 88590", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "chars"); got != "print(2 + 3)\nexit()" {
+		t.Fatalf("synthetic write_stdin chars = %q, want interactive follow-up", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceExtractsSessionIDFromWrappedExecOutput(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"python3\",\"tty\":true}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_shell_1","output":"Chunk ID: abc123\nWall time: 0.0000 seconds\nProcess running with session ID 45776\nOutput:\nPython 3.12.0\n>>> "}`),
+	}
+	task := "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = %q, want write_stdin", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic write_stdin call")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "session_id"); got != "45776" {
+		t.Fatalf("synthetic write_stdin session_id = %q, want 45776", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceRepairsWriteStdinRuntimeSessionID(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_shell_1","arguments":"{\"cmd\":\"python3\",\"tty\":true}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_shell_1","output":"Chunk ID: abc123\nWall time: 0.0000 seconds\nProcess running with session ID 45776\nOutput:\nPython 3.12.0\n>>> "}`),
+		json.RawMessage(`{"type":"function_call","name":"write_stdin","call_id":"call_stdin_1","arguments":"{\"chars\":\"exit()\\n\",\"session_id\":1}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_stdin_1","output":"write_stdin failed: Unknown process id 1"}`),
+	}
+	task := "1) 必须使用 exec_command 启动一个交互式 python3 会话。\n2) 必须使用 write_stdin 向同一 session 发送 print(2 + 3) 与 exit()。"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = %q, want write_stdin after runtime failure", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want repaired synthetic write_stdin call")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "session_id"); got != "45776" {
+		t.Fatalf("synthetic write_stdin session_id = %q, want 45776", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "chars"); got != "print(2 + 3)\nexit()" {
+		t.Fatalf("synthetic write_stdin chars = %q, want interactive follow-up", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesApplyPatch(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,20p' tmp/apply_patch_probe.txt\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_read_1","output":{"content":"alpha\n","success":true}}`),
+	}
+	task := "你是测试代理。请验证 apply_patch：\n" +
+		"1) 先使用 exec_command 读取 tmp/apply_patch_probe.txt。\n" +
+		"2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。\n" +
+		"3) 禁止使用 exec_command + python/sed/perl/cat 重写文件代替 apply_patch。\n" +
+		"4) 不要执行测试，也不要修改其他文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: tmp/apply_patch_probe.txt；TEST: N/A；NOTE: 是否真正使用了 apply_patch。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "apply_patch" {
+		t.Fatalf("policy.NextRequiredTool = %q, want apply_patch", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic apply_patch call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "apply_patch" {
+		t.Fatalf("synthetic tool name = %q, want apply_patch", got)
+	}
+	if got := parsedCallInput(t, *policy.SyntheticToolCall); !strings.Contains(got, "*** Update File: tmp/apply_patch_probe.txt") || !strings.Contains(got, "-alpha") || !strings.Contains(got, "+beta") {
+		t.Fatalf("synthetic apply_patch input = %q, want minimal alpha->beta patch", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_SynthesizesApplyPatchWhenRequiredToolIsMissed(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,20p' tmp/apply_patch_probe.txt\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_read_1","output":{"content":"alpha\n","success":true}}`),
+	}
+	task := "1) 先使用 exec_command 读取 tmp/apply_patch_probe.txt。\n2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic apply_patch call")
+	}
+
+	content := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"cat tmp/apply_patch_probe.txt\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	constraints := toolProtocolConstraints{RequiredTool: "apply_patch"}
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, constraints)
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, constraints)
+
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if gotName := parsedCallName(t, got.calls[0]); gotName != "apply_patch" {
+		t.Fatalf("tool name = %q, want apply_patch", gotName)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceDefersApplyPatchUntilReadSeeded(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+	}
+	task := "你是测试代理。请验证 apply_patch：\n" +
+		"1) 先读取 internal/codexfixture/patchprobe/message.txt。\n" +
+		"2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。\n" +
+		"3) 禁止使用 exec_command + python/sed/perl/cat 重写文件代替 apply_patch。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "" {
+		t.Fatalf("policy.NextRequiredTool = %q, want empty before initial read", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall != nil {
+		t.Fatalf("policy.SyntheticToolCall = %#v, want nil before initial read", policy.SyntheticToolCall)
+	}
+	if got := policy.NextCommand; got != buildReadFileCommand("internal/codexfixture/patchprobe/message.txt") {
+		t.Fatalf("policy.NextCommand = %q, want initial read command", got)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesViewImageFromPWD(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
@@ -797,6 +1543,28 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesViewImageFromPWD(t 
 	}
 	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "path"); got != "/Volumes/Work/code/firew2oai/internal/codexfixture/assets/red.png" {
 		t.Fatalf("synthetic view_image path = %q", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceTreatsImageOutputAsSatisfied(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"view_image":   {Name: "view_image", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_pwd_1","arguments":"{\"cmd\":\"pwd\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_pwd_1","output":{"content":"/Volumes/Work/code/firew2oai\n","success":true}}`),
+		json.RawMessage(`{"type":"function_call","name":"view_image","call_id":"call_img_1","arguments":"{\"path\":\"/Volumes/Work/code/firew2oai/internal/codexfixture/assets/red.png\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_img_1","output":[{"type":"input_image","image_url":"data:image/png;base64,abc","detail":"high"}]}`),
+	}
+	task := "1) 必须先使用 exec_command 执行 `pwd`，读取当前工作目录绝对路径。\n2) 然后必须使用 view_image 查看 internal/codexfixture/assets/red.png。"
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "" {
+		t.Fatalf("policy.NextRequiredTool = %q, want empty after image output", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall != nil {
+		t.Fatalf("policy.SyntheticToolCall = %#v, want nil", policy.SyntheticToolCall)
 	}
 }
 
@@ -907,8 +1675,9 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesSpawnAgent(t *testi
 	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "spawn_agent" {
 		t.Fatalf("synthetic tool name = %q, want spawn_agent", got)
 	}
-	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "message"); got != "读取 README.md 第一行并返回结果" {
-		t.Fatalf("synthetic spawn_agent message = %q, want 读取 README.md 第一行并返回结果", got)
+	want := "必须使用 exec_command 执行 `head -n 1 README.md`，只返回 README.md 第一行内容，不要额外解释。"
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "message"); got != want {
+		t.Fatalf("synthetic spawn_agent message = %q, want %q", got, want)
 	}
 }
 
@@ -932,6 +1701,66 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesWaitAgentFromSpawnO
 	}
 	if got := parsedCallArgumentList(t, *policy.SyntheticToolCall, "targets"); !reflect.DeepEqual(got, []string{"agent_456"}) {
 		t.Fatalf("synthetic wait_agent targets = %#v, want []string{\"agent_456\"}", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceAdvancesFromCompletedCollabSpawnAgent(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+		"wait_agent":  {Name: "wait_agent", Type: "function", Structured: true},
+		"close_agent": {Name: "close_agent", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+	}
+	task := "必须使用 spawn_agent 启动一个子代理，然后必须使用 wait_agent 等待结果，最后必须使用 close_agent 关闭子代理。"
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "wait_agent" {
+		t.Fatalf("policy.NextRequiredTool = %q, want wait_agent", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic wait_agent call")
+	}
+	if got := parsedCallArgumentList(t, *policy.SyntheticToolCall, "targets"); !reflect.DeepEqual(got, []string{"agent_789"}) {
+		t.Fatalf("synthetic wait_agent targets = %#v, want []string{\"agent_789\"}", got)
+	}
+	if !policy.RequireTool {
+		t.Fatal("policy.RequireTool = false, want true")
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceAdvancesFromCompletedSpawnFunctionCall(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+		"wait_agent":  {Name: "wait_agent", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"spawn_agent","call_id":"call_spawn_1","arguments":"{\"message\":\"读取 README.md 第一行\"}","status":"completed"}`),
+	}
+	task := "必须使用 spawn_agent 启动一个子代理，然后必须使用 wait_agent 等待结果。"
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "wait_agent" {
+		t.Fatalf("policy.NextRequiredTool = %q, want wait_agent", policy.NextRequiredTool)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceAdvancesFromCompletedCollabWaitAlias(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+		"wait_agent":  {Name: "wait_agent", Type: "function", Structured: true},
+		"close_agent": {Name: "close_agent", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_789"],"agents_states":{"agent_789":{"status":"completed","message":"Hello World"}},"status":"completed"}`),
+	}
+	task := "必须使用 spawn_agent 启动一个子代理，然后必须使用 wait_agent 等待结果，最后必须使用 close_agent 关闭子代理。"
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "close_agent" {
+		t.Fatalf("policy.NextRequiredTool = %q, want close_agent", policy.NextRequiredTool)
 	}
 }
 
@@ -1234,6 +2063,20 @@ func TestInferToolOutputSuccess_RecognizesMissingFileError(t *testing.T) {
 	got := inferToolOutputSuccess("sed: internal/proxy/output_constraints_test.go: No such file or directory")
 	if got == nil || *got {
 		t.Fatalf("inferToolOutputSuccess should return false for missing file error, got %#v", got)
+	}
+}
+
+func TestInferToolOutputSuccess_RecognizesWriteStdinParseError(t *testing.T) {
+	got := inferToolOutputSuccess("failed to parse function arguments: invalid type: string \"0\", expected i32 at line 1 column 36")
+	if got == nil || *got {
+		t.Fatalf("inferToolOutputSuccess should return false for write_stdin parse error, got %#v", got)
+	}
+}
+
+func TestInferToolOutputSuccess_RecognizesWriteStdinRuntimeError(t *testing.T) {
+	got := inferToolOutputSuccess("write_stdin failed: Unknown process id 1")
+	if got == nil || *got {
+		t.Fatalf("inferToolOutputSuccess should return false for write_stdin runtime error, got %#v", got)
 	}
 }
 
@@ -2100,10 +2943,38 @@ func parsedCallArgument(t *testing.T, call parsedToolCall, key string) string {
 	if err := json.Unmarshal([]byte(argsText), &args); err != nil {
 		t.Fatalf("unmarshal arguments JSON: %v", err)
 	}
-	value, _ := args[key].(string)
-	value = strings.TrimSpace(value)
+	value := ""
+	switch raw := args[key].(type) {
+	case string:
+		value = strings.TrimSpace(raw)
+	case float64:
+		value = strconv.Itoa(int(raw))
+	}
 	if value == "" {
 		t.Fatalf("missing %s in parsed call arguments: %s", key, argsText)
+	}
+	return value
+}
+
+func parsedCallBoolArgument(t *testing.T, call parsedToolCall, key string) bool {
+	t.Helper()
+
+	var item map[string]any
+	if err := json.Unmarshal(call.item, &item); err != nil {
+		t.Fatalf("unmarshal parsed call: %v", err)
+	}
+	argsText, _ := item["arguments"].(string)
+	if argsText == "" {
+		t.Fatalf("missing arguments in parsed call item: %s", string(call.item))
+	}
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsText), &args); err != nil {
+		t.Fatalf("unmarshal arguments JSON: %v", err)
+	}
+	value, ok := args[key].(bool)
+	if !ok {
+		t.Fatalf("missing bool %s in parsed call arguments: %s", key, argsText)
 	}
 	return value
 }
@@ -2137,6 +3008,42 @@ func parsedCallArgumentList(t *testing.T, call parsedToolCall, key string) []str
 			t.Fatalf("empty value in %s list: %s", key, argsText)
 		}
 		out = append(out, value)
+	}
+	return out
+}
+
+func parsedCallArgumentListOfObjects(t *testing.T, call parsedToolCall, key string) []map[string]string {
+	t.Helper()
+
+	var item map[string]any
+	if err := json.Unmarshal(call.item, &item); err != nil {
+		t.Fatalf("unmarshal parsed call: %v", err)
+	}
+	argsText, _ := item["arguments"].(string)
+	if argsText == "" {
+		t.Fatalf("missing arguments in parsed call item: %s", string(call.item))
+	}
+
+	var args map[string]any
+	if err := json.Unmarshal([]byte(argsText), &args); err != nil {
+		t.Fatalf("unmarshal arguments JSON: %v", err)
+	}
+	rawList, ok := args[key].([]any)
+	if !ok || len(rawList) == 0 {
+		t.Fatalf("missing %s object list in parsed call arguments: %s", key, argsText)
+	}
+
+	out := make([]map[string]string, 0, len(rawList))
+	for _, raw := range rawList {
+		entry, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("non-object entry in %s list: %#v", key, raw)
+		}
+		normalized := make(map[string]string, len(entry))
+		for field, value := range entry {
+			normalized[field] = strings.TrimSpace(asString(value))
+		}
+		out = append(out, normalized)
 	}
 	return out
 }

@@ -30,9 +30,9 @@ type Config struct {
 const (
 	defaultPort                        = 39527
 	defaultTimeout                     = 120
-	defaultUpstreamRetryCount          = 1
+	defaultUpstreamRetryCount          = 2
 	defaultUpstreamRetryBackoffMS      = 200
-	defaultUpstreamEmptyRetryCount     = 1
+	defaultUpstreamEmptyRetryCount     = 2
 	defaultUpstreamEmptyRetryBackoffMS = 200
 	defaultRateLimit                   = 0
 	minPort                            = 1

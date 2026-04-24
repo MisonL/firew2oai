@@ -387,7 +387,7 @@ func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
 			"raw_output", truncateForLog(mustMarshalJSONText(item["output"]), 800),
 		)
 	}
-	callID, command, parsedSuccess, outputText, ok := parseToolResultSummaryDetails(text)
+	callID, command, parsedSuccess, sessionID, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
 		return nil
 	}
@@ -415,6 +415,9 @@ func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
 	output := map[string]any{}
 	if success != nil {
 		output["success"] = *success
+	}
+	if normalized := normalizeSessionIDValue(sessionID); normalized != nil {
+		output["session_id"] = normalized
 	}
 	if content != "" {
 		output["content"] = content
@@ -466,7 +469,7 @@ func normalizeToolSummaryStringItems(text string) []json.RawMessage {
 		return []json.RawMessage{json.RawMessage(data)}
 	}
 
-	callID, command, success, outputText, ok := parseToolResultSummaryDetails(text)
+	callID, command, success, sessionID, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
 		return nil
 	}
@@ -478,6 +481,9 @@ func normalizeToolSummaryStringItems(text string) []json.RawMessage {
 	output := map[string]any{}
 	if success != nil {
 		output["success"] = *success
+	}
+	if normalized := normalizeSessionIDValue(sessionID); normalized != nil {
+		output["session_id"] = normalized
 	}
 	if resultText := strings.TrimSpace(outputText); resultText != "" {
 		output["content"] = resultText
@@ -603,8 +609,7 @@ func extractToolInputMessages(item map[string]any) []ChatMessage {
 			Content: formatToolCallSummary("web_search", callID, payload),
 		}}
 	case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
-		text, success := extractToolOutputText(item["output"])
-		content := formatToolOutputSummary(callID, success, text)
+		content := formatToolOutputSummaryFromOutput(callID, item["output"])
 		if content == "" {
 			return nil
 		}
@@ -839,9 +844,16 @@ func formatToolCallSummary(name, callID, payload string) string {
 	return builder.String()
 }
 
-func formatToolOutputSummary(callID string, success *bool, text string) string {
+func formatToolOutputSummaryFromOutput(callID string, output any) string {
+	text, success := extractToolOutputText(output)
+	sessionID := extractSessionIDFromToolOutput(output)
+	return formatToolOutputSummary(callID, success, text, sessionID)
+}
+
+func formatToolOutputSummary(callID string, success *bool, text, sessionID string) string {
 	text = strings.TrimSpace(text)
-	if callID == "" && success == nil && text == "" {
+	sessionID = strings.TrimSpace(sessionID)
+	if callID == "" && success == nil && text == "" && sessionID == "" {
 		return ""
 	}
 
@@ -859,6 +871,10 @@ func formatToolOutputSummary(callID string, success *bool, text string) string {
 		} else {
 			builder.WriteString("false")
 		}
+	}
+	if sessionID != "" {
+		builder.WriteString("\nSession ID: ")
+		builder.WriteString(sessionID)
 	}
 	if text != "" {
 		builder.WriteString("\nOutput:\n")
@@ -924,7 +940,7 @@ func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 	if !strings.EqualFold(strings.TrimSpace(role), "user") {
 		return nil
 	}
-	callID, command, success, outputText, ok := parseToolResultSummaryDetails(text)
+	callID, command, success, sessionID, outputText, ok := parseToolResultSummaryDetails(text)
 	if !ok {
 		return nil
 	}
@@ -935,6 +951,9 @@ func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 	output := map[string]any{}
 	if success != nil {
 		output["success"] = *success
+	}
+	if normalized := normalizeSessionIDValue(sessionID); normalized != nil {
+		output["session_id"] = normalized
 	}
 	if resultText := strings.TrimSpace(outputText); resultText != "" {
 		output["content"] = resultText
@@ -955,14 +974,14 @@ func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 }
 
 func parseToolResultSummary(text string) (string, *bool, string, bool) {
-	callID, _, success, output, ok := parseToolResultSummaryDetails(text)
+	callID, _, success, _, output, ok := parseToolResultSummaryDetails(text)
 	return callID, success, output, ok
 }
 
-func parseToolResultSummaryDetails(text string) (string, string, *bool, string, bool) {
+func parseToolResultSummaryDetails(text string) (string, string, *bool, string, string, bool) {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" || !strings.HasPrefix(strings.ToLower(trimmed), "tool result") {
-		return "", "", nil, "", false
+		return "", "", nil, "", "", false
 	}
 
 	lines := strings.Split(trimmed, "\n")
@@ -974,6 +993,7 @@ func parseToolResultSummaryDetails(text string) (string, string, *bool, string, 
 
 	command := ""
 	var success *bool
+	sessionID := ""
 	outputLines := make([]string, 0, len(lines))
 	outputStarted := false
 	for _, rawLine := range lines[1:] {
@@ -991,6 +1011,8 @@ func parseToolResultSummaryDetails(text string) (string, string, *bool, string, 
 				succeeded := strings.EqualFold(value, "true")
 				success = &succeeded
 			}
+		case strings.HasPrefix(lower, "session id:"):
+			sessionID = strings.TrimSpace(line[len("Session ID:"):])
 		case strings.HasPrefix(lower, "exit code:"):
 			value := strings.TrimSpace(line[len("Exit code:"):])
 			if code, err := strconv.Atoi(value); err == nil {
@@ -1011,10 +1033,21 @@ func parseToolResultSummaryDetails(text string) (string, string, *bool, string, 
 	}
 
 	output := strings.TrimSpace(strings.Join(outputLines, "\n"))
-	if callID == "" && command == "" && success == nil && output == "" {
-		return "", "", nil, "", false
+	if callID == "" && command == "" && success == nil && sessionID == "" && output == "" {
+		return "", "", nil, "", "", false
 	}
-	return callID, command, success, output, true
+	return callID, command, success, sessionID, output, true
+}
+
+func normalizeSessionIDValue(sessionID string) any {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	if parsed, err := strconv.Atoi(sessionID); err == nil {
+		return parsed
+	}
+	return sessionID
 }
 
 func buildExecCommandHistoryItem(callID, command string) json.RawMessage {
@@ -1644,10 +1677,13 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 	var walk func(prefix string, tool map[string]any)
 	walk = func(prefix string, tool map[string]any) {
 		toolType, _ := tool["type"].(string)
+		namespaceName := normalizeResponseToolNamespace(prefix)
+		if inlineNamespace, _ := tool["namespace"].(string); strings.TrimSpace(inlineNamespace) != "" {
+			namespaceName = normalizeResponseToolNamespace(inlineNamespace)
+		}
 		if toolType == "namespace" {
-			namespaceName := prefix
 			if name, _ := tool["name"].(string); name != "" {
-				namespaceName = name
+				namespaceName = normalizeResponseToolNamespace(name)
 			}
 			rawChildren, _ := tool["tools"].([]any)
 			for _, child := range rawChildren {
@@ -1676,11 +1712,14 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 		if name == "" {
 			return
 		}
+		if namespaceName != "" {
+			name = joinNamespaceToolName(namespaceName, bareMCPToolName(name, namespaceName))
+		}
 		catalog[name] = responseToolDescriptor{
 			Name:       name,
 			Type:       toolType,
 			Structured: toolType != "custom",
-			Namespace:  normalizeResponseToolNamespace(prefix),
+			Namespace:  namespaceName,
 		}
 	}
 
@@ -2033,6 +2072,13 @@ func buildToolProtocolErrorMessage(err error, upstreamText string) string {
 		builder.WriteString(trimmed)
 	}
 	return builder.String()
+}
+
+func buildSyntheticToolOutputItems(policy executionPolicy) []json.RawMessage {
+	if policy.SyntheticToolCall == nil {
+		return nil
+	}
+	return buildParsedToolOutputItems([]parsedToolCall{*policy.SyntheticToolCall})
 }
 
 func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
@@ -2572,6 +2618,40 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 
 	// If stream ended without done/content, emit a terminal error response instead of leaving client pending.
 	if !doneReceived && !contentEmitted && result.Len() == 0 && !clientGone && !errors.Is(scanErr, context.Canceled) {
+		if bufferForToolCalls {
+			if outputItems := buildSyntheticToolOutputItems(executionPolicy); len(outputItems) > 0 {
+				slog.Warn("responses stream ended empty, injecting synthetic required tool call",
+					"response_id", responseID,
+					"required_tool", executionPolicy.NextRequiredTool,
+					"execution_stage", executionPolicy.Stage,
+					"error", scanErr,
+				)
+				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+				for index, item := range outputItems {
+					if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+						Type:        "response.output_item.added",
+						ResponseID:  responseID,
+						OutputIndex: index,
+						Item:        item,
+					}) {
+						return
+					}
+					if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+						Type:        "response.output_item.done",
+						ResponseID:  responseID,
+						OutputIndex: index,
+						Item:        item,
+					}) {
+						return
+					}
+				}
+				if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
+					return
+				}
+				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				return
+			}
+		}
 		if fallbackText, ok := fallbackFinalTextForIncompleteResponses(currentTask, evidence, checkControlMarkup, scanErr); ok {
 			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, fallbackText)}
 			if bufferForToolCalls {
@@ -2706,6 +2786,21 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		slog.Warn("responses stream read error but content available, returning partial response", "response_id", responseID, "error", scanErr)
 	}
 	if !doneReceived && !contentEmitted && result.Len() == 0 {
+		if bufferForToolCalls {
+			if outputItems := buildSyntheticToolOutputItems(executionPolicy); len(outputItems) > 0 {
+				slog.Warn("responses non-stream ended empty, injecting synthetic required tool call",
+					"response_id", responseID,
+					"required_tool", executionPolicy.NextRequiredTool,
+					"execution_stage", executionPolicy.Stage,
+					"error", scanErr,
+				)
+				createdAt := time.Now().Unix()
+				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				writeJSON(w, http.StatusOK, completed)
+				return
+			}
+		}
 		if fallbackText, ok := fallbackFinalTextForIncompleteResponses(currentTask, evidence, checkControlMarkup, nil); ok {
 			createdAt := time.Now().Unix()
 			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, fallbackText)}
@@ -2785,6 +2880,16 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 	}
 	if strings.TrimSpace(task) == "" || taskLikelyNeedsWrite(task) {
 		return "", false
+	}
+	if len(extractRequiredOutputLabels(task)) == 0 {
+		if !taskCompletionSatisfied(task, evidence) || !allObservedOutputsSucceeded(evidence) {
+			return "", false
+		}
+		snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs))
+		if snippet == "" || strings.HasPrefix(snippet, "Codex adapter error:") {
+			return "", false
+		}
+		return snippet, true
 	}
 	if len(extractRequiredOutputLabels(task)) == 0 {
 		return "", false

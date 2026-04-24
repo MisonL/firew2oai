@@ -130,6 +130,34 @@ func TestStreamPost_RetriesTransientStatusBeforeSuccess(t *testing.T) {
 	}
 }
 
+func TestStreamPost_RetriesInternalServerErrorBeforeSuccess(t *testing.T) {
+	var attempts int
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	tp := NewWithRetry(5*time.Second, 1, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	reader, err := tp.StreamPost(ctx, ts.URL, bytes.NewReader([]byte("{}")), "")
+	if err != nil {
+		t.Fatalf("StreamPost error = %v, want nil", err)
+	}
+	defer reader.Close()
+
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+
 func TestStreamPost_DoesNotRetryNonTransientStatus(t *testing.T) {
 	var attempts int
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

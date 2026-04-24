@@ -373,6 +373,48 @@ func TestParseToolCallOutputs_ResolvesMCPToolNameHyphenUnderscoreAlias(t *testin
 	}
 }
 
+func TestParseToolCallOutputs_NormalizesContext7ResolveArguments(t *testing.T) {
+	text := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__context7__resolve_library_id\",\"arguments\":{\"library_name\":\"react\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"mcp__context7__resolve-library-id": {Name: "mcp__context7__resolve-library-id", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `\"libraryName\":\"react\"`) {
+		t.Fatalf("normalized context7 resolve item = %s, want libraryName", item)
+	}
+	if !strings.Contains(item, `\"query\":\"react\"`) {
+		t.Fatalf("normalized context7 resolve item = %s, want query", item)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesContext7GetDocsArguments(t *testing.T) {
+	text := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__context7__get_library_docs\",\"arguments\":{\"libraryId\":\"/reactjs/react.dev\",\"query\":\"useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	result := parseToolCallOutputs(text, map[string]responseToolDescriptor{
+		"mcp__context7__get-library-docs": {Name: "mcp__context7__get-library-docs", Type: "function", Structured: true, Namespace: "mcp__context7__"},
+	}, "")
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	item := string(result.calls[0].item)
+	if !strings.Contains(item, `\"context7CompatibleLibraryID\":\"/reactjs/react.dev\"`) {
+		t.Fatalf("normalized context7 get docs item = %s, want context7CompatibleLibraryID", item)
+	}
+	if !strings.Contains(item, `\"topic\":\"useEffectEvent\"`) {
+		t.Fatalf("normalized context7 get docs item = %s, want topic", item)
+	}
+}
+
 func TestParseToolCallOutputs_ParsesInlineAIActionsShorthand(t *testing.T) {
 	text := `I'll use a sub-agent.
 
@@ -832,6 +874,100 @@ func TestParseToolCallOutputs_NormalizesDocforkSearchDocsSourceAlias(t *testing.
 	}
 }
 
+func TestParseToolCallOutputs_NormalizesDocforkSearchDocsDocsAlias(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"query\":\"useEffectEvent\",\"docs\":\"react\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["library"] != "react" {
+		t.Fatalf("library = %v, want react", arguments["library"])
+	}
+	if _, ok := arguments["docs"]; ok {
+		t.Fatalf("docs alias should be removed, arguments=%#v", arguments)
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesCloudflareSearchInputToCode(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__search\",\"input\":\"async () => [{ method: 'GET', path: '/workers' }]\"}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["code"] != "async () => [{ method: 'GET', path: '/workers' }]" {
+		t.Fatalf("code = %v, want input copied into code", arguments["code"])
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesCloudflareSearchQueryToCode(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__cloudflare_api__search\",\"arguments\":{\"query\":\"workers\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__cloudflare_api__search": {Name: "mcp__cloudflare_api__search", Type: "function", Structured: true, Namespace: "mcp__cloudflare_api__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	code, _ := arguments["code"].(string)
+	if !strings.Contains(code, "async () =>") || !strings.Contains(code, "workers") {
+		t.Fatalf("code = %q, want synthesized async workers search", code)
+	}
+	if _, ok := arguments["query"]; ok {
+		t.Fatalf("query alias should be removed, arguments=%#v", arguments)
+	}
+}
+
 func TestParseToolCallOutputs_LegacyJSONSequence(t *testing.T) {
 	result := parseToolCallOutputs(
 		"{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",
@@ -886,6 +1022,42 @@ func TestParseToolCallOutputs_LegacyJSONSequence_AllowsAIActionsClosingTagTail(t
 	}
 	if len(result.calls) != 1 {
 		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+}
+
+func TestBuildParsedToolCall_NormalizesWriteStdinArguments(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"write_stdin": {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	call, err := buildParsedToolCall(map[string]any{
+		"type": "function_call",
+		"name": "write_stdin",
+		"arguments": map[string]any{
+			"input":      "print(2 + 3)\nexit()\n",
+			"session_id": "88590",
+		},
+	}, toolCatalog, "", false)
+	if err != nil {
+		t.Fatalf("buildParsedToolCall error = %v", err)
+	}
+
+	var item map[string]any
+	if err := json.Unmarshal(call.item, &item); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := item["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if _, ok := arguments["input"]; ok {
+		t.Fatalf("write_stdin arguments should not keep input alias: %#v", arguments)
+	}
+	if got, _ := arguments["chars"].(string); got != "print(2 + 3)\nexit()\n" {
+		t.Fatalf("write_stdin chars = %q, want full input", got)
+	}
+	if got, ok := arguments["session_id"].(float64); !ok || int(got) != 88590 {
+		t.Fatalf("write_stdin session_id = %#v, want 88590", arguments["session_id"])
 	}
 }
 

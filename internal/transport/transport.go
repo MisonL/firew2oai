@@ -304,7 +304,7 @@ func (t *FireworksTransport) shouldRetryStreamPost(attempt int, err error) bool 
 	var statusErr transientUpstreamError
 	if errors.As(err, &statusErr) {
 		switch statusErr.statusCode {
-		case http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		case http.StatusInternalServerError, http.StatusTooManyRequests, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
 			return true
 		default:
 			return false

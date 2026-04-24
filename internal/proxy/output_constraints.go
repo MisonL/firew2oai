@@ -30,6 +30,8 @@ var requiredLabelScaffoldPrefixPattern = regexp.MustCompile(`(?i)^(?:final answe
 var requiredLabelResultValuePattern = regexp.MustCompile(`(?i)\b(PASS|FAIL)\b`)
 var evidenceTextJSONWrapperPattern = regexp.MustCompile(`text":"((?:\\.|[^"\\])*)`)
 var evidenceSourcePrefixPattern = regexp.MustCompile(`(?i)^source:\s*\S+\s*`)
+var evidencePathFieldPattern = regexp.MustCompile(`"path"\s*:\s*"([^"]+)"`)
+var terminalEscapePattern = regexp.MustCompile(`\x1b(?:\[[0-?]*[ -/]*[@-~]|.)`)
 
 type requiredLabelEntry struct {
 	Label string
@@ -164,6 +166,9 @@ func fallbackRequiredLabelsFromText(text string) []string {
 
 func overrideStructuredFailBlockWithEvidence(task, text string, evidence executionEvidence) (string, bool) {
 	if taskLikelyNeedsWrite(task) {
+		return "", false
+	}
+	if !taskCompletionSatisfied(task, evidence) {
 		return "", false
 	}
 	labels := []string{"RESULT", "FILES", "TEST", "NOTE"}
@@ -427,9 +432,13 @@ func canonicalizeRequiredLabelOutput(text string, labels []string, task string, 
 	}
 
 	ordered := make([]string, 0, len(labels))
+	hasExplicitFailure := containsExplicitExecutionFailure(text)
 	for _, label := range labels {
 		value := strings.TrimSpace(values[label])
-		if shouldPreferInferredRequiredLabelValue(label, task, evidence) {
+		upperLabel := strings.ToUpper(strings.TrimSpace(label))
+		if hasExplicitFailure && (upperLabel == "RESULT" || upperLabel == "NOTE") {
+			// Preserve the explicit failure note instead of replacing it with a success-looking evidence summary.
+		} else if shouldPreferInferredRequiredLabelValue(label, task, evidence) {
 			if inferred, ok := inferRequiredLabelValue(label, task, text, evidence); ok {
 				value = inferred
 			}
@@ -458,14 +467,83 @@ func hasExecutionEvidence(evidence executionEvidence) bool {
 	return len(evidence.Commands) > 0 || len(evidence.Outputs) > 0
 }
 
+func taskRequiresConcreteNotePayload(task string) bool {
+	hint := strings.ToLower(strings.Join(strings.Fields(extractRequiredOutputLabelHint(task, "NOTE")), " "))
+	if hint == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"第一行",
+		"一句结论",
+		"一条结论",
+		"返回的",
+		"得到的一句结论",
+		"找到的两个path",
+		"找到的两个 path",
+		"主颜色",
+		"具体内容",
+	} {
+		if strings.Contains(hint, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func noteLooksLikeUnresolvedPayload(note string) bool {
+	normalized := strings.ToLower(strings.Join(strings.Fields(strings.TrimSpace(note)), " "))
+	if normalized == "" {
+		return true
+	}
+	for _, marker := range []string{
+		`"completed":null`,
+		`"message":null`,
+		`"agent_id":`,
+		`"nickname":`,
+		`{"previous_status":{"completed":null}}`,
+		`{"status":{},"timed_out":true}`,
+		"exec_command(",
+		"needs to be executed",
+		`"tool": "exec_command"`,
+		`"action": "run"`,
+		`"name":"exec_command"`,
+		`"command":`,
+		"$ head -n 1 readme.md",
+		"exec_command head -n 1 readme.md",
+		"i'll execute the command",
+		"i'll execute the requested command",
+		"i'll execute the required command",
+		"i'll run the command",
+		"executing the required command",
+		"to satisfy the current task",
+		"running `head -n 1 readme.md`",
+		"to fetch the first line",
+		"### executing `head -n 1 readme.md`",
+		"未获得可解析的工具结果。",
+		"任务尚未完成，仍缺少所需修改或验证步骤。",
+		"已按要求完成当前任务。",
+	} {
+		if strings.Contains(normalized, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 func inferRequiredLabelValue(label, task, text string, evidence executionEvidence) (string, bool) {
 	switch strings.ToUpper(strings.TrimSpace(label)) {
 	case "RESULT":
+		hasExplicitFailure := hasExplicitOutcomeFailure(task, text, evidence)
+		if taskRequiresConcreteNotePayload(task) && hasExecutionEvidence(evidence) {
+			if snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs)); noteLooksLikeUnresolvedPayload(snippet) {
+				return "FAIL", true
+			}
+		}
 		if !taskCompletionSatisfied(task, evidence) {
 			if shouldInferReadOnlyStructuredCompletion(task, text, evidence) {
 				return "PASS", true
 			}
-			if !taskLikelyNeedsWrite(task) && allObservedOutputsSucceeded(evidence) {
+			if !taskLikelyNeedsWrite(task) && allObservedOutputsSucceeded(evidence) && !hasExplicitFailure {
 				return "PASS", true
 			}
 			if shouldInferReadOnlyProbeCompletion(task, text, evidence) {
@@ -476,8 +554,11 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		if taskRequestsNoFilesLabel(task) && taskRequestsNotApplicableLabel(task, "TEST") && shouldInferReadOnlyProbeCompletion(task, text, evidence) {
 			return "PASS", true
 		}
-		if allObservedOutputsSucceeded(evidence) {
+		if allObservedOutputsSucceeded(evidence) && !hasExplicitFailure {
 			return "PASS", true
+		}
+		if hasExplicitFailure {
+			return "FAIL", true
 		}
 		combined := strings.ToLower(strings.TrimSpace(outcomeSignalText(text) + "\n" + strings.Join(relevantOutcomeEvidence(task, evidence), "\n")))
 		if strings.Contains(combined, "success=false") || strings.Contains(combined, " fail") || strings.Contains(combined, "error") {
@@ -547,7 +628,12 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 	case "NOTE":
 		if !taskLikelyNeedsWrite(task) {
 			if snippet := extractEvidenceSummarySnippet(evidence.Outputs); snippet != "" {
-				return snippet, true
+				if !taskRequiresConcreteNotePayload(task) || !noteLooksLikeUnresolvedPayload(snippet) {
+					return snippet, true
+				}
+			}
+			if taskRequiresConcreteNotePayload(task) && hasExecutionEvidence(evidence) {
+				return "未获得可解析的工具结果。", true
 			}
 		}
 		if taskLikelyNeedsWrite(task) && !taskCompletionSatisfied(task, evidence) {
@@ -615,7 +701,16 @@ func relevantOutcomeEvidence(task string, evidence executionEvidence) []string {
 
 func taskCompletionSatisfied(task string, evidence executionEvidence) bool {
 	requiredCommands := dedupePreserveOrder(extractRequiredCommands(task))
+	requiredTools := dedupePreserveOrder(extractRequiredToolNames(task))
 	if len(requiredCommands) == 0 {
+		if len(requiredTools) == 0 {
+			return hasExecutionEvidence(evidence)
+		}
+		for _, toolName := range requiredTools {
+			if !hasObservedCommandEvidence(evidence, toolName) {
+				return false
+			}
+		}
 		return hasExecutionEvidence(evidence)
 	}
 	for _, command := range requiredCommands {
@@ -779,6 +874,11 @@ func extractCommandEvidenceSnippet(outputs []string, commandKey string) string {
 
 func extractEvidenceSummarySnippet(outputs []string) string {
 	for i := len(outputs) - 1; i >= 0; i-- {
+		if snippet, ok := extractWaitAgentCompletedSnippet(outputs[i]); ok {
+			return snippet
+		}
+	}
+	for i := len(outputs) - 1; i >= 0; i-- {
 		lower := strings.ToLower(outputs[i])
 		if !strings.Contains(lower, "source:") {
 			continue
@@ -831,7 +931,12 @@ func normalizeEvidenceSummarySnippet(output string) (string, bool) {
 	snippet = strings.ReplaceAll(snippet, `\n`, " ")
 	snippet = strings.ReplaceAll(snippet, `\t`, " ")
 	snippet = strings.ReplaceAll(snippet, `\"`, `"`)
+	if nested, ok := extractStructuredCompletedSnippet(snippet); ok {
+		return normalizeEvidenceSummarySnippet(nested)
+	}
+	snippet = stripTerminalControlSequences(snippet)
 	snippet = evidenceSourcePrefixPattern.ReplaceAllString(snippet, "")
+	snippet = unwrapLeadingCodeFenceSnippet(snippet)
 	if idx := strings.Index(snippet, "```"); idx >= 0 {
 		snippet = strings.TrimSpace(snippet[:idx])
 	}
@@ -839,13 +944,154 @@ func normalizeEvidenceSummarySnippet(output string) (string, bool) {
 		snippet = strings.TrimSpace(snippet[:idx])
 	}
 	snippet = strings.Join(strings.Fields(snippet), " ")
+	snippet = simplifyInteractivePythonSnippet(snippet)
 	if snippet == "" {
+		return "", false
+	}
+	if paths := extractEvidencePathSummary(snippet); paths != "" {
+		return truncateString(paths, 220), true
+	}
+	if _, leaked := detectLeakedToolControlMarkup(snippet); leaked {
 		return "", false
 	}
 	if looksLikeCodeOrWrapperSnippet(snippet) || looksLikeMetaTaskHandoff(snippet) {
 		return "", false
 	}
 	return truncateString(snippet, 220), true
+}
+
+func unwrapLeadingCodeFenceSnippet(snippet string) string {
+	trimmed := strings.TrimSpace(snippet)
+	if !strings.HasPrefix(trimmed, "```") {
+		return snippet
+	}
+	lines := strings.Split(trimmed, "\n")
+	if len(lines) < 3 {
+		return snippet
+	}
+	closing := -1
+	for i := 1; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) == "```" {
+			closing = i
+			break
+		}
+	}
+	if closing <= 1 {
+		return snippet
+	}
+	body := strings.Join(lines[1:closing], "\n")
+	return strings.TrimSpace(body)
+}
+
+func extractWaitAgentCompletedSnippet(output string) (string, bool) {
+	lower := strings.ToLower(output)
+	if !strings.Contains(lower, "wait_agent =>") {
+		return "", false
+	}
+	snippet := output
+	if idx := strings.Index(snippet, "=>"); idx >= 0 {
+		snippet = strings.TrimSpace(snippet[idx+2:])
+	}
+	if idx := strings.LastIndex(snippet, "Output:"); idx >= 0 {
+		snippet = strings.TrimSpace(snippet[idx+len("Output:"):])
+	}
+	snippet = strings.TrimSpace(strings.TrimPrefix(snippet, "success=true"))
+	snippet = strings.TrimSpace(strings.TrimPrefix(snippet, "success=false"))
+	completed, ok := extractStructuredCompletedSnippet(snippet)
+	if !ok {
+		return "", false
+	}
+	return normalizeEvidenceSummarySnippet(completed)
+}
+
+func extractStructuredCompletedSnippet(snippet string) (string, bool) {
+	objectText, ok := extractJSONObject(snippet)
+	if !ok {
+		return "", false
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(objectText), &decoded); err != nil {
+		return "", false
+	}
+	if status, ok := decoded["status"].(map[string]any); ok {
+		for _, raw := range status {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			completed := strings.TrimSpace(asString(entry["completed"]))
+			if completed != "" {
+				return completed, true
+			}
+		}
+	}
+	if previousStatus, ok := decoded["previous_status"].(map[string]any); ok {
+		completed := strings.TrimSpace(asString(previousStatus["completed"]))
+		if completed != "" {
+			return completed, true
+		}
+	}
+	completed := strings.TrimSpace(asString(decoded["completed"]))
+	if completed != "" {
+		return completed, true
+	}
+	return "", false
+}
+
+func stripTerminalControlSequences(text string) string {
+	cleaned := terminalEscapePattern.ReplaceAllString(text, " ")
+	cleaned = strings.ReplaceAll(cleaned, "\r", " ")
+	cleaned = strings.Map(func(r rune) rune {
+		if r < 32 && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, cleaned)
+	return cleaned
+}
+
+func simplifyInteractivePythonSnippet(snippet string) string {
+	if !strings.Contains(snippet, ">>>") {
+		return snippet
+	}
+	prefix := strings.TrimSpace(snippet[:strings.Index(snippet, ">>>")])
+	if prefix == "" {
+		return snippet
+	}
+	if idx := strings.LastIndex(prefix, ")"); idx >= 0 {
+		if tail := strings.TrimSpace(prefix[idx+1:]); tail != "" {
+			return tail
+		}
+	}
+	fields := strings.Fields(prefix)
+	if len(fields) == 0 {
+		return snippet
+	}
+	return fields[len(fields)-1]
+}
+
+func extractEvidencePathSummary(snippet string) string {
+	matches := evidencePathFieldPattern.FindAllStringSubmatch(snippet, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	paths := make([]string, 0, len(matches))
+	seen := make(map[string]struct{}, len(matches))
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		path := strings.TrimSpace(match[1])
+		if path == "" {
+			continue
+		}
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return strings.Join(paths, "; ")
 }
 
 func taskRequestsNoFilesLabel(task string) bool {
@@ -885,12 +1131,33 @@ func shouldInferReadOnlyStructuredCompletion(task, text string, evidence executi
 	if taskLikelyNeedsWrite(task) || !taskRequestsNotApplicableLabel(task, "TEST") {
 		return false
 	}
-	combined := strings.ToLower(strings.TrimSpace(outcomeSignalText(text) + "\n" + strings.Join(evidence.Outputs, "\n")))
+	if hasExplicitOutcomeFailure(task, text, evidence) {
+		return false
+	}
+	return true
+}
+
+func hasExplicitOutcomeFailure(task, text string, evidence executionEvidence) bool {
+	if containsExplicitExecutionFailure(text) {
+		return true
+	}
+	return containsExplicitExecutionFailure(strings.Join(relevantOutcomeEvidence(task, evidence), "\n"))
+}
+
+func containsExplicitExecutionFailure(text string) bool {
+	combined := strings.ToLower(strings.TrimSpace(text))
+	if combined == "" {
+		return false
+	}
 	for _, marker := range []string{
 		"adapter error",
 		"upstream error",
 		"mcp error",
 		"tool error",
+		"failed to parse function arguments",
+		"missing field `session_id`",
+		"unknown process id",
+		"write_stdin failed",
 		"upstream response ended",
 		"tool_choice requires",
 		"missing required labels",
@@ -898,7 +1165,6 @@ func shouldInferReadOnlyStructuredCompletion(task, text string, evidence executi
 		"forbidden",
 		"timeout",
 		"timed out",
-		"not found",
 		"no auth available",
 		"success=false",
 		"process exited with code 1",
@@ -907,10 +1173,10 @@ func shouldInferReadOnlyStructuredCompletion(task, text string, evidence executi
 		"process exited with code 127",
 	} {
 		if strings.Contains(combined, marker) {
-			return false
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 func allObservedOutputsSucceeded(evidence executionEvidence) bool {
@@ -918,9 +1184,13 @@ func allObservedOutputsSucceeded(evidence executionEvidence) bool {
 		return false
 	}
 	seenExplicitSuccess := false
+	recoveredSubagentCompletion := hasRecoveredSubagentCompletionEvidence(evidence)
 	for _, output := range evidence.Outputs {
 		lower := strings.ToLower(strings.TrimSpace(output))
 		if strings.Contains(lower, "success=false") {
+			if recoveredSubagentCompletion && isRecoverableWaitAgentTimeoutOutput(lower) {
+				continue
+			}
 			return false
 		}
 		if strings.Contains(lower, "success=true") {
@@ -928,6 +1198,30 @@ func allObservedOutputsSucceeded(evidence executionEvidence) bool {
 		}
 	}
 	return seenExplicitSuccess
+}
+
+func isRecoverableWaitAgentTimeoutOutput(lowerOutput string) bool {
+	if !strings.Contains(lowerOutput, "wait_agent =>") {
+		return false
+	}
+	return strings.Contains(lowerOutput, `"timed_out":true`) ||
+		strings.Contains(lowerOutput, `"timedout":true`) ||
+		strings.Contains(lowerOutput, "timed out")
+}
+
+func hasRecoveredSubagentCompletionEvidence(evidence executionEvidence) bool {
+	for _, output := range evidence.Outputs {
+		lower := strings.ToLower(strings.TrimSpace(output))
+		if !strings.Contains(lower, "close_agent =>") && !strings.Contains(lower, "wait_agent =>") {
+			continue
+		}
+		if snippet, ok := normalizeEvidenceSummarySnippet(output); ok && strings.TrimSpace(snippet) != "" {
+			if !strings.HasPrefix(snippet, "{") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func looksLikeCodeOrWrapperSnippet(text string) bool {

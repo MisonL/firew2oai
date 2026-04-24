@@ -7,7 +7,7 @@ import (
 )
 
 const (
-	defaultUpstreamEmptyRetryCount   = 1
+	defaultUpstreamEmptyRetryCount   = 2
 	defaultUpstreamEmptyRetryBackoff = 200 * time.Millisecond
 )
 

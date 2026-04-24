@@ -61,6 +61,16 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 				}
 				outputs = appendExecutionEvidenceOutput(outputs, action, outputText, success)
 			}
+		case "collab_tool_call":
+			action := normalizeCollaborationEvidenceToolName(asString(item["tool"]))
+			action = strings.TrimSpace(action)
+			if action == "" {
+				continue
+			}
+			commands = append(commands, action)
+			text := buildCollaborationEvidenceOutputText(item, action)
+			success := buildCollaborationEvidenceSuccess(item, action, text)
+			outputs = appendExecutionEvidenceOutput(outputs, action, text, success)
 		case "custom_tool_call":
 			name, _ := item["name"].(string)
 			normalizedName := normalizeToolName(name)
@@ -115,8 +125,99 @@ func buildExecutionEvidence(historyItems []json.RawMessage) executionEvidence {
 	}
 }
 
+func normalizeCollaborationEvidenceToolName(name string) string {
+	normalized := normalizeToolName(name)
+	for _, candidate := range toolNameAliasVariants(normalized) {
+		if strings.EqualFold(candidate, "wait_agent") {
+			return "wait_agent"
+		}
+	}
+	return normalized
+}
+
+func buildCollaborationEvidenceOutputText(item map[string]any, action string) string {
+	switch action {
+	case "spawn_agent":
+		if ids, ok := item["receiver_thread_ids"].([]any); ok {
+			for _, raw := range ids {
+				id := strings.TrimSpace(asString(raw))
+				if id == "" {
+					continue
+				}
+				return mustMarshalJSONText(map[string]any{"agent_id": id})
+			}
+		}
+	case "wait_agent":
+		if states, ok := item["agents_states"].(map[string]any); ok && len(states) > 0 {
+			normalizedStates := make(map[string]any, len(states))
+			for agentID, rawState := range states {
+				stateMap, ok := rawState.(map[string]any)
+				if !ok {
+					normalizedStates[agentID] = rawState
+					continue
+				}
+				normalized := cloneMap(stateMap)
+				if strings.TrimSpace(asString(normalized["completed"])) == "" &&
+					strings.EqualFold(strings.TrimSpace(asString(normalized["status"])), "completed") {
+					if message := strings.TrimSpace(asString(normalized["message"])); message != "" {
+						normalized["completed"] = message
+					}
+				}
+				normalizedStates[agentID] = normalized
+			}
+			return mustMarshalJSONText(map[string]any{
+				"status":    normalizedStates,
+				"timed_out": false,
+			})
+		}
+	case "close_agent":
+		if previousStatus, ok := item["previous_status"].(map[string]any); ok && len(previousStatus) > 0 {
+			return mustMarshalJSONText(map[string]any{"previous_status": previousStatus})
+		}
+		if states, ok := item["agents_states"].(map[string]any); ok && len(states) > 0 {
+			for agentID, rawState := range states {
+				stateMap, ok := rawState.(map[string]any)
+				if !ok {
+					continue
+				}
+				completed := strings.TrimSpace(asString(stateMap["completed"]))
+				if completed == "" && strings.EqualFold(strings.TrimSpace(asString(stateMap["status"])), "completed") {
+					completed = strings.TrimSpace(asString(stateMap["message"]))
+				}
+				if completed == "" {
+					continue
+				}
+				return mustMarshalJSONText(map[string]any{
+					"previous_status": map[string]any{
+						"agent_id":  agentID,
+						"completed": completed,
+					},
+				})
+			}
+		}
+	}
+	if encoded, err := json.Marshal(item); err == nil {
+		return string(encoded)
+	}
+	return ""
+}
+
+func buildCollaborationEvidenceSuccess(item map[string]any, action, text string) *bool {
+	if historyCollabToolCallSucceeded(item) {
+		flag := true
+		return &flag
+	}
+	if inferred := inferCollaborationToolOutputSuccess(action, text); inferred != nil {
+		return inferred
+	}
+	return nil
+}
+
 func inferCollaborationToolOutputSuccess(action, text string) *bool {
 	action = normalizeToolName(strings.TrimSpace(action))
+	if action == "wait" {
+		action = "wait_agent"
+	}
 	lower := strings.ToLower(strings.TrimSpace(text))
 	switch action {
 	case "spawn_agent":
@@ -162,6 +263,9 @@ func appendExecutionEvidenceOutput(outputs []string, action, text string, succes
 	if strings.Contains(strings.ToLower(text), "source:") {
 		text = evidenceSourcePrefixPattern.ReplaceAllString(text, "")
 		text = strings.TrimSpace(strings.TrimLeft(text, "# "))
+	}
+	if pathSummary := extractEvidencePathSummary(text); pathSummary != "" {
+		text = pathSummary
 	}
 	if text == "" {
 		return outputs
