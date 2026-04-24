@@ -13,34 +13,41 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 ## 当前验证状态
 
-核对日期：2026-04-21  
-当前 README 只保留最后一次验证情况；历史矩阵和早期复测记录已从仓库文档中移除。
+核对日期：2026-04-24  
+当前以真实链路证据为准，区分 `Codex -> new-api -> firew2oai` 与 `Codex -> firew2oai` 两种口径，不再混写。
 
-### 最后一次真实链路验证
+### 当前权威口径：全 17 维真实链路
 
 | 项目 | 结果 |
 |---|---|
 | 链路 | `Codex -> new-api -> firew2oai` |
 | 接口 | `wire_api=responses` |
-| 场景 | `readonly_audit`、`add_test_file`、`fix_existing_bug`、`search_and_patch`、`cross_file_feature` |
-| 证据文件 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260421-094437/summary.tsv` |
-| 补充证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260420-230054/summary.reconstructed.tsv` |
-| 结果 | 已完成当前模型集真实 coding 场景分梯队复核 |
+| 场景 | `17` 个预设场景，其中 `14` 个在当前环境可执行，`3` 个因工具未声明或未认证跳过 |
+| 主证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260424-165129/summary.tsv` |
+| 严格重算 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260424-165129/summary.strict-20260424-newapi.tsv` |
+| 当前结论 | `105 ok / 63 fail / 36 skip`，失败集中在交互 shell、`js_repl`、`view_image`、Chrome DevTools、subagent 5 类 probe |
 
-验证结论：
+按模型分梯队：
 
-- 第一梯队，`5/5 PASS`：`glm-5`、`glm-4p7`、`gpt-oss-20b`、`gpt-oss-120b`、`kimi-k2p5`、`llama-v3p3-70b-instruct`、`minimax-m2p5`、`qwen3-vl-30b-a3b-instruct`、`deepseek-v3p1`、`deepseek-v3p2`
-- 第二梯队，`4/5 PASS`：`qwen3-8b`，唯一失败场景为 `readonly_audit`，最新失败表现为 `upstream response ended without a completion signal`
-- 第三梯队：`qwen3-vl-30b-a3b-thinking`，剩余问题主要表现为 completion signal 异常或长尾超时
-- 当前已确认的一梯队模型，在真实链路下可稳定完成只读审计、补测试、修已有 bug、仓库搜索后定点修补、跨文件小功能这 5 类 Coding 场景
-- 第二、第三梯队的残余问题当前更接近上游响应稳定性或模型能力长尾，不是已确认的主转换层回归
+- 第一梯队，`9/14 PASS`：`deepseek-v3p1`、`deepseek-v3p2`、`glm-5`、`gpt-oss-120b`、`kimi-k2p5`、`llama-v3p3-70b-instruct`、`minimax-m2p5`、`qwen3-8b`、`qwen3-vl-30b-a3b-instruct`
+- 第二梯队，`8/14 PASS`：`glm-4p7`、`gpt-oss-20b`、`qwen3-vl-30b-a3b-thinking`
+- 环境跳过场景统一为：`apply_patch_probe`、`cloudflare_execute_probe`、`cloudflare_spec_probe`
 
-本地回归验证：
+关键结论：
 
-- `go test ./internal/proxy`
-- `go test ./...`
+- 5 个核心 Coding 场景仍保持强势：除 `qwen3-vl-30b-a3b-thinking` 的 `readonly_audit` 外，其余模型均通过 `readonly_audit`、`add_test_file`、`fix_existing_bug`、`search_and_patch`、`cross_file_feature`
+- 新增的全维度弱项集中在工具历史与收口信号：`interactive_shell_session`、`js_repl_roundtrip`、`view_image_probe`、`chrome_devtools_probe`、`subagent_probe` 在本轮为主要失分项
+- 当前全维度权威结论应以 `docs/reviews/CR-NEWAPI-FULL-DIMENSION-MATRIX-2026-04-24.md` 为准
 
-详细记录见 `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md`。
+### 辅助口径：直连 firew2oai
+
+- `Codex -> firew2oai` 直连 17 维结果已归档到 `docs/reviews/CR-CODEX-FULL-DIMENSION-MATRIX-2026-04-24.md`
+- 该文档只用于评估直连转换层能力，不作为 new-api 网关链路的最终对外口径
+
+### 历史 coding 专项
+
+- `docs/reviews/CR-CODEX-MODEL-MATRIX-2026-04-21.md`：`Codex -> new-api -> firew2oai` 的 5 类真实 Coding 场景模型分梯队
+- `docs/reviews/CR-NEWAPI-CODING-MATRIX-2026-04-22.md`：3 个模型在 5 类 Coding 场景复测 `15/15 PASS`
 
 ## 快速开始
 
