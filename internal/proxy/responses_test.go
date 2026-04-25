@@ -228,6 +228,32 @@ func TestPreferredPendingWriteTool_PrefersConcreteFileMutationBeforeApplyPatch(t
 	}
 }
 
+func TestPendingWriteToolConstraintsDoNotForceMutationTool(t *testing.T) {
+	policy := executionPolicy{
+		PendingWrite:         true,
+		AllRequiredFilesSeen: true,
+	}
+	toolChoice := resolvedToolChoice{}
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
+	}
+	constraints := toolProtocolConstraints{
+		RequiredTool: toolChoice.RequiredTool,
+		RequireTool:  toolChoice.RequireTool || policy.RequireTool,
+	}
+	if policy.PendingWrite && toolChoice.RequiredTool == "" && !toolChoice.DisableTools {
+		constraints.PreferredToolNames = availableMutationToolNames(toolCatalog)
+	}
+
+	if constraints.RequiredTool != "" {
+		t.Fatalf("RequiredTool = %q, want empty so read/diagnostic tools are not rejected prematurely", constraints.RequiredTool)
+	}
+	if !reflect.DeepEqual(constraints.PreferredToolNames, []string{"apply_patch"}) {
+		t.Fatalf("PreferredToolNames = %#v, want apply_patch preference", constraints.PreferredToolNames)
+	}
+}
+
 func TestBuildResponsesPrompt_UsesDeclaredFileToolNamesWhenAvailable(t *testing.T) {
 	tools := json.RawMessage(`[
 		{"type":"function","name":"read_file","description":"read file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}},
@@ -1123,6 +1149,50 @@ func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForSingleReadReply(
 	}
 	if got != "# firew2oai" {
 		t.Fatalf("fallback text = %q, want %q", got, "# firew2oai")
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForReadOnlyFailedTestDiagnosis(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 只读测试诊断任务：\n" +
+		"1) 执行 go test ./internal/codexfixture/realdiagnose。\n" +
+		"2) 阅读 internal/codexfixture/realdiagnose/*.go。\n" +
+		"3) 不要修改任何文件。\n" +
+		"4) 说明失败根因和最小修复位置。\n" +
+		"最后只输出四行：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: 你读取的文件\n" +
+		"TEST: 测试结果\n" +
+		"NOTE: 根因和建议修复。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"go test ./internal/codexfixture/realdiagnose",
+			"sed -n '1,200p' 'internal/codexfixture/realdiagnose/math.go'",
+		},
+		Outputs: []string{
+			"go test ./internal/codexfixture/realdiagnose => success=false --- FAIL: TestDouble Double(21) = 43, want 42",
+			"sed -n '1,200p' 'internal/codexfixture/realdiagnose/math.go' => success=true package realdiagnose func Double(value int) int { return value + value + 1 }",
+		},
+	}
+
+	if !taskRequestsReadOnlyDiagnosis(task) {
+		t.Fatal("taskRequestsReadOnlyDiagnosis = false, want true")
+	}
+	if !shouldInferReadOnlyStructuredCompletion(task, "", evidence) {
+		t.Fatal("shouldInferReadOnlyStructuredCompletion = false, want true")
+	}
+	got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil)
+	if !ok {
+		t.Fatal("fallbackFinalTextForIncompleteResponses ok = false, want true")
+	}
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: internal/codexfixture/realdiagnose/math.go",
+		"TEST:",
+		"NOTE:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback text missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -2815,6 +2885,41 @@ func TestConstrainFinalText_SearchCommandWithoutSuccessFlagStillAllowsPass(t *te
 	got := constrainFinalText(task, text, evidence, true)
 	want := "RESULT: PASS\n" +
 		"FILES: internal/codexfixture/searchfix/summary.go\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 已完成所需文件修改，并保留任务范围内的业务逻辑边界。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q", got, want)
+	}
+}
+
+func TestConstrainFinalText_DocsSyncEvidenceOverridesModelFail(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n" +
+		"1) 阅读 internal/codexfixture/realdocs/config.go。\n" +
+		"2) 阅读 docs/codexfixture/realdocs.md。\n" +
+		"3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。\n" +
+		"4) 不要修改 Go 代码。\n" +
+		"5) 执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"
+	text := "RESULT: FAIL\n" +
+		"FILES: docs/codexfixture/realdocs.md\n" +
+		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
+		"NOTE: 已完成所需文件修改，并保留任务范围内的业务逻辑边界。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"sed -n '1,200p' 'internal/codexfixture/realdocs/config.go'",
+			"sed -n '1,200p' 'docs/codexfixture/realdocs.md'",
+			"python3 -c 'exec(...)'",
+			`rg -n "REALDOCS_TIMEOUT|REALDOCS_RETRIES" docs/codexfixture/realdocs.md`,
+		},
+		Outputs: []string{
+			"python3 -c 'exec(...)' => success=true",
+			`rg -n "REALDOCS_TIMEOUT|REALDOCS_RETRIES" docs/codexfixture/realdocs.md => 5:| REALDOCS_TIMEOUT | 请求超时时间，单位秒 |` + "\n" + `6:| REALDOCS_RETRIES | 待补充说明 |`,
+		},
+	}
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: docs/codexfixture/realdocs.md\n" +
 		"TEST: 已完成相关验证命令，未观察到明确失败信号。\n" +
 		"NOTE: 已完成所需文件修改，并保留任务范围内的业务逻辑边界。"
 	if got != want {

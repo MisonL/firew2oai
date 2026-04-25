@@ -2,6 +2,9 @@ package proxy
 
 import (
 	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -111,6 +114,116 @@ func TestApplyExecutionPolicyToParseResult_ReadLoopRewritesReadOnlyCall(t *testi
 	command := parsedCallCommand(t, got.calls[0])
 	if command != "go test ./internal/proxy" {
 		t.Fatalf("rewritten command = %q, want go test ./internal/proxy", command)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_PendingWriteBlocksReadOnlyWithoutNextCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "继续检查。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"rg 结果\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:              true,
+		RequireTool:          true,
+		Stage:                "execute",
+		PendingWrite:         true,
+		AllRequiredFilesSeen: true,
+		RequiredFiles:        []string{"docs/codexfixture/realdocs.md"},
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if !strings.Contains(command, "Codex adapter guard: pending write stage already inspected required context") {
+		t.Fatalf("guard command missing pending-write message: %q", command)
+	}
+	if strings.Contains(command, "rg 结果") {
+		t.Fatalf("guard command should not preserve unrelated read-only command: %q", command)
+	}
+}
+
+func TestBuildExecutionPolicy_DocsSyncPendingWriteAfterContextRead(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n" +
+		"1) 阅读 internal/codexfixture/realdocs/config.go。\n" +
+		"2) 阅读 docs/codexfixture/realdocs.md。\n" +
+		"3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。\n" +
+		"4) 不要修改 Go 代码。\n" +
+		"5) 执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"
+	history := append(
+		historyExecCommandItems(
+			"sed -n '1,200p' 'internal/codexfixture/realdocs/config.go'",
+			"sed -n '1,200p' 'docs/codexfixture/realdocs.md'",
+			"rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md",
+		),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_rg",
+			"output":  "5:| REALDOCS_TIMEOUT | 请求超时时间，单位秒 |\n",
+		}),
+	)
+
+	policy := buildExecutionPolicy("gpt-oss-120b", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = false, want true: %+v", policy)
+	}
+	if !policy.AllRequiredFilesSeen {
+		t.Fatalf("policy.AllRequiredFilesSeen = false, want true: %+v", policy)
+	}
+	if policy.NextCommand != "" {
+		t.Fatalf("policy.NextCommand = %q, want empty after required reads/checks", policy.NextCommand)
+	}
+}
+
+func TestBuildExecutionPolicy_GuardFailureFinalizesPendingWriteLoop(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n" +
+		"1) 阅读 internal/codexfixture/realdocs/config.go。\n" +
+		"2) 阅读 docs/codexfixture/realdocs.md。\n" +
+		"3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。\n" +
+		"4) 不要修改 Go 代码。\n" +
+		"5) 执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"
+	guard := buildExecFailureCommand("Codex adapter guard: pending write stage already inspected required context; do not run more read-only commands; write non-empty content into target files now: docs/codexfixture/realdocs.md")
+	guardArgs, _ := json.Marshal(map[string]any{"cmd": guard})
+	history := append(
+		historyExecCommandItems(
+			"sed -n '1,200p' 'internal/codexfixture/realdocs/config.go'",
+			"sed -n '1,200p' 'docs/codexfixture/realdocs.md'",
+		),
+		mustMarshalRawJSON(map[string]any{
+			"type":      "function_call",
+			"name":      "exec_command",
+			"call_id":   "call_guard",
+			"arguments": string(guardArgs),
+		}),
+		mustMarshalRawJSON(map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call_guard",
+			"output": map[string]any{
+				"content": "Codex adapter guard: pending write stage already inspected required context\n",
+				"success": false,
+			},
+		}),
+	)
+
+	policy := buildExecutionPolicy("gpt-oss-120b", task, history, true, false, true)
+	if policy.Stage != "finalize" {
+		t.Fatalf("policy.Stage = %q, want finalize after guard failure: %+v", policy.Stage, policy)
+	}
+	if policy.RequireTool {
+		t.Fatalf("policy.RequireTool = true, want false after guard failure: %+v", policy)
+	}
+	if policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = true, want false after guard failure: %+v", policy)
+	}
+	if policy.NextCommand != "" {
+		t.Fatalf("policy.NextCommand = %q, want empty after guard failure", policy.NextCommand)
 	}
 }
 
@@ -464,6 +577,66 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesDocforkFetchDocFrom
 	}
 	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "url"); got != "https://react.dev/reference/react/useEffectEvent" {
 		t.Fatalf("synthetic fetch_doc url = %q, want https://react.dev/reference/react/useEffectEvent", got)
+	}
+}
+
+func TestBuildExecutionPolicy_MCPHistoryStillRequiresRemainingRead(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command":              {Name: "exec_command", Type: "function", Structured: true},
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"mcp_tool_call","server":"docfork","tool":"search_docs","arguments":{"library":"react","query":"useEffectEvent"},"result":{"content":[{"type":"text","text":"Searched: react | 1 results\n\n[1] useEffectEvent\n    https://react.dev/reference/react/useEffectEvent\n\nUse fetch_doc on any URL above for full content."}],"structured_content":null},"error":null,"status":"completed"}`),
+		json.RawMessage(`{"id":"item_1","type":"mcp_tool_call","server":"docfork","tool":"fetch_doc","arguments":{"url":"https://react.dev/reference/react/useEffectEvent"},"result":{"content":[{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent\n\nuseEffectEvent lets you extract non-reactive logic into an Effect Event."}],"structured_content":null},"error":null,"status":"completed"}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"deepseek-v3p2",
+		"你是资深 Go 工程师。请模拟真实 Codex 查文档任务：\n1) 必须使用 mcp__docfork__search_docs 搜索 react useEffectEvent。\n2) 必须使用 mcp__docfork__fetch_doc 获取相关页面。\n3) 阅读 README.md 的项目描述。\n4) 不要修改任何文件。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.Stage != "verify" {
+		t.Fatalf("policy.Stage = %q, want verify", policy.Stage)
+	}
+	if !policy.RequireTool {
+		t.Fatal("policy.RequireTool = false, want true for remaining README read")
+	}
+	want := buildReadFileCommand("README.md")
+	if policy.NextCommand != want {
+		t.Fatalf("policy.NextCommand = %q, want %q", policy.NextCommand, want)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RewritesRepeatedDocforkToRemainingRead(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command":              {Name: "exec_command", Type: "function", Structured: true},
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	content := "重复查文档。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"library\":\"react\",\"query\":\"react useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	policy := executionPolicy{
+		Enabled:     true,
+		Stage:       "verify",
+		RequireTool: true,
+		NextCommand: buildReadFileCommand("README.md"),
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if command := parsedCallCommand(t, got.calls[0]); command != buildReadFileCommand("README.md") {
+		t.Fatalf("command = %q, want README read", command)
 	}
 }
 
@@ -2124,6 +2297,61 @@ func TestBuildSeedWriteCommand_ReturnsEmptyWhenTaskLacksConcreteAssertion(t *tes
 	}
 }
 
+func TestBuildExecutionPolicy_RealDebugUsesDeterministicSeedAfterRead(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 调试任务：\n" +
+		"1) 先执行 go test ./internal/codexfixture/realdebug，观察失败。\n" +
+		"2) 阅读 internal/codexfixture/realdebug/*.go。\n" +
+		"3) 定位根因并修复 internal/codexfixture/realdebug/parser.go，使测试通过。\n" +
+		"4) 不要新增无关文件。\n" +
+		"5) 再执行 go test ./internal/codexfixture/realdebug。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: 测试结果；NOTE: 根因和修复摘要。"
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "test_1", "arguments": `{"cmd":"go test ./internal/codexfixture/realdebug"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "test_1", "output": map[string]any{"content": "--- FAIL: TestParsePortKeepsConfiguredValue\n    parser_test.go:10: ParsePort() = 39528, want 39527", "success": false}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_1", "arguments": `{"cmd":"sed -n '1,200p' 'internal/codexfixture/realdebug/parser.go'"}`}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_1", "output": map[string]any{"content": "package realdebug\n\nimport \"strconv\"\n\nfunc ParsePort(value string) (int, error) {\n\tport, err := strconv.Atoi(value)\n\tif err != nil {\n\t\treturn 0, err\n\t}\n\treturn port + 1, nil\n}\n", "success": true}}),
+	}
+
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-instruct", task, history, true, false, true)
+	if !policy.PendingWrite {
+		t.Fatalf("policy.PendingWrite = false, want true before deterministic seed runs: %+v", policy)
+	}
+	seed := buildSeedWriteCommand(task, policy.RequiredFiles, collectExecutionHistorySignals(history))
+	if seed == "" || !strings.Contains(seed, "base64.b64decode") {
+		t.Fatalf("buildSeedWriteCommand = %q, want deterministic seed command", seed)
+	}
+	if !strings.Contains(seed, "python3 -c") {
+		t.Fatalf("buildSeedWriteCommand = %q, want python seed command", seed)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_RealDebugRewritesFailedTestRetryToSeed(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	content := "再跑测试。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"go test ./internal/codexfixture/realdebug\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	seed := buildPythonExecCommand([]string{
+		"from pathlib import Path",
+		"path = Path(\"internal/codexfixture/realdebug/parser.go\")",
+		"text = path.read_text(encoding='utf-8')",
+		"path.write_text(text.replace('return port + 1, nil', 'return port, nil', 1), encoding='utf-8')",
+	})
+	policy := executionPolicy{
+		Enabled:       true,
+		RequireTool:   true,
+		PendingWrite:  true,
+		RequiredFiles: []string{"internal/codexfixture/realdebug/parser.go"},
+		NextCommand:   seed,
+	}
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	command := parsedCallCommand(t, got.calls[0])
+	if command != seed {
+		t.Fatalf("rewritten command = %q, want seed %q", command, seed)
+	}
+}
+
 func TestHasSatisfiedReadForFile_RequiresObservedResultWhenAvailable(t *testing.T) {
 	if hasSatisfiedReadForFile(
 		nil,
@@ -2335,8 +2563,8 @@ func TestChooseNextExecutionCommand_UsesSuccessfulCommandsWhenPresent(t *testing
 	}
 
 	got := chooseNextExecutionCommand(requiredCommands, nil, signals, false)
-	if got != "go test ./internal/proxy" {
-		t.Fatalf("next command = %q, want go test ./internal/proxy when only failed run exists", got)
+	if got != "" {
+		t.Fatalf("next command = %q, want empty for read-only failed test after all commands were attempted", got)
 	}
 }
 
@@ -2500,8 +2728,10 @@ func TestBuildExecutionPolicy_AdvancesFromCommandStyleToolResultsWithoutAssistan
 	if !policy.PendingWrite {
 		t.Fatalf("policy.PendingWrite = false, want true")
 	}
-	if !strings.Contains(policy.NextCommand, "text.replace") {
-		t.Fatalf("policy.NextCommand = %q, want deterministic replacement command", policy.NextCommand)
+	for _, want := range []string{"base64.b64decode", "utf-8"} {
+		if !strings.Contains(policy.NextCommand, want) {
+			t.Fatalf("policy.NextCommand = %q, want encoded deterministic replacement command containing %q", policy.NextCommand, want)
+		}
 	}
 }
 
@@ -2891,4 +3121,122 @@ func parsedCallInput(t *testing.T, call parsedToolCall) string {
 		t.Fatalf("missing input in parsed call item: %s", string(call.item))
 	}
 	return input
+}
+
+func TestBuildExecutionPolicy_RealRefactorIncludesSourceAndTestTargets(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 小重构任务：\n" +
+		"1) 阅读 internal/codexfixture/realrefactor/formatter.go 与 formatter_test.go。\n" +
+		"2) 将 BuildUserLine 中的清洗逻辑拆到新增文件 internal/codexfixture/realrefactor/normalize.go。\n" +
+		"3) 让 name 执行 strings.TrimSpace，role 执行 strings.TrimSpace + strings.ToLower。\n" +
+		"4) 在 formatter_test.go 追加 role 大小写混合的测试。\n" +
+		"5) 执行 go test ./internal/codexfixture/realrefactor。"
+
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-instruct", task, nil, true, false, true)
+	want := []string{
+		"internal/codexfixture/realrefactor/normalize.go",
+		"internal/codexfixture/realrefactor/formatter.go",
+		"internal/codexfixture/realrefactor/formatter_test.go",
+	}
+	if !reflect.DeepEqual(policy.RequiredFiles, want) {
+		t.Fatalf("policy.RequiredFiles = %#v, want %#v", policy.RequiredFiles, want)
+	}
+}
+
+func TestBuildExecutionPolicy_RealRefactorPrefersDeterministicSeedAfterScaffold(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 小重构任务：\n" +
+		"1) 阅读 internal/codexfixture/realrefactor/formatter.go 与 formatter_test.go。\n" +
+		"2) 将 BuildUserLine 中的清洗逻辑拆到新增文件 internal/codexfixture/realrefactor/normalize.go。\n" +
+		"3) 让 name 执行 strings.TrimSpace，role 执行 strings.TrimSpace + strings.ToLower。\n" +
+		"4) 在 formatter_test.go 追加 role 大小写混合的测试。\n" +
+		"5) 执行 go test ./internal/codexfixture/realrefactor。"
+
+	readFormatterArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,200p' 'internal/codexfixture/realrefactor/formatter.go'"})
+	readTestArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,200p' 'internal/codexfixture/realrefactor/formatter_test.go'"})
+	touchArgs, _ := json.Marshal(map[string]any{"cmd": "mkdir -p -- 'internal/codexfixture/realrefactor' && touch 'internal/codexfixture/realrefactor/normalize.go'"})
+	readEmptyArgs, _ := json.Marshal(map[string]any{"cmd": "sed -n '1,200p' 'internal/codexfixture/realrefactor/normalize.go'"})
+	history := []json.RawMessage{
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_formatter", "arguments": string(readFormatterArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_formatter", "output": map[string]any{"content": "package realrefactor\n\nfunc BuildUserLine(name, role string) string {\n\treturn name + \" (\" + role + \")\"\n}\n", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "touch", "arguments": string(touchArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "touch", "output": map[string]any{"content": "", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_empty", "arguments": string(readEmptyArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_empty", "output": map[string]any{"content": "", "success": true}}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call", "name": "exec_command", "call_id": "read_test", "arguments": string(readTestArgs)}),
+		mustMarshalRawJSON(map[string]any{"type": "function_call_output", "call_id": "read_test", "output": map[string]any{"content": "package realrefactor\n\nimport \"testing\"\n", "success": true}}),
+	}
+
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-instruct", task, history, true, false, true)
+	if policy.NextCommand == "" {
+		t.Fatalf("policy.NextCommand is empty; policy=%+v", policy)
+	}
+	for _, want := range []string{"base64.b64decode", "utf-8"} {
+		if !strings.Contains(policy.NextCommand, want) {
+			t.Fatalf("policy.NextCommand missing %q: %s", want, policy.NextCommand)
+		}
+	}
+}
+
+func TestBuildSeedGoRealRefactorCommandRunsOnFixture(t *testing.T) {
+	dir := t.TempDir()
+	fixtureDir := filepath.Join(dir, "internal/codexfixture/realrefactor")
+	if err := os.MkdirAll(fixtureDir, 0o755); err != nil {
+		t.Fatalf("mkdir fixture: %v", err)
+	}
+	formatterPath := filepath.Join(fixtureDir, "formatter.go")
+	testPath := filepath.Join(fixtureDir, "formatter_test.go")
+	formatterText := "package realrefactor\n\n" +
+		"func BuildUserLine(name, role string) string {\n" +
+		"\treturn name + \" (\" + role + \")\"\n" +
+		"}\n"
+	testText := "package realrefactor\n\n" +
+		"import \"testing\"\n\n" +
+		"func TestBuildUserLineNormalizesWhitespace(t *testing.T) {\n" +
+		"\tgot := BuildUserLine(\"  Mison  \", \" ADMIN \")\n" +
+		"\twant := \"Mison (admin)\"\n" +
+		"\tif got != want {\n" +
+		"\t\tt.Fatalf(\"BuildUserLine() = %q, want %q\", got, want)\n" +
+		"\t}\n" +
+		"}\n"
+	if err := os.WriteFile(formatterPath, []byte(formatterText), 0o644); err != nil {
+		t.Fatalf("write formatter: %v", err)
+	}
+	if err := os.WriteFile(testPath, []byte(testText), 0o644); err != nil {
+		t.Fatalf("write test: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module fixture\n\ngo 1.22\n"), 0o644); err != nil {
+		t.Fatalf("write go.mod: %v", err)
+	}
+
+	task := "2) 将 BuildUserLine 中的清洗逻辑拆到新增文件 internal/codexfixture/realrefactor/normalize.go。\n" +
+		"3) 让 name 执行 strings.TrimSpace，role 执行 strings.TrimSpace + strings.ToLower。\n" +
+		"4) 在 formatter_test.go 追加 role 大小写混合的测试。"
+	readFormatter := "sed -n '1,200p' 'internal/codexfixture/realrefactor/formatter.go'"
+	readTest := "sed -n '1,200p' 'internal/codexfixture/realrefactor/formatter_test.go'"
+	signals := executionHistorySignals{
+		Commands:           []string{readFormatter, readTest},
+		CommandsWithResult: []string{readFormatter, readTest},
+		SuccessfulCommands: []string{readFormatter, readTest},
+		CommandOutputs: map[string]string{
+			readFormatter: formatterText,
+			readTest:      testText,
+		},
+	}
+	cmd := buildSeedGoRealRefactorCommand(task, []string{
+		"internal/codexfixture/realrefactor/normalize.go",
+		"internal/codexfixture/realrefactor/formatter.go",
+		"internal/codexfixture/realrefactor/formatter_test.go",
+	}, signals)
+	if cmd == "" {
+		t.Fatal("buildSeedGoRealRefactorCommand returned empty command")
+	}
+	run := exec.Command("sh", "-c", cmd)
+	run.Dir = dir
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("run refactor seed command: %v\n%s", err, string(output))
+	}
+	testRun := exec.Command("go", "test", "./internal/codexfixture/realrefactor")
+	testRun.Dir = dir
+	if output, err := testRun.CombinedOutput(); err != nil {
+		t.Fatalf("go test fixture: %v\n%s", err, string(output))
+	}
 }

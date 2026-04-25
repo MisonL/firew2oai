@@ -143,12 +143,12 @@ func extractAIActionsBlock(text string) (aiActionsBlock, bool) {
 		return aiActionsBlock{}, false
 	}
 
-	end := strings.LastIndex(text, aiActionsEndMarker)
+	end, endMarker := findAIActionsEndMarker(text)
 	if end < 0 || end < start {
 		return aiActionsBlock{}, false
 	}
 
-	suffix := text[end+len(aiActionsEndMarker):]
+	suffix := text[end+len(endMarker):]
 	if strings.TrimSpace(suffix) != "" {
 		return aiActionsBlock{}, false
 	}
@@ -163,6 +163,18 @@ func extractAIActionsBlock(text string) (aiActionsBlock, bool) {
 		VisibleText: strings.TrimSpace(text[:start]),
 		JSONText:    payload,
 	}, true
+}
+
+func findAIActionsEndMarker(text string) (int, string) {
+	if end := strings.LastIndex(text, aiActionsEndMarker); end >= 0 {
+		return end, aiActionsEndMarker
+	}
+	for _, candidate := range []string{"<<<END_AI_ACTIONS_V1>>}", "<<<END_AI_ACTIONS_V1>>"} {
+		if end := strings.LastIndex(text, candidate); end >= 0 {
+			return end, candidate
+		}
+	}
+	return -1, ""
 }
 
 func findAIActionsStartMarker(text string) (int, string) {
@@ -347,7 +359,7 @@ func extractSequentialAIActionsBlocks(text string) []aiActionsBlock {
 		}
 		start += cursor
 		payloadStart := start + len(marker)
-		end := strings.Index(text[payloadStart:], aiActionsEndMarker)
+		end, endMarker := findNextAIActionsEndMarker(text[payloadStart:])
 		if end < 0 {
 			break
 		}
@@ -359,9 +371,21 @@ func extractSequentialAIActionsBlocks(text string) []aiActionsBlock {
 				JSONText:    payload,
 			})
 		}
-		cursor = end + len(aiActionsEndMarker)
+		cursor = end + len(endMarker)
 	}
 	return blocks
+}
+
+func findNextAIActionsEndMarker(text string) (int, string) {
+	best := -1
+	bestMarker := ""
+	for _, candidate := range []string{aiActionsEndMarker, "<<<END_AI_ACTIONS_V1>>}", "<<<END_AI_ACTIONS_V1>>"} {
+		if idx := strings.Index(text, candidate); idx >= 0 && (best < 0 || idx < best) {
+			best = idx
+			bestMarker = candidate
+		}
+	}
+	return best, bestMarker
 }
 
 func parseAIActionsToolCallOutputs(block aiActionsBlock, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallBatchResult {
@@ -1171,11 +1195,14 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		if !ok {
 			return args, false
 		}
-		if _, hasLibrary := value["library"]; hasLibrary {
+		if library, ok := firstStringField(value, "library"); ok && library != "" {
 			return args, false
 		}
-		source, ok := firstStringField(value, "source", "docs", "docset", "library_name", "libraryName")
-		if !ok {
+		source, _ := firstStringField(value, "source", "docs", "docset", "library_name", "libraryName")
+		if source == "" {
+			source = inferDocforkLibraryFromQuery(value)
+		}
+		if source == "" {
 			return args, false
 		}
 		normalized := cloneMap(value)
@@ -1203,6 +1230,20 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		}
 	}
 	return args, false
+}
+
+func inferDocforkLibraryFromQuery(values map[string]any) string {
+	query, ok := firstStringField(values, "query")
+	if !ok {
+		return ""
+	}
+	lower := strings.ToLower(query)
+	for _, candidate := range []string{"react", "nextjs", "next.js", "vue", "svelte", "angular", "zod", "tailwind"} {
+		if strings.Contains(lower, candidate) {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func firstNonEmptyNormalizedToolName(names ...string) string {

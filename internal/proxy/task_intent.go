@@ -55,7 +55,7 @@ var taskPlainResponseKeywords = []string{
 
 var taskWriteKeywords = []string{
 	"edit", "modify", "update", "fix", "patch", "implement", "add", "create", "write", "change", "refactor",
-	"修改", "修复", "新增", "添加", "实现", "重构", "优化", "完善", "补充",
+	"修改", "修复", "新增", "添加", "实现", "重构", "优化", "完善", "补充", "补强", "更新",
 }
 
 var taskReadOnlyMarkers = []string{
@@ -107,7 +107,9 @@ var taskShellCommandPrefixes = []string{
 }
 
 var taskFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql|txt)`)
+var taskBareFileNamePattern = regexp.MustCompile(`(?i)\b[a-z0-9_.-]+\.(?:go|py|ts|js|jsx|tsx|md|json|yaml|yml|toml|sh|sql|txt)\b`)
 var taskTestStyleGlobPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+\*_test\.go`)
+var taskGoGlobPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+\*\.go`)
 var taskCommandLinePattern = regexp.MustCompile(`(?im)^\s*(?:[-*]|\d+[.)])?\s*((?:go test|pytest|cargo test|npm test|make test|golangci-lint|go vet|gofmt)\b[^\n]*)$`)
 var taskCommandLabelPattern = regexp.MustCompile(`(?i)(?:执行命令|run command|execute command)\s*[:：]`)
 var taskTrailingBulletSuffixPattern = regexp.MustCompile(`\s+[（(]?\d+[.)）]\s*$`)
@@ -413,11 +415,20 @@ func taskLikelyNeedsWrite(task string) bool {
 	if trimmed == "" {
 		return false
 	}
-	lower := strings.ToLower(trimmed)
-	if containsAny(lower, taskReadOnlyMarkers) {
-		return false
+	return taskHasAffirmativeWriteIntent(trimmed)
+}
+
+func taskHasAffirmativeWriteIntent(task string) bool {
+	for _, segment := range splitTaskActionSegments(stripFinalOutputInstructionSection(task)) {
+		lower := strings.ToLower(strings.TrimSpace(segment))
+		if lower == "" || containsAny(lower, taskReadOnlyMarkers) {
+			continue
+		}
+		if firstKeywordIndex(lower, taskWriteKeywords) >= 0 {
+			return true
+		}
 	}
-	return containsAny(lower, taskWriteKeywords)
+	return false
 }
 
 func containsAny(text string, keywords []string) bool {
@@ -836,8 +847,48 @@ func extractRequiredCommands(task string) []string {
 		}
 	}
 
-	commands = append(commands, extractInlineCommands(task)...)
+	commands = append(commands, extractInlineCommands(stripFinalOutputInstructionSection(task))...)
+	if taskRequestsReadOnlyDiagnosis(task) {
+		for _, filePath := range taskFilePathPattern.FindAllString(task, -1) {
+			if strings.Contains(filePath, "*") {
+				continue
+			}
+			if strings.HasSuffix(strings.ToLower(filePath), ".go") {
+				commands = append(commands, buildReadFileCommand(filePath))
+			}
+		}
+		for _, glob := range taskGoGlobPattern.FindAllString(task, -1) {
+			dir := strings.TrimSpace(path.Dir(glob))
+			if dir == "" || dir == "." {
+				continue
+			}
+			commands = append(commands, "find "+shellQuoteSingle(dir)+" -maxdepth 1 -name '*.go' -print -exec sed -n '1,200p' '{}' ';'")
+		}
+	}
 	return commands
+}
+
+func stripFinalOutputInstructionSection(task string) string {
+	trimmed := strings.TrimSpace(task)
+	if trimmed == "" {
+		return ""
+	}
+	best := len(trimmed)
+	for _, marker := range []string{
+		"最后只输出",
+		"最终只输出",
+		"完成后只输出",
+		"最后仅输出",
+		"最终仅输出",
+		"完成后仅输出",
+		"only output",
+		"output only",
+	} {
+		if idx := strings.Index(strings.ToLower(trimmed), strings.ToLower(marker)); idx >= 0 && idx < best {
+			best = idx
+		}
+	}
+	return strings.TrimSpace(trimmed[:best])
 }
 
 func extractStyleInspectionCommands(task string) []string {
@@ -868,6 +919,7 @@ func extractWriteTargetFiles(task string) []string {
 		return nil
 	}
 	segments := splitTaskActionSegments(task)
+	knownPaths := taskFilePathPattern.FindAllString(task, -1)
 	targets := make([]string, 0, 4)
 	for _, segment := range segments {
 		lower := strings.ToLower(segment)
@@ -876,8 +928,85 @@ func extractWriteTargetFiles(task string) []string {
 			continue
 		}
 		targets = append(targets, taskFilePathPattern.FindAllString(segment[writeIdx:], -1)...)
+		if segmentWriteIntentAppliesToAllMentionedFiles(lower) {
+			targets = append(targets, taskFilePathPattern.FindAllString(segment, -1)...)
+			targets = append(targets, expandSiblingBareFileMentions(segment, knownPaths)...)
+		}
+	}
+	if taskWideWriteIntentAppliesToAllMentionedFiles(task) {
+		targets = append(targets, knownPaths...)
+		for _, segment := range segments {
+			targets = append(targets, expandSiblingBareFileMentions(segment, knownPaths)...)
+		}
 	}
 	return dedupePreserveOrder(targets)
+}
+
+func taskWideWriteIntentAppliesToAllMentionedFiles(task string) bool {
+	lowerTask := strings.ToLower(task)
+	return strings.Contains(lowerTask, "重构") || strings.Contains(lowerTask, "refactor")
+}
+
+func segmentWriteIntentAppliesToAllMentionedFiles(lowerSegment string) bool {
+	if strings.Contains(lowerSegment, "追加") && strings.Contains(lowerSegment, "测试") {
+		return true
+	}
+	if strings.Contains(lowerSegment, "add") && strings.Contains(lowerSegment, "test") {
+		return true
+	}
+	if strings.Contains(lowerSegment, "append") && strings.Contains(lowerSegment, "test") {
+		return true
+	}
+	if strings.Contains(lowerSegment, "重构") || strings.Contains(lowerSegment, "refactor") {
+		return true
+	}
+	return false
+}
+
+func expandSiblingBareFileMentions(segment string, knownPaths []string) []string {
+	if len(knownPaths) == 0 {
+		return nil
+	}
+	dirs := make([]string, 0, len(knownPaths))
+	known := make(map[string]struct{}, len(knownPaths))
+	for _, filePath := range knownPaths {
+		trimmed := strings.TrimSpace(filePath)
+		if trimmed == "" {
+			continue
+		}
+		known[trimmed] = struct{}{}
+		dir := strings.TrimSpace(path.Dir(trimmed))
+		if dir != "" && dir != "." {
+			dirs = append(dirs, dir)
+		}
+	}
+	dirs = dedupePreserveOrder(dirs)
+	if len(dirs) == 0 {
+		return nil
+	}
+	fullMatches := taskFilePathPattern.FindAllString(segment, -1)
+	fullInSegment := make(map[string]struct{}, len(fullMatches))
+	for _, match := range fullMatches {
+		fullInSegment[match] = struct{}{}
+	}
+	resolved := make([]string, 0, 2)
+	for _, bare := range taskBareFileNamePattern.FindAllString(segment, -1) {
+		if _, ok := fullInSegment[bare]; ok {
+			continue
+		}
+		if strings.Contains(bare, "/") {
+			continue
+		}
+		for _, dir := range dirs {
+			candidate := path.Join(dir, bare)
+			resolved = append(resolved, candidate)
+			if _, ok := known[candidate]; ok {
+				break
+			}
+			break
+		}
+	}
+	return dedupePreserveOrder(resolved)
 }
 
 func firstKeywordIndex(text string, keywords []string) int {
@@ -1255,6 +1384,9 @@ func isLikelyTaskShellCommand(text string) bool {
 	if candidate == "" {
 		return false
 	}
+	if looksLikeOutputLabelDescription(candidate) {
+		return false
+	}
 	lower := strings.ToLower(candidate)
 	for _, prefix := range taskShellCommandPrefixes {
 		if strings.HasPrefix(lower, prefix) {
@@ -1262,6 +1394,25 @@ func isLikelyTaskShellCommand(text string) bool {
 		}
 	}
 	return false
+}
+
+func looksLikeOutputLabelDescription(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	idx := strings.Index(trimmed, ":")
+	if idx < 1 || idx > 24 {
+		return false
+	}
+	label := trimmed[:idx]
+	if label != strings.ToUpper(label) {
+		return false
+	}
+	for _, r := range label {
+		if (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func extractRequiredOutputLabels(task string) []string {

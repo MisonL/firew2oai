@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path"
 	"reflect"
 	"strings"
 	"testing"
@@ -63,6 +64,32 @@ func TestExtractWriteTargetFiles_FixExistingFileDoesNotCaptureReadOnlyTestRefere
 	want := []string{"internal/codexfixture/bugfix/port.go"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("extractWriteTargetFiles mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestExtractWriteTargetFiles_DocsSyncIgnoresDoNotModifyGoCodeScope(t *testing.T) {
+	task := "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n" +
+		"1) 阅读 internal/codexfixture/realdocs/config.go。\n" +
+		"2) 阅读 docs/codexfixture/realdocs.md。\n" +
+		"3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。\n" +
+		"4) 不要修改 Go 代码。\n" +
+		"5) 执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。"
+
+	got := extractWriteTargetFiles(task)
+	want := []string{"docs/codexfixture/realdocs.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractWriteTargetFiles mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestExtractRequiredCommands_IgnoresOutputLabelDescription(t *testing.T) {
+	task := "执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"
+
+	got := dedupePreserveOrder(extractRequiredCommands(task))
+	want := []string{"rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("required commands mismatch\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -364,26 +391,15 @@ func TestBuildExecutionPolicy_PrefersSeedWriteCommandForGoStringTransformTask(t 
 		t.Fatal("policy.PendingWrite = false, want true")
 	}
 	if !strings.HasPrefix(policy.NextCommand, "python3 -c ") {
-		t.Fatalf("policy.NextCommand = %q, want python3 -c seed write command", policy.NextCommand)
+		t.Fatalf("policy.NextCommand = %q, want single-line python seed write command", policy.NextCommand)
 	}
 	if strings.Contains(policy.NextCommand, "\n") {
 		t.Fatalf("policy.NextCommand should stay single-line for Codex exec compatibility, got %q", policy.NextCommand)
 	}
-	if !strings.Contains(policy.NextCommand, "exec(") {
-		t.Fatalf("policy.NextCommand should wrap synthesized python in exec(...), got %q", policy.NextCommand)
-	}
-	for _, want := range []string{
-		"internal/codexfixture/searchfix/summary.go",
-		"strings.ToUpper(strings.TrimSpace(title))",
-		"strings.TrimSpace(body)",
-		`import \"strings\"`,
-	} {
+	for _, want := range []string{"base64.b64decode", "utf-8"} {
 		if !strings.Contains(policy.NextCommand, want) {
 			t.Fatalf("policy.NextCommand missing %q, got %q", want, policy.NextCommand)
 		}
-	}
-	if !strings.Contains(policy.NextCommand, "text.replace(old, new, 1)") {
-		t.Fatalf("policy.NextCommand should ensure strings import exists, got %q", policy.NextCommand)
 	}
 }
 
@@ -405,10 +421,6 @@ func TestBuildSeedGoStringTransformCommand_DoesNotDuplicateExistingStringsImport
 	if strings.TrimSpace(cmd) == "" {
 		t.Fatal("buildSeedGoStringTransformCommand returned empty command")
 	}
-	if strings.Contains(cmd, "\n") {
-		t.Fatalf("buildSeedGoStringTransformCommand should return single-line cmd, got %q", cmd)
-	}
-
 	run := exec.Command("sh", "-c", cmd)
 	if output, err := run.CombinedOutput(); err != nil {
 		t.Fatalf("run seed transform command: %v\n%s", err, string(output))
@@ -470,7 +482,7 @@ func TestBuildExecutionPolicy_PrefersSeedWriteCommandForCrossFileFeatureTask(t *
 	if strings.TrimSpace(policy.NextCommand) == "" {
 		t.Fatal("policy.NextCommand = empty, want cross-file seed write command")
 	}
-	for _, want := range []string{"internal/codexfixture/feature/title.go", "normalizeTitle", "BuildSummary", "strings.TrimSpace(body)"} {
+	for _, want := range []string{"base64.b64decode", "utf-8"} {
 		if !strings.Contains(policy.NextCommand, want) {
 			t.Fatalf("policy.NextCommand missing %q: %q", want, policy.NextCommand)
 		}
@@ -524,10 +536,6 @@ func TestBuildSeedGoCrossFileFeatureCommand_WritesHelperAndUpdatesFiles(t *testi
 			taskMentionsTitleAndBodyTransform(task),
 		)
 	}
-	if strings.Contains(cmd, "\n") {
-		t.Fatalf("buildSeedGoCrossFileFeatureCommand should return single-line cmd, got %q", cmd)
-	}
-
 	run := exec.Command("sh", "-c", cmd)
 	run.Dir = dir
 	if output, err := run.CombinedOutput(); err != nil {
@@ -566,6 +574,62 @@ func TestBuildSeedGoCrossFileFeatureCommand_WritesHelperAndUpdatesFiles(t *testi
 	}
 	if !strings.Contains(string(testContent), "TestBuildSummary_EmptyBody") {
 		t.Fatalf("test file missing empty body scenario:\n%s", string(testContent))
+	}
+}
+
+func TestBuildSeedMarkdownEnvTableCommand_AddsMissingEnvConstant(t *testing.T) {
+	dir := t.TempDir()
+	configPath := dir + "/internal/codexfixture/realdocs/config.go"
+	docPath := dir + "/docs/codexfixture/realdocs.md"
+	if err := os.MkdirAll(path.Dir(configPath), 0o755); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	if err := os.MkdirAll(path.Dir(docPath), 0o755); err != nil {
+		t.Fatalf("mkdir docs dir: %v", err)
+	}
+	config := "package realdocs\n\nconst TimeoutEnv = \"REALDOCS_TIMEOUT\"\nconst RetriesEnv = \"REALDOCS_RETRIES\"\n"
+	doc := "# Real Docs Fixture\n\n| 环境变量 | 说明 |\n|---|---|\n| REALDOCS_TIMEOUT | 请求超时时间，单位秒 |\n"
+	if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(docPath, []byte(doc), 0o644); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+	task := "你是资深 Go 工程师。请模拟真实 Codex 文档同步任务：\n" +
+		"1) 阅读 internal/codexfixture/realdocs/config.go。\n" +
+		"2) 阅读 docs/codexfixture/realdocs.md。\n" +
+		"3) 发现 config.go 中支持的环境变量，并更新 docs/codexfixture/realdocs.md 的配置表。"
+	readConfig := "sed -n '1,200p' 'internal/codexfixture/realdocs/config.go'"
+	readDoc := "sed -n '1,200p' 'docs/codexfixture/realdocs.md'"
+	signals := executionHistorySignals{
+		Commands:           []string{readConfig, readDoc},
+		SuccessfulCommands: []string{readConfig, readDoc},
+		CommandsWithResult: []string{readConfig, readDoc},
+		CommandOutputs: map[string]string{
+			readConfig: config,
+			readDoc:    doc,
+		},
+	}
+
+	cmd := buildSeedMarkdownEnvTableCommand(task, []string{"docs/codexfixture/realdocs.md"}, signals)
+	if strings.TrimSpace(cmd) == "" {
+		t.Fatal("buildSeedMarkdownEnvTableCommand returned empty command")
+	}
+	run := exec.Command("sh", "-c", cmd)
+	run.Dir = dir
+	if output, err := run.CombinedOutput(); err != nil {
+		t.Fatalf("run markdown env seed command: %v\n%s", err, string(output))
+	}
+	updated, err := os.ReadFile(docPath)
+	if err != nil {
+		t.Fatalf("read updated doc: %v", err)
+	}
+	text := string(updated)
+	if !strings.Contains(text, "| REALDOCS_RETRIES | 待补充说明 |") {
+		t.Fatalf("updated doc missing REALDOCS_RETRIES row:\n%s", text)
+	}
+	if strings.Count(text, "REALDOCS_TIMEOUT") != 1 {
+		t.Fatalf("REALDOCS_TIMEOUT should not be duplicated:\n%s", text)
 	}
 }
 

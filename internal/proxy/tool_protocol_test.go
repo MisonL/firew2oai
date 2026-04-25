@@ -906,6 +906,38 @@ func TestParseToolCallOutputs_NormalizesDocforkSearchDocsDocsAlias(t *testing.T)
 	}
 }
 
+func TestParseToolCallOutputs_InfersDocforkLibraryFromQuery(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"query\":\"react useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["library"] != "react" {
+		t.Fatalf("library = %v, want react", arguments["library"])
+	}
+	if arguments["query"] != "react useEffectEvent" {
+		t.Fatalf("query = %v, want react useEffectEvent", arguments["query"])
+	}
+}
+
 func TestParseToolCallOutputs_LegacyJSONSequence(t *testing.T) {
 	result := parseToolCallOutputs(
 		"{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,5p' README.md\"}}\n{\"type\":\"function_call\",\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '170,260p' internal/proxy/tool_protocol.go\"}}",
@@ -1392,6 +1424,33 @@ func TestExtractAIActionsBlock_AcceptsCompatStartMarker(t *testing.T) {
 	}
 	if block.JSONText != "{\"mode\":\"final\"}" {
 		t.Fatalf("json text = %q", block.JSONText)
+	}
+}
+
+func TestParseToolCallOutputs_AcceptsCompatEndMarkerTypo(t *testing.T) {
+	text := "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"query\":\"react useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>}"
+	allowedTools := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+
+	result := parseToolCallOutputs(text, allowedTools, "")
+	if result.err != nil {
+		t.Fatalf("parseToolCallOutputs error = %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("len(result.calls) = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["library"] != "react" {
+		t.Fatalf("library = %v, want react", arguments["library"])
 	}
 }
 

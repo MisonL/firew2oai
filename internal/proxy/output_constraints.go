@@ -42,6 +42,9 @@ func enforceTaskOutputConstraints(task, text string, evidence executionEvidence,
 	trimmed := strings.TrimSpace(text)
 	strictOutputGate := isStrictOutputGateEnabled()
 	requiredLabels := dedupePreserveOrder(extractRequiredOutputLabels(task))
+	if len(requiredLabels) == 0 && taskRequestsReadOnlyDiagnosis(task) {
+		requiredLabels = []string{"RESULT", "FILES", "TEST", "NOTE"}
+	}
 	if fallbackLabels := fallbackRequiredLabelsFromText(trimmed); len(fallbackLabels) > 0 {
 		requiredLabels = fallbackLabels
 	}
@@ -534,6 +537,9 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 	switch strings.ToUpper(strings.TrimSpace(label)) {
 	case "RESULT":
 		hasExplicitFailure := hasExplicitOutcomeFailure(task, text, evidence)
+		if taskCompletionSatisfied(task, evidence) && allObservedOutputsSucceeded(evidence) {
+			hasExplicitFailure = false
+		}
 		if taskRequiresConcreteNotePayload(task) && hasExecutionEvidence(evidence) {
 			if snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs)); noteLooksLikeUnresolvedPayload(snippet) {
 				return "FAIL", true
@@ -593,6 +599,9 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		if taskRequestsNotApplicableLabel(task, label) {
 			return "N/A", true
 		}
+		if taskRequestsReadOnlyDiagnosis(task) {
+			return "已执行诊断测试并观察到失败输出。", true
+		}
 		if !taskCompletionSatisfied(task, evidence) {
 			return "未完成任务要求的验证命令，当前不能判定测试通过。", true
 		}
@@ -615,6 +624,19 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		if len(targets) == 0 {
 			targets = splitFileLabelCandidates(extractRequiredOutputLabelHint(task, "FILES"))
 		}
+		if len(targets) == 0 && !taskRequestsReadOnlyDiagnosis(task) {
+			targets = dedupePreserveOrder(taskFilePathPattern.FindAllString(task, -1))
+		}
+		if len(targets) == 0 && taskRequestsReadOnlyDiagnosis(task) {
+			for _, command := range evidence.Commands {
+				if !isReadOnlyCommand(command) {
+					continue
+				}
+				if filePath := strings.TrimSpace(taskFilePathPattern.FindString(command)); filePath != "" {
+					targets = append(targets, filePath)
+				}
+			}
+		}
 		if len(targets) == 0 {
 			targets = dedupePreserveOrder(taskFilePathPattern.FindAllString(task, -1))
 		}
@@ -636,7 +658,7 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 				return "未获得可解析的工具结果。", true
 			}
 		}
-		if taskLikelyNeedsWrite(task) && !taskCompletionSatisfied(task, evidence) {
+		if taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task) && !taskCompletionSatisfied(task, evidence) {
 			return "任务尚未完成，仍缺少所需修改或验证步骤。", true
 		}
 		targets := extractWriteTargetFiles(task)
@@ -1128,13 +1150,30 @@ func shouldInferReadOnlyProbeCompletion(task, text string, evidence executionEvi
 }
 
 func shouldInferReadOnlyStructuredCompletion(task, text string, evidence executionEvidence) bool {
-	if taskLikelyNeedsWrite(task) || !taskRequestsNotApplicableLabel(task, "TEST") {
+	if taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task) {
 		return false
+	}
+	if !taskRequestsNotApplicableLabel(task, "TEST") && !taskRequestsReadOnlyDiagnosis(task) {
+		return false
+	}
+	if taskRequestsReadOnlyDiagnosis(task) {
+		return hasExecutionEvidence(evidence)
 	}
 	if hasExplicitOutcomeFailure(task, text, evidence) {
 		return false
 	}
 	return true
+}
+
+func taskRequestsReadOnlyDiagnosis(task string) bool {
+	lower := strings.ToLower(strings.Join(strings.Fields(task), " "))
+	if strings.Contains(task, "不要修改任何文件") && strings.Contains(task, "失败根因") {
+		return true
+	}
+	if strings.Contains(task, "只读") && strings.Contains(task, "诊断") {
+		return true
+	}
+	return strings.Contains(lower, "read-only") && strings.Contains(lower, "diagnos")
 }
 
 func hasExplicitOutcomeFailure(task, text string, evidence executionEvidence) bool {

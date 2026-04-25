@@ -2179,12 +2179,6 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if executionPolicy.PendingWrite && toolChoice.RequiredTool == "" && !toolChoice.DisableTools {
 		preferredMutationTools := availableMutationToolNames(toolCatalog)
 		toolConstraints.PreferredToolNames = preferredMutationTools
-		if executionPolicy.AllRequiredFilesSeen {
-			if forced := preferredPendingWriteTool(preferredMutationTools); forced != "" {
-				toolConstraints.RequiredTool = forced
-				toolConstraints.RequireTool = true
-			}
-		}
 	}
 	if disableToolsForFinalize {
 		toolConstraints.RequiredTool = ""
@@ -2878,10 +2872,16 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 	if scanErr != nil {
 		return "", false
 	}
-	if strings.TrimSpace(task) == "" || taskLikelyNeedsWrite(task) {
+	if strings.TrimSpace(task) == "" || (taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task)) {
 		return "", false
 	}
 	if len(extractRequiredOutputLabels(task)) == 0 {
+		if shouldInferReadOnlyStructuredCompletion(task, "", evidence) && taskCompletionSatisfied(task, evidence) {
+			finalText := strings.TrimSpace(constrainFinalText(task, "", evidence, checkControlMarkup))
+			if finalText != "" && !strings.HasPrefix(finalText, "Codex adapter error:") {
+				return finalText, true
+			}
+		}
 		if !taskCompletionSatisfied(task, evidence) || !allObservedOutputsSucceeded(evidence) {
 			return "", false
 		}
@@ -2895,7 +2895,9 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 		return "", false
 	}
 	if !taskCompletionSatisfied(task, evidence) || !allObservedOutputsSucceeded(evidence) {
-		return "", false
+		if !shouldInferReadOnlyStructuredCompletion(task, "", evidence) || !taskRequestsReadOnlyDiagnosis(task) {
+			return "", false
+		}
 	}
 	finalText := strings.TrimSpace(constrainFinalText(task, "", evidence, checkControlMarkup))
 	if finalText == "" || strings.HasPrefix(finalText, "Codex adapter error:") {
