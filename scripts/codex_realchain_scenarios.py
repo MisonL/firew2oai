@@ -153,7 +153,7 @@ SCENARIOS = (
             "TEST: N/A\n"
             "NOTE: 你是否先成功调用了 update_plan"
         ),
-        expected_operations=("README.md",),
+        expected_operations=("mcp__docfork__search_docs", "mcp__docfork__fetch_doc", "README.md"),
         expected_files=(),
         capabilities=("planning", "read", "structured_final"),
         required_tools=("update_plan", "exec_command"),

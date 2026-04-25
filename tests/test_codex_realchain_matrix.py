@@ -15,21 +15,58 @@ if str(SCRIPTS_DIR) not in sys.path:
 import codex_realchain_matrix as matrix
 
 
+class FakePopen:
+    def __init__(self, timeout_on_first_communicate: bool = False, wait_times_out: bool = False) -> None:
+        self.pid = 12345
+        self.returncode = 0
+        self.communicate_input = None
+        self.communicate_count = 0
+        self.timeout_on_first_communicate = timeout_on_first_communicate
+        self.wait_times_out = wait_times_out
+
+    def communicate(self, input=None, timeout=None):
+        self.communicate_input = input
+        self.communicate_count += 1
+        if self.timeout_on_first_communicate and self.communicate_count == 1:
+            raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout, output=b"partial out", stderr=b"partial err")
+        return "", ""
+
+    def wait(self, timeout=None):
+        if self.wait_times_out:
+            raise subprocess.TimeoutExpired(cmd=["codex"], timeout=timeout)
+        self.returncode = -15
+        return self.returncode
+
+
 class RunHelperTests(TestCase):
     def test_run_closes_stdin_by_default(self) -> None:
-        with patch("subprocess.run") as mock_run:
+        fake_proc = FakePopen()
+        with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
             matrix.run(["codex", "exec", "hello"], cwd=REPO_ROOT, timeout=30)
 
-        _, kwargs = mock_run.call_args
+        _, kwargs = mock_popen.call_args
         self.assertIs(kwargs.get("stdin"), subprocess.DEVNULL)
+        self.assertTrue(kwargs.get("start_new_session"))
 
     def test_run_passes_input_text_without_explicit_stdin(self) -> None:
-        with patch("subprocess.run") as mock_run:
+        fake_proc = FakePopen()
+        with patch("subprocess.Popen", return_value=fake_proc) as mock_popen:
             matrix.run(["git", "apply", "-"], cwd=REPO_ROOT, timeout=30, input_text="patch")
 
-        _, kwargs = mock_run.call_args
-        self.assertNotIn("stdin", kwargs)
-        self.assertEqual(kwargs.get("input"), "patch")
+        _, kwargs = mock_popen.call_args
+        self.assertIs(kwargs.get("stdin"), subprocess.PIPE)
+        self.assertEqual(fake_proc.communicate_input, "patch")
+
+    def test_run_kills_process_group_on_timeout(self) -> None:
+        fake_proc = FakePopen(timeout_on_first_communicate=True, wait_times_out=True)
+        with patch("subprocess.Popen", return_value=fake_proc), patch("os.killpg") as mock_killpg:
+            result = matrix.run(["codex", "exec", "slow"], cwd=REPO_ROOT, timeout=1)
+
+        self.assertEqual(result.returncode, -9)
+        self.assertIn("partial out", result.stdout)
+        self.assertIn("partial err", result.stderr)
+        self.assertIn("timeout after 1s", result.stderr)
+        self.assertEqual(mock_killpg.call_count, 2)
 
     def test_resolve_codex_executable_uses_env_override(self) -> None:
         with patch.dict("os.environ", {"CODEX_MATRIX_CODEX_BIN": "/tmp/codex"}, clear=False):
