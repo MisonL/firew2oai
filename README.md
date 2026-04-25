@@ -13,8 +13,20 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 
 ## 当前验证状态
 
-核对日期：2026-04-24  
+核对日期：2026-04-25
 当前以真实链路证据为准，区分 `Codex -> new-api -> firew2oai` 与 `Codex -> firew2oai` 两种口径，不再混写。
+
+### 最新聚焦复测：Docfork MCP 场景
+
+| 项目 | 结果 |
+|---|---|
+| 链路 | `Codex -> new-api -> firew2oai` |
+| 接口 | `wire_api=responses` |
+| 场景 | `real_docfork_api_lookup` |
+| 主证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260425-133952/summary.tsv` |
+| 当前结论 | `11 ok / 1 fail`，`qwen3-vl-30b-a3b-thinking` 因 `stdin_read_loop_timeout` 未通过 |
+
+本轮修复后，Docfork 场景从此前 `0/12 PASS` 收敛到 `11/12 PASS`。已通过模型均完成 `mcp__docfork__search_docs -> mcp__docfork__fetch_doc -> exec_command 读取 README.md -> RESULT: PASS`。失败模型已有 Docfork 工具进展，但未完成 README 读取与结构化收口。
 
 ### 当前权威口径：15 维真实链路
 
