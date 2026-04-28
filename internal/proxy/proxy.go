@@ -315,13 +315,14 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	normalizedTools := normalizeChatTools(req.Tools)
 	normalizedToolChoice := normalizeChatToolChoice(req.ToolChoice)
-	toolCatalog := buildResponseToolCatalog(normalizedTools)
+	currentTask := latestUserTask(req.Messages)
+	effectiveRequestTools := augmentResponseToolsForPromptDynamic(normalizedTools, currentTask)
+	toolCatalog := buildResponseToolCatalog(effectiveRequestTools)
 	toolChoice := resolveToolChoice(normalizedToolChoice)
 	if err := validateToolChoiceConfiguration(toolChoice, toolCatalog); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", "%s", err.Error())
 		return
 	}
-	currentTask := latestUserTask(req.Messages)
 	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
 	toolConstraints := toolProtocolConstraints{
 		RequiredTool: toolChoice.RequiredTool,
@@ -329,7 +330,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		MaxCalls:     maxToolCalls,
 	}
 	bufferForToolCalls := len(toolCatalog) > 0 && !toolChoice.DisableTools
-	promptTools := toolsForPrompt(normalizedTools, toolChoice)
+	promptTools := toolsForPrompt(effectiveRequestTools, toolChoice)
 	prompt := messagesToPrompt(req.Messages)
 	if len(promptTools) > 0 || len(normalizedToolChoice) > 0 {
 		prompt = buildChatPrompt(req.Messages, promptTools, normalizedToolChoice, maxToolCalls)
@@ -879,8 +880,8 @@ func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	w.Write(data)
-	w.Write([]byte("\n"))
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func writeError(w http.ResponseWriter, status int, errType string, errCode string, format string, args ...interface{}) {
@@ -906,8 +907,8 @@ func writeError(w http.ResponseWriter, status int, errType string, errCode strin
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	w.Write(data)
-	w.Write([]byte("\n"))
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 type routeDurationMetrics struct {

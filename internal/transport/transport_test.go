@@ -93,7 +93,7 @@ func TestStreamPost_UpstreamNon200(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for non-200 status")
 		if reader != nil {
-			reader.Close()
+			_ = reader.Close()
 		}
 	}
 	// Verify error mentions the status code
@@ -123,7 +123,9 @@ func TestStreamPost_RetriesTransientStatusBeforeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamPost error = %v, want nil", err)
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
@@ -151,7 +153,9 @@ func TestStreamPost_RetriesInternalServerErrorBeforeSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamPost error = %v, want nil", err)
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
@@ -210,7 +214,9 @@ func TestStreamPost_RetriesSendRequestErrorOnce(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StreamPost error = %v, want nil", err)
 	}
-	defer reader.Close()
+	defer func() {
+		_ = reader.Close()
+	}()
 	if attempts != 2 {
 		t.Fatalf("attempts = %d, want 2", attempts)
 	}

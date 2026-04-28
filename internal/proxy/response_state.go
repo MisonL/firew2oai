@@ -85,14 +85,6 @@ func cloneMessages(messages []ChatMessage) []ChatMessage {
 	return cloned
 }
 
-func responseConversation(input []ChatMessage, assistantText string) []ChatMessage {
-	conversation := cloneMessages(input)
-	if assistantText != "" {
-		conversation = append(conversation, ChatMessage{Role: "assistant", Content: assistantText})
-	}
-	return conversation
-}
-
 func cloneRawItems(items []json.RawMessage) []json.RawMessage {
 	if len(items) == 0 {
 		return nil

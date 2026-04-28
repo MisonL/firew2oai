@@ -588,8 +588,12 @@ func (hr *hijackRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 
 func TestResponseWriterHijackPassthrough(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
-	defer serverConn.Close()
-	defer clientConn.Close()
+	defer func() {
+		_ = serverConn.Close()
+	}()
+	defer func() {
+		_ = clientConn.Close()
+	}()
 
 	rec := &hijackRecorder{
 		ResponseRecorder: httptest.NewRecorder(),
@@ -1131,7 +1135,7 @@ func TestHandleNonStream_UpstreamIncomplete(t *testing.T) {
 		flusher.Flush()
 
 		// Send some content but NO done event
-		w.Write([]byte("data: {\"type\":\"content\",\"content\":\"partial\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"partial\"}\n\n"))
 		flusher.Flush()
 		// Stream ends here — no done event
 	}))

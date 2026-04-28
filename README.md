@@ -23,10 +23,10 @@ firew2oai 是一个 OpenAI 兼容转换代理。它把 Fireworks 网页聊天接
 | 链路 | `Codex -> new-api -> firew2oai` |
 | 接口 | `wire_api=responses` |
 | 场景 | `real_docfork_api_lookup` |
-| 主证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260425-133952/summary.tsv` |
-| 当前结论 | `11 ok / 1 fail`，`qwen3-vl-30b-a3b-thinking` 因 `stdin_read_loop_timeout` 未通过 |
+| 主证据 | `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260425-213408/summary.tsv` |
+| 当前结论 | `12 ok / 0 fail`，全部模型完成 Docfork MCP 调用、README 读取与结构化收口 |
 
-本轮修复后，Docfork 场景从此前 `0/12 PASS` 收敛到 `11/12 PASS`。已通过模型均完成 `mcp__docfork__search_docs -> mcp__docfork__fetch_doc -> exec_command 读取 README.md -> RESULT: PASS`。失败模型已有 Docfork 工具进展，但未完成 README 读取与结构化收口。
+本轮修复后，Docfork 场景从此前 `0/12 PASS` 收敛到 `12/12 PASS`。全部模型均完成 `mcp__docfork__search_docs -> mcp__docfork__fetch_doc -> exec_command 读取 README.md -> RESULT: PASS`。`qwen3-vl-30b-a3b-thinking` 仍是长尾样本，最新全矩阵耗时 `275.8s`，但已不再因工具循环或初始非工具叙述失败。
 
 ### 当前权威口径：15 维真实链路
 

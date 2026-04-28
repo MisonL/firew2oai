@@ -22,7 +22,8 @@ var (
 
 	sseScanBufferPool = sync.Pool{
 		New: func() any {
-			return make([]byte, initialSSEScanBufferSize)
+			buffer := make([]byte, initialSSEScanBufferSize)
+			return &buffer
 		},
 	}
 
@@ -200,10 +201,12 @@ func rolePrefix(role string) string {
 // Returns (hasContent, error) where hasContent indicates if any content was emitted.
 func scanSSEEvents(reader io.Reader, isThinking, showThinking bool, onEvent func(sseContentEvent) bool) (bool, error) {
 	scanner := bufio.NewScanner(reader)
-	scanBuffer := sseScanBufferPool.Get().([]byte)
+	scanBufferPtr := sseScanBufferPool.Get().(*[]byte)
+	scanBuffer := *scanBufferPtr
 	scanner.Buffer(scanBuffer[:initialSSEScanBufferSize], maxSSEScanTokenSize)
 	defer func() {
-		sseScanBufferPool.Put(scanBuffer[:initialSSEScanBufferSize])
+		*scanBufferPtr = scanBuffer[:initialSSEScanBufferSize]
+		sseScanBufferPool.Put(scanBufferPtr)
 	}()
 
 	state := thinkingScanState{inThinking: isThinking}

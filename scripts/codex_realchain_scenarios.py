@@ -153,7 +153,7 @@ SCENARIOS = (
             "TEST: N/A\n"
             "NOTE: 你是否先成功调用了 update_plan"
         ),
-        expected_operations=("mcp__docfork__search_docs", "mcp__docfork__fetch_doc", "README.md"),
+        expected_operations=("head -n 3 README.md",),
         expected_files=(),
         capabilities=("planning", "read", "structured_final"),
         required_tools=("update_plan", "exec_command"),
@@ -275,7 +275,7 @@ SCENARIOS = (
             "你是测试代理。请验证 view_image：\n"
             "1) 必须先使用 exec_command 执行 `pwd`，读取当前工作目录绝对路径。\n"
             "2) 然后必须使用 view_image 查看 internal/codexfixture/assets/red.png。\n"
-            "3) 不要修改任何文件。\n"
+            "4) 不要修改任何文件。\n"
             "最后只输出四行，不要有任何额外内容：\n"
             "RESULT: PASS 或 FAIL\n"
             "FILES: internal/codexfixture/assets/red.png\n"
@@ -327,6 +327,50 @@ SCENARIOS = (
         capabilities=("mcp_resources", "structured_final"),
         required_tools=("list_mcp_resources", "list_mcp_resource_templates"),
         expected_signals=("list_mcp_resources", "list_mcp_resource_templates"),
+        expect_clean_diff=True,
+    ),
+)
+
+
+BUILTIN_TOOL_SCENARIOS = (
+    Scenario(
+        name="mcp_resource_read_probe",
+        prompt=(
+            "你是测试代理。请验证 MCP resource 读取工具链：\n"
+            "1) 必须调用 read_mcp_resource 读取本地 fixture 资源。\n"
+            "2) read_mcp_resource 的 server 参数必须是 firew2oai_fixture_resources。\n"
+            "3) read_mcp_resource 的 uri 参数必须是 fixture://firew2oai/readme。\n"
+            "4) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 资源内容。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("mcp_resources", "read_mcp_resource", "structured_final"),
+        required_tools=("read_mcp_resource",),
+        expected_signals=("read_mcp_resource",),
+        expected_final_substrings=("fixture-ok",),
+        expect_clean_diff=True,
+    ),
+    Scenario(
+        name="subagent_resume_send_probe",
+        prompt=(
+            "你是测试代理。请验证子代理恢复与追加输入工具链：\n"
+            "1) 必须使用 spawn_agent 启动一个子代理，参数字段使用 message，内容为：读取 README.md 第一行，并在回复中包含 PHASE_ONE。不要使用 instruction 字段。\n"
+            "2) 必须使用 wait_agent 等待上一步返回的 agent id，直到看到 PHASE_ONE。禁止在 wait_agent 前调用 close_agent。\n"
+            "3) 必须使用 close_agent 关闭同一个 agent id。\n"
+            "4) 必须使用 resume_agent 恢复同一个 agent id，参数字段使用 id。\n"
+            "5) 必须使用 send_input 向同一个 agent id 发送追加输入，参数字段使用 target 和 message，message 内容为：读取 README.md 第一行，并在回复中包含 PHASE_TWO。\n"
+            "6) 必须再次使用 wait_agent 等待同一个 agent id，直到看到 PHASE_TWO。禁止在第二次 wait_agent 前调用 close_agent。\n"
+            "7) 必须再次使用 close_agent 关闭同一个 agent id。\n"
+            "8) 不要修改任何文件。\n"
+            "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 是否观察到 PHASE_ONE 和 PHASE_TWO。"
+        ),
+        expected_operations=(),
+        expected_files=(),
+        capabilities=("spawn_agent", "wait_agent", "close_agent", "resume_agent", "send_input", "structured_final"),
+        required_tools=("spawn_agent", "wait_agent", "close_agent", "resume_agent", "send_input"),
+        expected_signals=("spawn_agent", "wait_agent", "close_agent", "resume_agent", "send_input"),
+        expected_final_substrings=("PHASE_ONE", "PHASE_TWO"),
         expect_clean_diff=True,
     ),
 )
@@ -546,6 +590,21 @@ func BuildTicketSummary(title, body string) string {
 }
 """,
         )
+        write_text(
+            worktree / "internal/codexfixture/searchfix/summary_test.go",
+            """package searchfix
+
+import "testing"
+
+func TestBuildTicketSummary_TrimsAndUppercases(t *testing.T) {
+\tgot := BuildTicketSummary("  firew2oai  ", " adapter ")
+\twant := "FIREW2OAI: adapter"
+\tif got != want {
+\t\tt.Fatalf("BuildTicketSummary() = %q, want %q", got, want)
+\t}
+}
+""",
+        )
     if scenario_name == "real_debug_regression":
         write_text(
             worktree / "internal/codexfixture/realdebug/parser.go",
@@ -647,21 +706,6 @@ func TestDouble(t *testing.T) {
 	if got := Double(21); got != 42 {
 		t.Fatalf("Double(21) = %d, want 42", got)
 	}
-}
-""",
-        )
-        write_text(
-            worktree / "internal/codexfixture/searchfix/summary_test.go",
-            """package searchfix
-
-import "testing"
-
-func TestBuildTicketSummary_TrimsAndUppercases(t *testing.T) {
-\tgot := BuildTicketSummary("  firew2oai  ", " adapter ")
-\twant := "FIREW2OAI: adapter"
-\tif got != want {
-\t\tt.Fatalf("BuildTicketSummary() = %q, want %q", got, want)
-\t}
 }
 """,
         )

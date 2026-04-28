@@ -14,11 +14,20 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from codex_realchain_scenarios import MODELS, REALISTIC_SCENARIOS, SCENARIOS, Scenario, prepare_fixture
+from codex_realchain_scenarios import (
+    BUILTIN_TOOL_SCENARIOS,
+    MODELS,
+    REALISTIC_SCENARIOS,
+    SCENARIOS,
+    Scenario,
+    prepare_fixture,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOL_NAMES_PATTERN = re.compile(r'tool_names="\[([^\"]*)\]"')
 CODE_FENCE_PATTERN = re.compile(r"```(?:bash|sh|shell)?\n([\s\S]*?)```", re.IGNORECASE)
+ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][A-Z0-9]|\x1b[=>]")
+EVIDENCE_FIELD_PATTERN = re.compile(r"\bevidence_(?:commands|outputs)=((?:\"[^\"]*\")|\[[^\]]*\])")
 EXPLICIT_EXECUTION_FAILURE_MARKERS = (
     "adapter error",
     "upstream error",
@@ -34,6 +43,40 @@ EXPLICIT_EXECUTION_FAILURE_MARKERS = (
     "process exited with code 2",
     "process exited with code 126",
     "process exited with code 127",
+)
+WRITE_STDIN_RUNTIME_FAILURE_MARKERS = (
+    "unknown process id",
+    "write_stdin failed",
+)
+PROMPT_DYNAMIC_REQUIRED_TOOLS = {
+    "apply_patch",
+}
+EVIDENCE_SIGNAL_TOKENS = (
+    "apply_patch",
+    "close_agent",
+    "exec_command",
+    "js_repl_reset",
+    "js_repl",
+    "list_mcp_resource_templates",
+    "list_mcp_resources",
+    "read_mcp_resource",
+    "request_user_input",
+    "resume_agent",
+    "send_input",
+    "spawn_agent",
+    "update_plan",
+    "view_image",
+    "wait_agent",
+    "web_search",
+    "write_stdin",
+)
+CODEX_HOME_SUPPORT_ENTRIES = (
+    ".tmp",
+    "memories",
+    "plugins",
+    "skills",
+    "superpowers",
+    "vendor_imports",
 )
 
 
@@ -112,11 +155,109 @@ def configure_codex_home(output_dir: Path) -> None:
     explicit = os.environ.get("CODEX_MATRIX_CODEX_HOME", "").strip()
     if explicit == "":
         return
+    source_home = resolve_base_codex_home(os.environ.get("CODEX_HOME", "").strip())
     home = Path(explicit)
     if not home.is_absolute():
         home = output_dir / home
     home.mkdir(parents=True, exist_ok=True)
+    link_base_codex_home_entries(home, source_home)
     os.environ["CODEX_HOME"] = str(home)
+
+
+def resolve_base_codex_home(current_home: str) -> Path:
+    explicit = os.environ.get("CODEX_MATRIX_BASE_CODEX_HOME", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    if current_home:
+        return Path(current_home).expanduser()
+    return Path.home() / ".codex"
+
+
+def link_base_codex_home_entries(target_home: Path, source_home: Path) -> None:
+    if not env_flag_enabled("CODEX_MATRIX_INHERIT_CODEX_HOME", True):
+        return
+    try:
+        if target_home.resolve() == source_home.resolve():
+            return
+    except OSError:
+        return
+    for entry in CODEX_HOME_SUPPORT_ENTRIES:
+        source = source_home / entry
+        target = target_home / entry
+        if not source.exists() or target.exists():
+            continue
+        target.symlink_to(source, target_is_directory=source.is_dir())
+
+
+def read_matrix_bearer_token() -> str:
+    token_file = os.environ.get("CODEX_MATRIX_BEARER_TOKEN_FILE", "").strip()
+    if token_file:
+        return Path(token_file).read_text(encoding="utf-8").strip()
+    return os.environ.get("CODEX_MATRIX_BEARER_TOKEN", "").strip()
+
+
+def read_base_codex_config(codex_home: Path) -> str:
+    if not env_flag_enabled("CODEX_MATRIX_INHERIT_CODEX_CONFIG", True):
+        return ""
+    explicit = os.environ.get("CODEX_MATRIX_BASE_CODEX_CONFIG", "").strip()
+    config_path = Path(explicit).expanduser() if explicit else resolve_base_codex_home("").joinpath("config.toml")
+    if not config_path.exists():
+        return ""
+    try:
+        if config_path.resolve() == (codex_home / "config.toml").resolve():
+            return ""
+    except OSError:
+        return ""
+    return config_path.read_text(encoding="utf-8")
+
+
+def build_provider_config_block(provider_name: str, base_url: str, bearer_token: str, wire_api: str) -> str:
+    block = (
+        f"[model_providers.{provider_name}]\n"
+        f"name = {json.dumps(provider_name)}\n"
+        f"base_url = {json.dumps(base_url)}\n"
+        f"experimental_bearer_token = {json.dumps(bearer_token)}\n"
+    )
+    if wire_api:
+        block += f"wire_api = {json.dumps(wire_api)}\n"
+    return block
+
+
+def build_fixture_mcp_config_block() -> str:
+    server_path = REPO_ROOT / "scripts" / "codex_mcp_resource_fixture.mjs"
+    return (
+        "[mcp_servers.firew2oai_fixture_resources]\n"
+        f"command = {json.dumps(shutil.which('node') or 'node')}\n"
+        f"args = [{json.dumps(str(server_path))}]\n"
+    )
+
+
+def configure_codex_provider_config() -> None:
+    if not env_flag_enabled("CODEX_MATRIX_WRITE_PROVIDER_CONFIG", False):
+        return
+
+    provider_name = os.environ.get("CODEX_MATRIX_PROVIDER", "").strip()
+    base_url = os.environ.get("CODEX_MATRIX_BASE_URL", "").strip()
+    bearer_token = read_matrix_bearer_token()
+    wire_api = os.environ.get("CODEX_MATRIX_WIRE_API", "").strip()
+    codex_home = os.environ.get("CODEX_HOME", "").strip()
+    if not provider_name or not base_url or not bearer_token or not codex_home:
+        raise RuntimeError("CODEX_MATRIX_WRITE_PROVIDER_CONFIG requires provider, base_url, bearer token, and CODEX_HOME")
+
+    config_path = Path(codex_home) / "config.toml"
+    config_text = read_base_codex_config(Path(codex_home))
+    provider_header = f"[model_providers.{provider_name}]"
+    if provider_header in config_text:
+        raise RuntimeError(f"CODEX_MATRIX_PROVIDER already exists in inherited config: {provider_name}")
+    if config_text and not config_text.endswith("\n"):
+        config_text += "\n"
+    if config_text:
+        config_text += "\n"
+    config_text += build_provider_config_block(provider_name, base_url, bearer_token, wire_api)
+    if env_flag_enabled("CODEX_MATRIX_ENABLE_FIXTURE_MCP", False):
+        config_text += "\n" + build_fixture_mcp_config_block()
+    config_path.write_text(config_text, encoding="utf-8")
+    config_path.chmod(0o600)
 
 
 def configure_child_tool_environment() -> None:
@@ -144,6 +285,13 @@ def append_config_override(cmd: list[str], key: str, value: str) -> None:
     cmd.extend(["-c", f"{key}={value}"])
 
 
+def append_feature_overrides(cmd: list[str]) -> None:
+    for feature in split_declared_tools(os.environ.get("CODEX_MATRIX_ENABLE_FEATURES", "")):
+        cmd.extend(["--enable", feature])
+    for feature in split_declared_tools(os.environ.get("CODEX_MATRIX_DISABLE_FEATURES", "")):
+        cmd.extend(["--disable", feature])
+
+
 def build_codex_exec_command(codex_executable: str, worktree: Path, last_path: Path, model: str, prompt: str) -> list[str]:
     cmd = [
         codex_executable,
@@ -157,6 +305,7 @@ def build_codex_exec_command(codex_executable: str, worktree: Path, last_path: P
         "-o",
         str(last_path),
     ]
+    append_feature_overrides(cmd)
 
     profile = os.environ.get("CODEX_MATRIX_PROFILE", "").strip()
     if profile:
@@ -172,7 +321,7 @@ def build_codex_exec_command(codex_executable: str, worktree: Path, last_path: P
         append_config_override(cmd, f"model_providers.{provider_name}.base_url", json.dumps(base_url))
 
     bearer_token = os.environ.get("CODEX_MATRIX_BEARER_TOKEN", "").strip()
-    if provider_name and bearer_token:
+    if provider_name and bearer_token and not env_flag_enabled("CODEX_MATRIX_WRITE_PROVIDER_CONFIG", False):
         append_config_override(
             cmd,
             f"model_providers.{provider_name}.experimental_bearer_token",
@@ -300,8 +449,11 @@ def extract_terminal_jsonl_message(jsonl_path: Path) -> str:
     return latest
 
 
-def last_command_success_by_expected_operation(jsonl_path: Path) -> dict[str, bool]:
+def last_command_success_by_expected_operation(jsonl_path: Path, expected_operations: tuple[str, ...]) -> dict[str, bool]:
     results: dict[str, bool] = {}
+    expected_command_operations = tuple(operation for operation in expected_operations if "/" in operation or " " in operation or operation in {"python3", "python", "node", "bash", "zsh", "sh"})
+    if not expected_command_operations:
+        return results
     for raw_line in jsonl_path.read_text(encoding="utf-8", errors="ignore").splitlines():
         line = raw_line.strip()
         if not line.startswith("{"):
@@ -320,7 +472,7 @@ def last_command_success_by_expected_operation(jsonl_path: Path) -> dict[str, bo
         if status not in {"completed", "failed"}:
             continue
         success = status == "completed" and item.get("exit_code") == 0
-        for operation in ("go test ./internal/codexfixture/realdebug",):
+        for operation in expected_command_operations:
             if operation in command:
                 results[operation] = success
     return results
@@ -469,12 +621,22 @@ def parse_trace_signals(jsonl_path: Path) -> tuple[list[str], str]:
             if item_type == "command_execution":
                 append_signal("exec_command")
                 command = item.get("command")
+                aggregated_output = item.get("aggregated_output")
                 if isinstance(command, str):
                     normalized_command = command.strip()
+                    if "apply_patch" in normalized_command:
+                        append_signal("apply_patch")
                     if normalized_command == "js_repl":
                         append_signal("js_repl")
                     if normalized_command == "js_repl_reset":
                         append_signal("js_repl_reset")
+                    clean_output = strip_terminal_controls(aggregated_output) if isinstance(aggregated_output, str) else ""
+                    if (
+                        "python3" in normalized_command
+                        and ">>>" in clean_output
+                        and ("print(" in clean_output or "exit(" in clean_output)
+                    ):
+                        append_signal("write_stdin")
             if item_type == "todo_list":
                 append_signal("update_plan")
             if item_type == "mcp_tool_call":
@@ -498,6 +660,10 @@ def parse_trace_signals(jsonl_path: Path) -> tuple[list[str], str]:
         name = item.get("name")
         if isinstance(name, str) and name:
             append_signal(name)
+        if item_type == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str) and "data:image/" in text:
+                append_signal("view_image")
 
     return list(dict.fromkeys(signals)), raw_text
 
@@ -513,6 +679,10 @@ def append_signal_value(signals: list[str], value: str) -> None:
 
 def normalize_inline_text(text: str) -> str:
     return " ".join(text.split())
+
+
+def strip_terminal_controls(text: str) -> str:
+    return ANSI_ESCAPE_PATTERN.sub("", text).replace("\r", "")
 
 
 def scenario_log_hint(scenario: Scenario) -> str:
@@ -547,7 +717,7 @@ def resolve_history_endpoint() -> tuple[str, str]:
 
     provider_name = os.environ.get("CODEX_MATRIX_PROVIDER", "").strip()
     base_url = os.environ.get("CODEX_MATRIX_BASE_URL", "").strip()
-    token = os.environ.get("CODEX_MATRIX_BEARER_TOKEN", "").strip()
+    token = read_matrix_bearer_token()
     if (
         provider_name in {"firew2oai", "direct-firew2oai"}
         or provider_name.startswith("firew2oai-")
@@ -592,6 +762,10 @@ def parse_response_history_signals(items: list[dict]) -> list[str]:
             name = item.get("name")
             if isinstance(name, str) and name:
                 append_signal_value(signals, name)
+            if name == "exec_command":
+                args = item.get("arguments")
+                if isinstance(args, str) and "apply_patch" in args:
+                    append_signal_value(signals, "apply_patch")
         elif item_type == "mcp_tool_call":
             server = item.get("server")
             tool = item.get("tool")
@@ -601,6 +775,47 @@ def parse_response_history_signals(items: list[dict]) -> list[str]:
                 append_signal_value(signals, tool)
             if isinstance(server, str) and server and isinstance(tool, str) and tool:
                 append_signal_value(signals, f"{server}.{tool}")
+    return list(dict.fromkeys(signals))
+
+
+def extract_evidence_field_values(line: str) -> list[str]:
+    values: list[str] = []
+    for match in EVIDENCE_FIELD_PATTERN.finditer(line):
+        raw = match.group(1).strip()
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = raw[1:-1]
+        if raw.startswith("[") and raw.endswith("]"):
+            raw = raw[1:-1]
+        values.append(raw)
+    return values
+
+
+def append_evidence_signals(signals: list[str], evidence_text: str) -> None:
+    for token in EVIDENCE_SIGNAL_TOKENS:
+        if token in evidence_text:
+            append_signal_value(signals, token)
+    for match in re.finditer(r"\bmcp__([A-Za-z0-9_]+)__([A-Za-z0-9_]+)\b", evidence_text):
+        server, tool = match.groups()
+        append_signal_value(signals, match.group(0))
+        append_signal_value(signals, server)
+        append_signal_value(signals, tool)
+
+
+def parse_evidence_history_signals(log_text: str, model: str, scenario: Scenario) -> list[str]:
+    signals: list[str] = []
+    hint = scenario_log_hint(scenario)
+    for raw_line in log_text.splitlines():
+        line = normalize_inline_text(raw_line)
+        if 'msg="responses request"' not in line:
+            continue
+        if f"model={model}" not in line:
+            continue
+        if hint and hint not in line:
+            continue
+        evidence_text = " ".join(extract_evidence_field_values(line))
+        if evidence_text == "":
+            continue
+        append_evidence_signals(signals, evidence_text)
     return list(dict.fromkeys(signals))
 
 
@@ -615,7 +830,7 @@ def collect_firew2oai_history_signals(started_at: float, model: str, scenario: S
         if not response_ids:
             return [], ""
 
-        signals: list[str] = []
+        signals: list[str] = parse_evidence_history_signals(log_text, model, scenario)
         for response_id in response_ids:
             items = load_response_input_items(response_id)
             if not items:
@@ -634,7 +849,7 @@ def collect_firew2oai_history_signals(started_at: float, model: str, scenario: S
     if not response_ids:
         return [], ""
 
-    signals: list[str] = []
+    signals: list[str] = parse_evidence_history_signals(log_text, model, scenario)
     for response_id in response_ids:
         items = load_response_input_items(response_id)
         if not items:
@@ -665,13 +880,21 @@ def build_tool_discovery_prompt(marker: str) -> str:
     )
 
 
-def detect_declared_tools(output_dir: Path, codex_executable: str, model: str, timeout_s: int) -> list[str]:
-    explicit = os.environ.get("CODEX_MATRIX_DECLARED_TOOLS", "").strip()
-    if explicit:
-        return [item.strip() for item in explicit.split(",") if item.strip()]
+def split_declared_tools(raw: str) -> list[str]:
+    return [item.strip() for item in raw.split(",") if item.strip()]
 
-    auto_detect = os.environ.get("CODEX_MATRIX_AUTO_DETECT_TOOLS", "1").strip().lower()
-    if auto_detect in {"0", "false", "no"}:
+
+def env_flag_enabled(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def discover_declared_tools(output_dir: Path, codex_executable: str, model: str, timeout_s: int) -> list[str]:
+    if not env_flag_enabled("CODEX_MATRIX_AUTO_DETECT_TOOLS", True):
         return []
 
     marker = f"TOOL_DISCOVERY_PROBE_{int(time.time())}"
@@ -696,6 +919,20 @@ def detect_declared_tools(output_dir: Path, codex_executable: str, model: str, t
             remove_worktree(worktree)
 
 
+def detect_declared_tools(output_dir: Path, codex_executable: str, model: str, timeout_s: int) -> list[str]:
+    explicit_tools = split_declared_tools(os.environ.get("CODEX_MATRIX_DECLARED_TOOLS", ""))
+    if explicit_tools and env_flag_enabled("CODEX_MATRIX_TRUST_DECLARED_TOOLS", False):
+        return explicit_tools
+
+    observed_tools = discover_declared_tools(output_dir, codex_executable, model, timeout_s)
+    if explicit_tools and observed_tools:
+        observed = set(observed_tools)
+        return [tool for tool in explicit_tools if tool in observed]
+    if explicit_tools:
+        return explicit_tools
+    return observed_tools
+
+
 def filter_declared_tools_for_matrix(tools: list[str]) -> list[str]:
     raw = os.environ.get("CODEX_MATRIX_ALLOWED_MCP_TOOLS", "chrome-devtools,docfork").strip()
     if raw == "":
@@ -714,7 +951,14 @@ def filter_declared_tools_for_matrix(tools: list[str]) -> list[str]:
 def unsupported_required_tools(scenario: Scenario, available_tools: set[str]) -> list[str]:
     if not available_tools:
         return []
-    return [tool for tool in scenario.required_tools if tool not in available_tools]
+    missing: list[str] = []
+    for tool in scenario.required_tools:
+        if tool in available_tools:
+            continue
+        if tool in PROMPT_DYNAMIC_REQUIRED_TOOLS:
+            continue
+        missing.append(tool)
+    return missing
 
 
 def has_required_labels(text: str) -> bool:
@@ -747,9 +991,58 @@ def changed_path_matches(expected_path: str, changed_paths: list[str]) -> bool:
     return False
 
 
+def is_repo_path_operation(operation: str) -> bool:
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+",
+            operation.strip().lstrip("./"),
+        )
+    )
+
+
+def expected_operation_observed(
+    operation: str,
+    command_blob: str,
+    diff_files: list[str],
+    file_change_paths: list[str],
+    mutated_expected_files: set[str],
+    final_label_files: set[str],
+) -> bool:
+    if operation in command_blob:
+        return True
+    if not is_repo_path_operation(operation):
+        return False
+    if changed_path_matches(operation, diff_files):
+        return True
+    if changed_path_matches(operation, file_change_paths):
+        return True
+    return operation in mutated_expected_files or operation in final_label_files
+
+
 def contains_explicit_execution_failure(text: str) -> bool:
     combined = text.lower()
     return any(marker in combined for marker in EXPLICIT_EXECUTION_FAILURE_MARKERS)
+
+
+def scenario_requires_write_stdin(scenario: Scenario) -> bool:
+    return (
+        "write_stdin" in scenario.required_tools
+        or "write_stdin" in scenario.expected_signals
+        or "write_stdin" in scenario.expected_operations
+    )
+
+
+def contains_blocking_stderr_execution_failure(stderr: str, scenario: Scenario) -> bool:
+    combined = stderr.lower()
+    if not any(marker in combined for marker in EXPLICIT_EXECUTION_FAILURE_MARKERS):
+        return False
+    if scenario_requires_write_stdin(scenario):
+        return True
+    return any(
+        marker in combined
+        for marker in EXPLICIT_EXECUTION_FAILURE_MARKERS
+        if marker not in WRITE_STDIN_RUNTIME_FAILURE_MARKERS
+    )
 
 
 def collect_changed_paths(worktree: Path) -> list[str]:
@@ -948,6 +1241,8 @@ def classify_failure_reason(
     result_pass: bool,
 ) -> str:
     combined = "\n".join([stderr_preview, final_preview]).lower()
+    if "stream disconnected before completion: idle timeout waiting for sse" in combined:
+        return "upstream_sse_idle_timeout"
     if exit_code == "timeout":
         if "reading additional input from stdin" in combined:
             return "stdin_read_loop_timeout"
@@ -976,7 +1271,10 @@ def classify_failure_reason(
         return "upstream_incomplete_completion"
     if 'tool_choice requires "write_stdin"' in combined:
         return "missed_write_stdin"
-    if "write_stdin failed" in combined or "unknown process id" in combined:
+    if (
+        "write_stdin" in expected_signals
+        and ("write_stdin failed" in combined or "unknown process id" in combined)
+    ):
         return "write_stdin_runtime_error"
     if 'tool_choice requires "mcp__docfork__fetch_doc"' in combined:
         return "missed_docfork_fetch_doc"
@@ -988,6 +1286,8 @@ def classify_failure_reason(
         return "web_search_followup_not_grounded"
     if "web_search follow-up omitted required output labels" in combined:
         return "web_search_followup_unstructured"
+    if "web search failed after" in combined and "no results found" in combined:
+        return "web_search_no_results"
     if "execute web search request:" in combined:
         return "web_search_transport_error"
     if "is not a function" in combined:
@@ -996,6 +1296,11 @@ def classify_failure_reason(
         return "mcp_search_invalid_args"
     if "invalid arguments for tool fetch_doc" in combined:
         return "mcp_fetch_doc_invalid_args"
+    if (
+        "docfork" in expected_signals
+        and ("too many requests" in combined or "rate limit exceeded" in combined)
+    ):
+        return "docfork_rate_limited"
     if "tool call json decode failed" in combined:
         return "malformed_tool_json"
     if expected_signals and not all(token in observed for token in expected_signals):
@@ -1066,11 +1371,21 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
                 continue
             diff_files.append(path)
         command_blob = "\n".join(commands)
-        reads_and_tests_ok = all(token in command_blob for token in scenario.expected_operations)
         observed_signal_set = set(observed_signals)
         signals_ok = all(token in observed_signal_set for token in scenario.expected_signals)
         mutated_expected_files = collect_mutated_expected_files(commands, scenario.expected_files)
         final_label_files = collect_final_label_files(final_text)
+        reads_and_tests_ok = all(
+            expected_operation_observed(
+                token,
+                command_blob,
+                diff_files,
+                file_change_paths,
+                mutated_expected_files,
+                final_label_files,
+            )
+            for token in scenario.expected_operations
+        )
         files_ok = all(
             changed_path_matches(path, diff_files)
             or changed_path_matches(path, file_change_paths)
@@ -1083,8 +1398,15 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
         labels_ok = has_required_labels(final_text)
         result_pass = bool(re.search(r"(?m)^RESULT:\s*PASS\b", final_text))
         final_substrings_ok = all(token in final_text for token in scenario.expected_final_substrings)
-        explicit_failure = contains_explicit_execution_failure("\n".join([final_text, result.stderr or ""]))
-        last_command_success = last_command_success_by_expected_operation(jsonl_path) if jsonl_path.exists() else {}
+        explicit_failure = contains_explicit_execution_failure(final_text) or contains_blocking_stderr_execution_failure(
+            result.stderr or "",
+            scenario,
+        )
+        last_command_success = (
+            last_command_success_by_expected_operation(jsonl_path, scenario.expected_operations)
+            if jsonl_path.exists()
+            else {}
+        )
         for operation, success in last_command_success.items():
             if operation in scenario.expected_operations and success:
                 explicit_failure = False
@@ -1105,18 +1427,17 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
         )
         failure_reason = ""
         if not strict_ok:
-            if not final_substrings_ok:
+            failure_reason = classify_failure_reason(
+                exit_code=exit_code,
+                expected_signals=scenario.expected_signals,
+                observed_signals=observed_signals,
+                final_preview=final_text,
+                stderr_preview=result.stderr or "",
+                labels_ok=labels_ok,
+                result_pass=result_pass,
+            )
+            if not failure_reason and not final_substrings_ok:
                 failure_reason = "final_content_mismatch"
-            else:
-                failure_reason = classify_failure_reason(
-                    exit_code=exit_code,
-                    expected_signals=scenario.expected_signals,
-                    observed_signals=observed_signals,
-                    final_preview=final_text,
-                    stderr_preview=result.stderr or "",
-                    labels_ok=labels_ok,
-                    result_pass=result_pass,
-                )
         return build_case_row(
             model=model,
             scenario=scenario,
@@ -1214,10 +1535,12 @@ def filter_items(items, env_key: str):
 
 def select_scenarios() -> list[Scenario]:
     suite = os.environ.get("CODEX_MATRIX_SUITE", "full").strip().lower()
+    if suite in {"builtin", "builtins", "builtin-tools", "tools"}:
+        return filter_items(BUILTIN_TOOL_SCENARIOS, "CODEX_MATRIX_SCENARIOS")
     if suite in {"real", "realistic", "realworld", "real-world"}:
         return filter_items(REALISTIC_SCENARIOS, "CODEX_MATRIX_SCENARIOS")
     if suite in {"all", "combined"}:
-        return filter_items((*SCENARIOS, *REALISTIC_SCENARIOS), "CODEX_MATRIX_SCENARIOS")
+        return filter_items((*SCENARIOS, *BUILTIN_TOOL_SCENARIOS, *REALISTIC_SCENARIOS), "CODEX_MATRIX_SCENARIOS")
     return filter_items(SCENARIOS, "CODEX_MATRIX_SCENARIOS")
 
 
@@ -1269,6 +1592,7 @@ def main() -> int:
     output_dir = Path(tempfile.gettempdir()) / f"firew2oai-realchain-matrix-{stamp}"
     (output_dir / "worktrees").mkdir(parents=True, exist_ok=True)
     configure_codex_home(output_dir)
+    configure_codex_provider_config()
     configure_child_tool_environment()
     summary_path = output_dir / "summary.tsv"
     rows: list[dict[str, str]] = []

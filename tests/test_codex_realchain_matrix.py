@@ -75,11 +75,134 @@ class RunHelperTests(TestCase):
     def test_configure_codex_home_sets_relative_home_under_output_dir(self) -> None:
         output_dir = Path(tempfile.mkdtemp(prefix="matrix-output-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
-        with patch.dict("os.environ", {"CODEX_MATRIX_CODEX_HOME": "codex-home"}, clear=True):
+        with patch.dict(
+            "os.environ",
+            {"CODEX_MATRIX_CODEX_HOME": "codex-home", "CODEX_MATRIX_INHERIT_CODEX_HOME": "0"},
+            clear=True,
+        ):
             matrix.configure_codex_home(output_dir)
 
             self.assertEqual(Path(__import__("os").environ["CODEX_HOME"]), output_dir / "codex-home")
             self.assertTrue((output_dir / "codex-home").is_dir())
+
+    def test_configure_codex_provider_config_reads_token_file(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-output-"))
+        token_file = output_dir / "token.txt"
+        token_file.write_text("sk-local\n", encoding="utf-8")
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_HOME": str(output_dir / "codex-home"),
+                "CODEX_MATRIX_WRITE_PROVIDER_CONFIG": "1",
+                "CODEX_MATRIX_PROVIDER": "newapi-local",
+                "CODEX_MATRIX_BASE_URL": "http://localhost:3000/v1",
+                "CODEX_MATRIX_WIRE_API": "responses",
+                "CODEX_MATRIX_BEARER_TOKEN_FILE": str(token_file),
+                "CODEX_MATRIX_INHERIT_CODEX_CONFIG": "0",
+            },
+            clear=True,
+        ):
+            (output_dir / "codex-home").mkdir()
+            matrix.configure_codex_provider_config()
+
+        config = (output_dir / "codex-home/config.toml").read_text(encoding="utf-8")
+        self.assertIn("[model_providers.newapi-local]", config)
+        self.assertIn('experimental_bearer_token = "sk-local"', config)
+
+    def test_configure_codex_provider_config_preserves_base_tool_config(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-output-"))
+        base_home = output_dir / "base-codex"
+        base_home.mkdir()
+        (base_home / "config.toml").write_text(
+            '[features]\njs_repl = true\n\n[mcp_servers.docfork]\ncommand = "docfork"\n',
+            encoding="utf-8",
+        )
+        token_file = output_dir / "token.txt"
+        token_file.write_text("sk-local\n", encoding="utf-8")
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_HOME": str(output_dir / "codex-home"),
+                "CODEX_MATRIX_WRITE_PROVIDER_CONFIG": "1",
+                "CODEX_MATRIX_BASE_CODEX_HOME": str(base_home),
+                "CODEX_MATRIX_PROVIDER": "newapi-local",
+                "CODEX_MATRIX_BASE_URL": "http://localhost:3000/v1",
+                "CODEX_MATRIX_WIRE_API": "responses",
+                "CODEX_MATRIX_BEARER_TOKEN_FILE": str(token_file),
+            },
+            clear=True,
+        ):
+            (output_dir / "codex-home").mkdir()
+            matrix.configure_codex_provider_config()
+
+        config = (output_dir / "codex-home/config.toml").read_text(encoding="utf-8")
+        self.assertIn("[features]", config)
+        self.assertIn("[mcp_servers.docfork]", config)
+        self.assertIn("[model_providers.newapi-local]", config)
+        self.assertIn('experimental_bearer_token = "sk-local"', config)
+
+    def test_configure_codex_provider_config_can_add_fixture_mcp(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-output-"))
+        token_file = output_dir / "token.txt"
+        token_file.write_text("sk-local\n", encoding="utf-8")
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_HOME": str(output_dir / "codex-home"),
+                "CODEX_MATRIX_WRITE_PROVIDER_CONFIG": "1",
+                "CODEX_MATRIX_PROVIDER": "newapi-local",
+                "CODEX_MATRIX_BASE_URL": "http://localhost:3000/v1",
+                "CODEX_MATRIX_WIRE_API": "responses",
+                "CODEX_MATRIX_BEARER_TOKEN_FILE": str(token_file),
+                "CODEX_MATRIX_INHERIT_CODEX_CONFIG": "0",
+                "CODEX_MATRIX_ENABLE_FIXTURE_MCP": "1",
+            },
+            clear=True,
+        ):
+            (output_dir / "codex-home").mkdir()
+            matrix.configure_codex_provider_config()
+
+        config = (output_dir / "codex-home/config.toml").read_text(encoding="utf-8")
+        self.assertIn("[mcp_servers.firew2oai_fixture_resources]", config)
+        self.assertIn("codex_mcp_resource_fixture.mjs", config)
+
+    def test_build_codex_exec_command_omits_token_when_provider_config_is_written(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_MATRIX_PROVIDER": "newapi-local",
+                "CODEX_MATRIX_BASE_URL": "http://localhost:3000/v1",
+                "CODEX_MATRIX_BEARER_TOKEN": "sk-local",
+                "CODEX_MATRIX_WRITE_PROVIDER_CONFIG": "1",
+            },
+            clear=True,
+        ):
+            cmd = matrix.build_codex_exec_command("codex", Path("/tmp/w"), Path("/tmp/out"), "model-a", "prompt")
+
+        self.assertNotIn("sk-local", " ".join(cmd))
+
+    def test_build_codex_exec_command_appends_feature_overrides(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_MATRIX_ENABLE_FEATURES": "js_repl,memories",
+                "CODEX_MATRIX_DISABLE_FEATURES": "apps",
+            },
+            clear=True,
+        ):
+            cmd = matrix.build_codex_exec_command("codex", Path("/tmp/w"), Path("/tmp/out"), "model-a", "prompt")
+
+        self.assertIn("--enable", cmd)
+        self.assertIn("js_repl", cmd)
+        self.assertIn("memories", cmd)
+        self.assertIn("--disable", cmd)
+        self.assertIn("apps", cmd)
 
     def test_configure_child_tool_environment_sets_safe_go_cache(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
@@ -159,6 +282,44 @@ class RunHelperTests(TestCase):
                 [scenario.name for scenario in matrix.select_scenarios()],
                 ["real_docs_sync", "real_debug_regression"],
             )
+
+    def test_select_scenarios_supports_combined_suite(self) -> None:
+        with patch.dict("os.environ", {"CODEX_MATRIX_SUITE": "combined"}, clear=False):
+            scenarios = matrix.select_scenarios()
+
+        self.assertEqual(
+            len(scenarios),
+            len(matrix.SCENARIOS) + len(matrix.BUILTIN_TOOL_SCENARIOS) + len(matrix.REALISTIC_SCENARIOS),
+        )
+
+    def test_select_scenarios_supports_builtin_tools_suite(self) -> None:
+        with patch.dict("os.environ", {"CODEX_MATRIX_SUITE": "builtin-tools"}, clear=False):
+            self.assertEqual(
+                [scenario.name for scenario in matrix.select_scenarios()],
+                ["mcp_resource_read_probe", "subagent_resume_send_probe"],
+            )
+
+    def test_plan_then_read_uses_head_command_as_expected_operation(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "plan_then_read")
+        self.assertEqual(scenario.expected_operations, ("head -n 3 README.md",))
+
+    def test_prepare_fixture_search_and_patch_creates_target_and_test_files(self) -> None:
+        worktree = Path(tempfile.mkdtemp(prefix="matrix-fixture-search-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(worktree, ignore_errors=True))
+
+        matrix.prepare_fixture(worktree, "search_and_patch")
+
+        self.assertTrue((worktree / "internal/codexfixture/searchfix/summary.go").is_file())
+        self.assertTrue((worktree / "internal/codexfixture/searchfix/summary_test.go").is_file())
+
+    def test_prepare_fixture_real_test_diagnosis_does_not_create_searchfix_files(self) -> None:
+        worktree = Path(tempfile.mkdtemp(prefix="matrix-fixture-diagnosis-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(worktree, ignore_errors=True))
+
+        matrix.prepare_fixture(worktree, "real_test_diagnosis_no_write")
+
+        self.assertTrue((worktree / "internal/codexfixture/realdiagnose/math.go").is_file())
+        self.assertFalse((worktree / "internal/codexfixture/searchfix/summary_test.go").exists())
 
     def test_effective_case_timeout_raises_subagent_probe_floor(self) -> None:
         scenario = next(item for item in matrix.SCENARIOS if item.name == "subagent_probe")
@@ -298,6 +459,130 @@ class RunHelperTests(TestCase):
             )
         )
 
+    def test_expected_operation_observed_accepts_changed_repo_path(self) -> None:
+        self.assertTrue(
+            matrix.expected_operation_observed(
+                "internal/codexfixture/searchfix/summary.go",
+                "python3 -c 'import base64; exec(...)'",
+                ["internal/codexfixture/searchfix/summary.go"],
+                [],
+                set(),
+                set(),
+            )
+        )
+
+    def test_expected_operation_observed_keeps_command_operations_strict(self) -> None:
+        self.assertFalse(
+            matrix.expected_operation_observed(
+                "go test ./internal/codexfixture/searchfix",
+                "python3 -c 'import base64; exec(...)'",
+                ["internal/codexfixture/searchfix/summary.go"],
+                [],
+                set(),
+                set(),
+            )
+        )
+
+    def test_parse_trace_signals_infers_write_stdin_from_interactive_python_output(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "/bin/zsh -lc python3",
+                            "aggregated_output": (
+                                "Python 3.14.3\r\n"
+                                "\u001b[?2004h\u001b[?1h\u001b=\u001b[?25l>>> \u001b[?12l\u001b[?25h"
+                                "\u001b[@p\u001b[@r\u001b[@i\u001b[@n\u001b[@t\u001b[@(\u001b[@2"
+                                "\u001b[@ \u001b[@+\u001b[@ \u001b[@3\u001b[@)\u001b[16D\n\r"
+                                "\u001b[?2004l\u001b[?1l\u001b>5\r\n"
+                                "\u001b[?2004h\u001b[?1h\u001b=\u001b[?25l>>> \u001b[?12l\u001b[?25h"
+                                "\u001b[@e\u001b[@x\u001b[@i\u001b[@t\u001b[@(\u001b[@)\u001b[10D\n\r"
+                                "\u001b[?2004l\u001b[?1l\u001b>"
+                            ),
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            path = Path(fh.name)
+        try:
+            signals, _ = matrix.parse_trace_signals(path)
+            self.assertIn("write_stdin", signals)
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_last_command_success_by_expected_operation_matches_interactive_python(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "command_execution",
+                            "command": "/bin/zsh -lc python3",
+                            "aggregated_output": ">>> ",
+                            "exit_code": 0,
+                            "status": "completed",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            path = Path(fh.name)
+        try:
+            results = matrix.last_command_success_by_expected_operation(path, ("python3",))
+            self.assertEqual(results, {"python3": True})
+        finally:
+            path.unlink(missing_ok=True)
+
+    def test_parse_evidence_history_signals_reads_write_stdin_and_js_reset(self) -> None:
+        interactive = next(item for item in matrix.SCENARIOS if item.name == "interactive_shell_session")
+        js_repl = next(item for item in matrix.SCENARIOS if item.name == "js_repl_roundtrip")
+        interactive_log = (
+            'time=1 level=INFO msg="responses request" response_id=resp_shell '
+            'model=kimi-k2p5 task_summary="你是测试代理。请验证交互式 shell 会话能力： 1) 必须使用 exec_command 启动一个交互式 python3 会话。" '
+            'evidence_commands="[python3 write_stdin]" '
+            'evidence_outputs="[write_stdin => success=true 5]"\n'
+        )
+        js_log = (
+            'time=2 level=INFO msg="responses request" response_id=resp_js '
+            'model=kimi-k2p5 task_summary="你是测试代理。请验证 js_repl： 1) 必须先使用 js_repl 计算数组 [2,3,5] 的和。" '
+            'evidence_commands="[js_repl js_repl_reset]" '
+            'evidence_outputs="[js_repl => success=true 10 js_repl_reset => js_repl kernel reset]"\n'
+        )
+
+        interactive_signals = matrix.parse_evidence_history_signals(interactive_log, "kimi-k2p5", interactive)
+        js_signals = matrix.parse_evidence_history_signals(js_log, "kimi-k2p5", js_repl)
+
+        self.assertIn("write_stdin", interactive_signals)
+        self.assertIn("js_repl_reset", js_signals)
+
+    def test_parse_trace_signals_infers_view_image_from_inline_data_url(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", suffix=".jsonl", delete=False) as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "type": "item.completed",
+                        "item": {
+                            "type": "agent_message",
+                            "text": 'RESULT: PASS\nFILES: internal/codexfixture/assets/red.png\nTEST: N/A\nNOTE: [{"image_url":"data:image/png;base64,abc","type":"input_image"}]',
+                        },
+                    }
+                )
+                + "\n"
+            )
+            path = Path(fh.name)
+        try:
+            signals, _ = matrix.parse_trace_signals(path)
+            self.assertIn("view_image", signals)
+        finally:
+            path.unlink(missing_ok=True)
+
     def test_resolve_history_endpoint_prefers_explicit_history_env(self) -> None:
         with patch.dict(
             "os.environ",
@@ -428,6 +713,34 @@ class RunHelperTests(TestCase):
         self.assertIn("view_image", signals)
         self.assertEqual(response_id, "resp_img")
 
+    def test_collect_firew2oai_history_signals_falls_back_to_evidence_logs(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "js_repl_roundtrip")
+        log_text = (
+            'time=1 level=INFO msg="responses request" response_id=resp_js '
+            'model=qwen3-vl-30b-a3b-instruct task_summary="你是测试代理。请验证 js_repl： '
+            '1) 必须先使用 js_repl 计算数组 [2,3,5] 的和。" '
+            'evidence_commands="[js_repl js_repl_reset]" '
+            'evidence_outputs="[js_repl => success=true 10 js_repl_reset => js_repl kernel reset js_repl => success=true 56]"\n'
+        )
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as fh:
+            fh.write(log_text)
+            path = Path(fh.name)
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+
+        with patch.dict("os.environ", {"CODEX_MATRIX_HISTORY_LOG_FILE": str(path)}, clear=True), patch.object(
+            matrix,
+            "load_response_input_items",
+            return_value=[],
+        ):
+            signals, response_id = matrix.collect_firew2oai_history_signals(
+                started_at=0,
+                model="qwen3-vl-30b-a3b-instruct",
+                scenario=scenario,
+            )
+
+        self.assertIn("js_repl_reset", signals)
+        self.assertEqual(response_id, "resp_js")
+
     def test_classify_failure_reason_marks_missed_write_stdin(self) -> None:
         self.assertEqual(
             matrix.classify_failure_reason(
@@ -456,12 +769,53 @@ class RunHelperTests(TestCase):
             "write_stdin_runtime_error",
         )
 
+    def test_classify_failure_reason_prefers_sse_idle_timeout(self) -> None:
+        self.assertEqual(
+            matrix.classify_failure_reason(
+                exit_code="timeout",
+                expected_signals=("write_stdin", "command_execution"),
+                observed_signals=["exec_command", "write_stdin"],
+                final_preview="Reconnecting... 2/5 (stream disconnected before completion: idle timeout waiting for SSE)",
+                stderr_preview="Reading additional input from stdin...",
+                labels_ok=False,
+                result_pass=False,
+            ),
+            "upstream_sse_idle_timeout",
+        )
+
     def test_contains_explicit_execution_failure_marks_write_stdin_failure(self) -> None:
         self.assertTrue(
             matrix.contains_explicit_execution_failure(
                 "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: write_stdin failed: Unknown process id 1"
             )
         )
+
+    def test_non_write_stdin_scenario_ignores_stderr_only_write_stdin_warning(self) -> None:
+        scenario = matrix.Scenario(
+            name="cross_file_feature",
+            prompt="",
+            expected_operations=("go test ./internal/codexfixture/feature",),
+            expected_files=("internal/codexfixture/feature/title.go",),
+            capabilities=("exec_command",),
+            required_tools=("exec_command",),
+        )
+        stderr = "ERROR codex_core::tools::router: error=write_stdin failed: Unknown process id 1"
+
+        self.assertFalse(matrix.contains_blocking_stderr_execution_failure(stderr, scenario))
+
+    def test_write_stdin_scenario_keeps_stderr_write_stdin_warning_blocking(self) -> None:
+        scenario = matrix.Scenario(
+            name="interactive_shell_session",
+            prompt="",
+            expected_operations=("python3",),
+            expected_files=(),
+            capabilities=("exec_command", "write_stdin"),
+            required_tools=("exec_command", "write_stdin"),
+            expected_signals=("write_stdin", "command_execution"),
+        )
+        stderr = "ERROR codex_core::tools::router: error=write_stdin failed: Unknown process id 1"
+
+        self.assertTrue(matrix.contains_blocking_stderr_execution_failure(stderr, scenario))
 
     def test_classify_failure_reason_marks_web_search_followup_not_grounded(self) -> None:
         self.assertEqual(
@@ -475,6 +829,20 @@ class RunHelperTests(TestCase):
                 result_pass=False,
             ),
             "web_search_followup_not_grounded",
+        )
+
+    def test_classify_failure_reason_marks_web_search_no_results(self) -> None:
+        self.assertEqual(
+            matrix.classify_failure_reason(
+                exit_code="0",
+                expected_signals=("web_search",),
+                observed_signals=["web_search"],
+                final_preview="Codex adapter error: web search failed after 1 attempt(s): parse web search html: no results found",
+                stderr_preview="",
+                labels_ok=False,
+                result_pass=False,
+            ),
+            "web_search_no_results",
         )
 
     def test_classify_failure_reason_marks_mcp_search_invalid_args(self) -> None:
@@ -516,6 +884,57 @@ class RunHelperTests(TestCase):
                 ]
             ),
             ["exec_command", "mcp__docfork__search_docs", "mcp__chrome_devtools__new_page"],
+        )
+
+    def test_detect_declared_tools_intersects_explicit_list_with_runtime_observation(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-tools-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+        worktree = output_dir / "probe-worktree"
+
+        def fake_run(cmd, cwd=None, timeout=None, input_text=None):
+            if cmd[:2] == ["docker", "logs"]:
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=0,
+                    stdout='msg="responses request" prompt="TOOL_DISCOVERY_PROBE_123" tool_names="[exec_command js_repl]"\n',
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+        with patch.dict(
+            "os.environ",
+            {
+                "CODEX_MATRIX_DECLARED_TOOLS": "exec_command,apply_patch,js_repl",
+                "CODEX_MATRIX_HISTORY_CONTAINER": "firew2oai",
+            },
+            clear=False,
+        ), patch.object(matrix, "time") as mock_time, patch.object(
+            matrix, "create_worktree", return_value=worktree
+        ), patch.object(
+            matrix, "remove_worktree"
+        ), patch.object(
+            matrix, "run", side_effect=fake_run
+        ):
+            mock_time.time.return_value = 123
+            self.assertEqual(
+                matrix.detect_declared_tools(output_dir, "codex", "model-a", 30),
+                ["exec_command", "js_repl"],
+            )
+
+    def test_unsupported_required_tools_keeps_prompt_dynamic_apply_patch_runnable(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "apply_patch_probe")
+
+        self.assertEqual(
+            matrix.unsupported_required_tools(scenario, {"exec_command", "js_repl"}),
+            [],
+        )
+
+    def test_unsupported_required_tools_still_skips_missing_mcp_tools(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "docfork_probe")
+
+        self.assertEqual(
+            matrix.unsupported_required_tools(scenario, {"exec_command"}),
+            ["mcp__docfork__search_docs", "mcp__docfork__fetch_doc"],
         )
 
     def test_classify_failure_reason_ignores_unrelated_mcp_auth_stderr(self) -> None:
@@ -631,6 +1050,20 @@ class RunHelperTests(TestCase):
                 result_pass=False,
             ),
             "missed_docfork_fetch_doc",
+        )
+
+    def test_classify_failure_reason_marks_docfork_rate_limited(self) -> None:
+        self.assertEqual(
+            matrix.classify_failure_reason(
+                exit_code="0",
+                expected_signals=("docfork", "search_docs", "fetch_doc"),
+                observed_signals=["docfork", "search_docs"],
+                final_preview='RESULT: FAIL\nNOTE: 429 Too Many Requests: {"message":"Monthly rate limit exceeded"}',
+                stderr_preview="",
+                labels_ok=True,
+                result_pass=False,
+            ),
+            "docfork_rate_limited",
         )
 
     def test_classify_failure_reason_marks_missed_apply_patch(self) -> None:

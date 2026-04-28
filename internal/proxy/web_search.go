@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -11,21 +12,35 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mison/firew2oai/internal/config"
 	"github.com/mison/firew2oai/internal/transport"
 )
 
 const (
-	defaultWebSearchEndpoint = "https://html.duckduckgo.com/html/"
-	maxWebSearchResults      = 5
-	maxWebSearchBodyBytes    = 512 * 1024
+	defaultWebSearchEndpoint         = "https://html.duckduckgo.com/html/"
+	defaultWebSearchFallbackEndpoint = "https://lite.duckduckgo.com/lite/"
+	maxWebSearchResults              = 5
+	maxWebSearchBodyBytes            = 512 * 1024
+	webSearchMaxAttempts             = 3
+	webSearchRetryDelay              = 250 * time.Millisecond
 )
 
+type webSearchStatusError struct {
+	StatusCode int
+}
+
+func (e webSearchStatusError) Error() string {
+	return fmt.Sprintf("web search endpoint returned %d", e.StatusCode)
+}
+
 var (
-	webSearchResultLinkPattern    = regexp.MustCompile(`(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
-	webSearchResultSnippetPattern = regexp.MustCompile(`(?is)<(?:a|div)[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</(?:a|div)>`)
-	htmlTagPattern                = regexp.MustCompile(`(?is)<[^>]+>`)
+	webSearchAnchorPattern          = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
+	webSearchResultLinkClassPattern = regexp.MustCompile(`(?is)\bclass\s*=\s*(?:"[^"]*(?:result__a|result-link)[^"]*"|'[^']*(?:result__a|result-link)[^']*')`)
+	webSearchHrefPattern            = regexp.MustCompile(`(?is)\bhref\s*=\s*(?:"([^"]+)"|'([^']+)')`)
+	webSearchResultSnippetPattern   = regexp.MustCompile(`(?is)<(?:a|div|td)[^>]+class=(?:"[^"]*(?:result__snippet|result-snippet)[^"]*"|'[^']*(?:result__snippet|result-snippet)[^']*')[^>]*>(.*?)</(?:a|div|td)>`)
+	htmlTagPattern                  = regexp.MustCompile(`(?is)<[^>]+>`)
 )
 
 type webSearchResult struct {
@@ -356,15 +371,69 @@ func (p *Proxy) runWebSearch(ctx context.Context, query string) (string, error) 
 		client = &http.Client{Timeout: p.transport.Timeout()}
 	}
 
-	reqURL, err := url.Parse(endpoint)
+	reqURLs, err := buildWebSearchRequestURLs(endpoint, query)
 	if err != nil {
 		return "", fmt.Errorf("invalid web search endpoint: %w", err)
+	}
+
+	var lastErr error
+	attempts := 0
+	for attempt := 1; attempt <= webSearchMaxAttempts; attempt++ {
+		attempts = attempt
+		retryable := false
+		for _, reqURL := range reqURLs {
+			summary, err := p.runWebSearchOnce(ctx, client, reqURL, query)
+			if err == nil {
+				return summary, nil
+			}
+			lastErr = err
+			if isRetryableWebSearchError(err) {
+				retryable = true
+			}
+		}
+		if attempt == webSearchMaxAttempts || !retryable {
+			break
+		}
+		if err := sleepWithContext(ctx, webSearchRetryDelay); err != nil {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("web search failed after %d attempt(s): %w", attempts, lastErr)
+}
+
+func buildWebSearchRequestURLs(endpoint, query string) ([]string, error) {
+	trimmed := strings.TrimSpace(endpoint)
+	if trimmed == "" {
+		trimmed = defaultWebSearchEndpoint
+	}
+	primary, err := buildWebSearchRequestURL(trimmed, query)
+	if err != nil {
+		return nil, err
+	}
+	urls := []string{primary}
+	if trimmed == "" || strings.TrimRight(trimmed, "/") == strings.TrimRight(defaultWebSearchEndpoint, "/") {
+		fallback, err := buildWebSearchRequestURL(defaultWebSearchFallbackEndpoint, query)
+		if err != nil {
+			return nil, err
+		}
+		urls = append(urls, fallback)
+	}
+	return urls, nil
+}
+
+func buildWebSearchRequestURL(endpoint, query string) (string, error) {
+	reqURL, err := url.Parse(endpoint)
+	if err != nil {
+		return "", err
 	}
 	values := reqURL.Query()
 	values.Set("q", query)
 	reqURL.RawQuery = values.Encode()
+	return reqURL.String(), nil
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+func (p *Proxy) runWebSearchOnce(ctx context.Context, client *http.Client, reqURL string, query string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", fmt.Errorf("create web search request: %w", err)
 	}
@@ -375,10 +444,12 @@ func (p *Proxy) runWebSearch(ctx context.Context, query string) (string, error) 
 	if err != nil {
 		return "", fmt.Errorf("execute web search request: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("web search endpoint returned %d", resp.StatusCode)
+		return "", webSearchStatusError{StatusCode: resp.StatusCode}
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxWebSearchBodyBytes))
@@ -394,6 +465,18 @@ func (p *Proxy) runWebSearch(ctx context.Context, query string) (string, error) 
 		return fmt.Sprintf("Web search query: %s\nNo results found.", query), nil
 	}
 	return formatWebSearchSummary(query, results), nil
+}
+
+func isRetryableWebSearchError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr webSearchStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusTooManyRequests || statusErr.StatusCode >= 500
+	}
+	var urlErr *url.Error
+	return errors.As(err, &urlErr)
 }
 
 func parseWebSearchResults(body []byte, contentType string) ([]webSearchResult, error) {
@@ -427,20 +510,17 @@ func parseWebSearchResultsJSON(body []byte) ([]webSearchResult, bool, error) {
 }
 
 func parseWebSearchResultsHTML(body string) ([]webSearchResult, error) {
-	links := webSearchResultLinkPattern.FindAllStringSubmatch(body, maxWebSearchResults)
+	links := extractWebSearchResultLinks(body)
 	snippets := webSearchResultSnippetPattern.FindAllStringSubmatch(body, maxWebSearchResults)
 	if len(links) == 0 {
 		return nil, fmt.Errorf("parse web search html: no results found")
 	}
 
 	results := make([]webSearchResult, 0, len(links))
-	for i, match := range links {
-		if len(match) < 3 {
-			continue
-		}
+	for i, link := range links {
 		result := webSearchResult{
-			Title: stripHTML(match[2]),
-			URL:   decodeDuckDuckGoLink(match[1]),
+			Title: stripHTML(link.Title),
+			URL:   decodeDuckDuckGoLink(link.URL),
 		}
 		if i < len(snippets) {
 			for _, candidate := range snippets[i][1:] {
@@ -461,13 +541,51 @@ func parseWebSearchResultsHTML(body string) ([]webSearchResult, error) {
 	return results, nil
 }
 
+type webSearchHTMLLink struct {
+	URL   string
+	Title string
+}
+
+func extractWebSearchResultLinks(body string) []webSearchHTMLLink {
+	matches := webSearchAnchorPattern.FindAllStringSubmatch(body, -1)
+	links := make([]webSearchHTMLLink, 0, maxWebSearchResults)
+	for _, match := range matches {
+		if len(match) < 3 {
+			continue
+		}
+		attrs := match[1]
+		if !webSearchResultLinkClassPattern.MatchString(attrs) {
+			continue
+		}
+		hrefMatches := webSearchHrefPattern.FindStringSubmatch(attrs)
+		if len(hrefMatches) < 3 {
+			continue
+		}
+		rawURL := strings.TrimSpace(hrefMatches[1])
+		if rawURL == "" {
+			rawURL = strings.TrimSpace(hrefMatches[2])
+		}
+		if rawURL == "" {
+			continue
+		}
+		links = append(links, webSearchHTMLLink{
+			URL:   rawURL,
+			Title: match[2],
+		})
+		if len(links) >= maxWebSearchResults {
+			break
+		}
+	}
+	return links
+}
+
 func formatWebSearchSummary(query string, results []webSearchResult) string {
 	var builder strings.Builder
 	builder.WriteString("Web search query: ")
 	builder.WriteString(strings.TrimSpace(query))
 	builder.WriteByte('\n')
 	for index, result := range limitWebSearchResults(results) {
-		builder.WriteString(fmt.Sprintf("%d. %s\n", index+1, strings.TrimSpace(result.Title)))
+		fmt.Fprintf(&builder, "%d. %s\n", index+1, strings.TrimSpace(result.Title))
 		if result.URL != "" {
 			builder.WriteString("URL: ")
 			builder.WriteString(result.URL)

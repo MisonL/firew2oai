@@ -90,7 +90,9 @@ func TestNew_JSONFile(t *testing.T) {
 		{Key: "sk-unlimited", Quota: 0, RateLimit: 0},
 	}
 	b, _ := json.Marshal(data)
-	os.WriteFile(f, b, 0644)
+	if err := os.WriteFile(f, b, 0644); err != nil {
+		t.Fatalf("write token config: %v", err)
+	}
 
 	m, err := New(f, 30)
 	if err != nil {

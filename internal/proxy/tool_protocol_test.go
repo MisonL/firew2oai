@@ -933,8 +933,40 @@ func TestParseToolCallOutputs_InfersDocforkLibraryFromQuery(t *testing.T) {
 	if arguments["library"] != "react" {
 		t.Fatalf("library = %v, want react", arguments["library"])
 	}
-	if arguments["query"] != "react useEffectEvent" {
-		t.Fatalf("query = %v, want react useEffectEvent", arguments["query"])
+	if arguments["query"] != "useEffectEvent" {
+		t.Fatalf("query = %v, want useEffectEvent", arguments["query"])
+	}
+}
+
+func TestParseToolCallOutputs_NormalizesDocforkSearchDocsQueryWithLibrary(t *testing.T) {
+	result := parseToolCallOutputs(
+		"<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"library\":\"react\",\"query\":\"react useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>",
+		map[string]responseToolDescriptor{
+			"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		},
+		"",
+	)
+
+	if result.err != nil {
+		t.Fatalf("unexpected parse error: %v", result.err)
+	}
+	if len(result.calls) != 1 {
+		t.Fatalf("tool call count = %d, want 1", len(result.calls))
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(result.calls[0].item, &decoded); err != nil {
+		t.Fatalf("decode tool call: %v", err)
+	}
+	argumentsText, _ := decoded["arguments"].(string)
+	var arguments map[string]any
+	if err := json.Unmarshal([]byte(argumentsText), &arguments); err != nil {
+		t.Fatalf("decode arguments: %v", err)
+	}
+	if arguments["library"] != "react" {
+		t.Fatalf("library = %v, want react", arguments["library"])
+	}
+	if arguments["query"] != "useEffectEvent" {
+		t.Fatalf("query = %v, want useEffectEvent", arguments["query"])
 	}
 }
 
@@ -1302,7 +1334,9 @@ func TestHandleResponses_StreamAIActionsBlock_MultipleToolCalls(t *testing.T) {
 func TestHandleResponses_ToolChoiceNoneDoesNotExposeToolsToUpstream(t *testing.T) {
 	var capturedPrompt string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var req FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
@@ -1312,8 +1346,8 @@ func TestHandleResponses_ToolChoiceNoneDoesNotExposeToolsToUpstream(t *testing.T
 		}
 		capturedPrompt = req.Messages[0].Content
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, "纯文本结果"))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, "纯文本结果"))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1365,7 +1399,9 @@ func TestShouldDisableToolsForExecutionFinalize(t *testing.T) {
 func TestHandleResponses_ExecutionFinalizeDoesNotExposeToolsToUpstream(t *testing.T) {
 	var capturedPrompt string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var req FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
@@ -1375,8 +1411,8 @@ func TestHandleResponses_ExecutionFinalizeDoesNotExposeToolsToUpstream(t *testin
 		}
 		capturedPrompt = req.Messages[0].Content
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, "RESULT: PASS\nREADME: # firew2oai\nTOOLP: tool_choice requires tool call when enabled"))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, "RESULT: PASS\nREADME: # firew2oai\nTOOLP: tool_choice requires tool call when enabled"))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1476,8 +1512,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_FinalModeStripsControlBlock(t *
 	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1515,8 +1551,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_RequiredToolRejectsFinalMode(t 
 	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1551,7 +1587,9 @@ func TestHandleResponses_NonStreamAIActionsBlock_ActionTaskSynthesizesNextToolCa
 	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	var capturedPrompt string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var req FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
@@ -1561,8 +1599,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_ActionTaskSynthesizesNextToolCa
 		}
 		capturedPrompt = req.Messages[0].Content
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1616,8 +1654,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_PlainQuestionDoesNotAutoRequire
 	content := "这是仓库简介。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1655,8 +1693,8 @@ func TestHandleResponses_NonStreamAIActionsBlock_ParallelToolCallsFalseRejectsMu
 	content := "先做两步。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"pwd\"}},{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"ls\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1732,7 +1770,9 @@ func TestHandleChatCompletions_NonStreamAIActionsBlock_ActionTaskUsesSoftToolGui
 	content := "这是最终文本。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
 	var capturedPrompt string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var req FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
@@ -1810,8 +1850,8 @@ func TestHandleResponses_StreamAIActionsBlock_RequiredToolRejectsFinalMode(t *te
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1873,8 +1913,8 @@ func TestHandleResponses_StreamAIActionsBlock_ParallelToolCallsFalseRejectsMulti
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, marshalSSEContent(t, content))
-		fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, "data: {\"type\":\"done\",\"content\":\"\"}\n\n")
 	}))
 	defer upstream.Close()
 
@@ -1913,7 +1953,7 @@ func TestHandleResponses_StreamAIActionsBlock_RequiredToolRejectsFinalModeWithou
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, marshalSSEContent(t, content))
+		_, _ = fmt.Fprint(w, marshalSSEContent(t, content))
 	}))
 	defer upstream.Close()
 

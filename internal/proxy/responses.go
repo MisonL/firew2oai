@@ -439,14 +439,6 @@ func normalizeStructuredToolOutputItems(item map[string]any) []json.RawMessage {
 	return items
 }
 
-func normalizeToolSummaryStringItem(text string) (json.RawMessage, bool) {
-	items := normalizeToolSummaryStringItems(text)
-	if len(items) == 0 {
-		return nil, false
-	}
-	return items[len(items)-1], true
-}
-
 func normalizeToolSummaryStringItems(text string) []json.RawMessage {
 	if match := assistantToolSummaryPattern.FindStringSubmatch(text); len(match) != 0 {
 		call := map[string]any{
@@ -971,11 +963,6 @@ func normalizeToolSummaryMessageItems(item map[string]any) []json.RawMessage {
 	}
 	items = append(items, json.RawMessage(data))
 	return items
-}
-
-func parseToolResultSummary(text string) (string, *bool, string, bool) {
-	callID, _, success, _, output, ok := parseToolResultSummaryDetails(text)
-	return callID, success, output, ok
 }
 
 func parseToolResultSummaryDetails(text string) (string, string, *bool, string, string, bool) {
@@ -1729,6 +1716,52 @@ func buildResponseToolCatalog(raw json.RawMessage) map[string]responseToolDescri
 	return catalog
 }
 
+func augmentResponseToolsForPromptDynamic(raw json.RawMessage, task string) json.RawMessage {
+	if !promptDynamicApplyPatchRequired(task) {
+		return raw
+	}
+	if catalog := buildResponseToolCatalog(raw); catalog != nil {
+		if _, ok := catalog["apply_patch"]; ok {
+			return raw
+		}
+	}
+
+	tools := make([]map[string]any, 0, 1)
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null")) && !bytes.Equal(trimmed, []byte("[]")) {
+		if err := json.Unmarshal(trimmed, &tools); err != nil {
+			return raw
+		}
+	}
+	tools = append(tools, map[string]any{
+		"type":        "custom",
+		"name":        "apply_patch",
+		"description": "Apply a unified diff patch to workspace files. Input must be raw patch text beginning with *** Begin Patch and ending with *** End Patch.",
+	})
+	data, err := json.Marshal(tools)
+	if err != nil {
+		return raw
+	}
+	return data
+}
+
+func promptDynamicApplyPatchRequired(task string) bool {
+	lower := strings.ToLower(strings.TrimSpace(task))
+	if lower == "" || !strings.Contains(lower, "apply_patch") {
+		return false
+	}
+	if strings.Contains(lower, "必须使用 apply_patch") || strings.Contains(lower, "must use apply_patch") {
+		return true
+	}
+	required := extractRequiredToolNames(task)
+	for _, name := range required {
+		if name == "apply_patch" {
+			return true
+		}
+	}
+	return false
+}
+
 func sortedResponseToolNames(toolCatalog map[string]responseToolDescriptor) []string {
 	if len(toolCatalog) == 0 {
 		return nil
@@ -2127,13 +2160,14 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		maxToolCalls = 1
 	}
 	promptMessages := append(cloneMessages(baseMessages), currentMessages...)
-	toolCatalog := buildResponseToolCatalog(req.Tools)
+	currentTask := stableActionableUserTask(promptMessages)
+	effectiveRequestTools := augmentResponseToolsForPromptDynamic(req.Tools, currentTask)
+	toolCatalog := buildResponseToolCatalog(effectiveRequestTools)
 	toolChoice := resolveToolChoice(req.ToolChoice)
 	if err := validateToolChoiceConfiguration(toolChoice, toolCatalog); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_tool_choice", "%s", err.Error())
 		return
 	}
-	currentTask := stableActionableUserTask(promptMessages)
 	autoRequireTool := len(toolCatalog) > 0 && !toolChoice.DisableTools && !toolChoice.RequireTool && taskLikelyNeedsTools(currentTask)
 	policyHistoryItems := buildHistoryItems(baseHistoryItems, requestItems, nil)
 	executionEvidence := buildExecutionEvidence(policyHistoryItems)
@@ -2146,7 +2180,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if maxToolCalls == 0 && executionPolicy.ForceSingleToolCall {
 		maxToolCalls = 1
 	}
-	promptTools := toolsForPrompt(req.Tools, effectiveToolChoice)
+	promptTools := toolsForPrompt(effectiveRequestTools, effectiveToolChoice)
 	prompt := buildResponsesPrompt(baseMessages, req.Instructions, currentMessages, promptTools, maxToolCalls, responsesPromptOptions{
 		CompactForFinalize:  disableToolsForFinalize,
 		SuppressMetaContext: len(toolCatalog) > 0 && taskLikelyNeedsTools(currentTask),
@@ -2872,10 +2906,16 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 	if scanErr != nil {
 		return "", false
 	}
-	if strings.TrimSpace(task) == "" || (taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task)) {
+	task = strings.TrimSpace(task)
+	if task == "" {
 		return "", false
 	}
-	if len(extractRequiredOutputLabels(task)) == 0 {
+	requiredLabels := extractRequiredOutputLabels(task)
+	needsWrite := taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task)
+	if needsWrite && (len(requiredLabels) == 0 || !hasWriteCompletionEvidence(evidence)) {
+		return "", false
+	}
+	if len(requiredLabels) == 0 {
 		if shouldInferReadOnlyStructuredCompletion(task, "", evidence) && taskCompletionSatisfied(task, evidence) {
 			finalText := strings.TrimSpace(constrainFinalText(task, "", evidence, checkControlMarkup))
 			if finalText != "" && !strings.HasPrefix(finalText, "Codex adapter error:") {
@@ -2891,9 +2931,6 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 		}
 		return snippet, true
 	}
-	if len(extractRequiredOutputLabels(task)) == 0 {
-		return "", false
-	}
 	if !taskCompletionSatisfied(task, evidence) || !allObservedOutputsSucceeded(evidence) {
 		if !shouldInferReadOnlyStructuredCompletion(task, "", evidence) || !taskRequestsReadOnlyDiagnosis(task) {
 			return "", false
@@ -2904,4 +2941,22 @@ func fallbackFinalTextForIncompleteResponses(task string, evidence executionEvid
 		return "", false
 	}
 	return finalText, true
+}
+
+func hasWriteCompletionEvidence(evidence executionEvidence) bool {
+	for _, command := range evidence.Commands {
+		if isMutationCommand(command) || isMutationToolName(normalizeToolName(command)) {
+			return true
+		}
+	}
+	for _, output := range evidence.Outputs {
+		action := strings.TrimSpace(output)
+		if idx := strings.Index(action, "=>"); idx >= 0 {
+			action = strings.TrimSpace(action[:idx])
+		}
+		if isMutationCommand(action) || isMutationToolName(normalizeToolName(action)) {
+			return true
+		}
+	}
+	return false
 }

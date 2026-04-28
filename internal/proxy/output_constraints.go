@@ -185,7 +185,11 @@ func overrideStructuredFailBlockWithEvidence(task, text string, evidence executi
 	}
 
 	values["RESULT"] = "PASS"
-	if snippet := extractEvidenceSummarySnippet(evidence.Outputs); snippet != "" {
+	if snippet, ok := extractConcreteNotePayloadFromEvidence(task, evidence); ok {
+		values["NOTE"] = snippet
+	} else if taskRequiresConcreteNotePayload(task) {
+		return "", false
+	} else if snippet := extractEvidenceSummarySnippet(evidence.Outputs); snippet != "" {
 		values["NOTE"] = snippet
 	}
 
@@ -541,7 +545,8 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 			hasExplicitFailure = false
 		}
 		if taskRequiresConcreteNotePayload(task) && hasExecutionEvidence(evidence) {
-			if snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs)); noteLooksLikeUnresolvedPayload(snippet) {
+			_, hasConcretePayload := extractConcreteNotePayloadFromEvidence(task, evidence)
+			if snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs)); !hasConcretePayload && noteLooksLikeUnresolvedPayload(snippet) {
 				return "FAIL", true
 			}
 		}
@@ -649,6 +654,9 @@ func inferRequiredLabelValue(label, task, text string, evidence executionEvidenc
 		return strings.Join(targets, ", "), true
 	case "NOTE":
 		if !taskLikelyNeedsWrite(task) {
+			if snippet, ok := extractConcreteNotePayloadFromEvidence(task, evidence); ok {
+				return snippet, true
+			}
 			if snippet := extractEvidenceSummarySnippet(evidence.Outputs); snippet != "" {
 				if !taskRequiresConcreteNotePayload(task) || !noteLooksLikeUnresolvedPayload(snippet) {
 					return snippet, true
@@ -932,6 +940,47 @@ func extractEvidenceSummarySnippet(outputs []string) string {
 	return ""
 }
 
+func extractConcreteNotePayloadFromEvidence(task string, evidence executionEvidence) (string, bool) {
+	if !taskRequiresConcreteNotePayload(task) {
+		return "", false
+	}
+	if taskRequestsReadmeFirstLine(task) {
+		if snippet := extractReadmeFirstLineCommandEvidence(evidence.Outputs); snippet != "" {
+			return snippet, true
+		}
+	}
+	snippet := strings.TrimSpace(extractEvidenceSummarySnippet(evidence.Outputs))
+	if snippet == "" || noteLooksLikeUnresolvedPayload(snippet) {
+		return "", false
+	}
+	return snippet, true
+}
+
+func taskRequestsReadmeFirstLine(task string) bool {
+	lower := strings.ToLower(strings.Join(strings.Fields(task), " "))
+	return strings.Contains(lower, "readme.md") &&
+		(strings.Contains(task, "第一行") || strings.Contains(lower, "first line"))
+}
+
+func extractReadmeFirstLineCommandEvidence(outputs []string) string {
+	for i := len(outputs) - 1; i >= 0; i-- {
+		output := outputs[i]
+		lower := strings.ToLower(output)
+		if !strings.Contains(lower, "readme.md") || !strings.Contains(lower, "success=true") {
+			continue
+		}
+		if strings.Contains(lower, "wait_agent =>") || strings.Contains(lower, "close_agent =>") || strings.Contains(lower, "spawn_agent =>") {
+			continue
+		}
+		snippet, ok := normalizeEvidenceSummarySnippet(output)
+		if !ok || noteLooksLikeUnresolvedPayload(snippet) {
+			continue
+		}
+		return snippet
+	}
+	return ""
+}
+
 func normalizeEvidenceSummarySnippet(output string) (string, bool) {
 	snippet := output
 	if idx := strings.Index(snippet, "=>"); idx >= 0 {
@@ -1193,6 +1242,10 @@ func containsExplicitExecutionFailure(text string) bool {
 		"upstream error",
 		"mcp error",
 		"tool error",
+		"429 too many requests",
+		"too many requests",
+		"rate limit exceeded",
+		"monthly rate limit exceeded",
 		"failed to parse function arguments",
 		"missing field `session_id`",
 		"unknown process id",

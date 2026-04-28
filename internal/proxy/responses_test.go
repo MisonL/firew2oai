@@ -307,6 +307,59 @@ func TestBuildResponseToolCatalog_UsesInlineNamespaceField(t *testing.T) {
 	}
 }
 
+func TestAugmentResponseToolsForPromptDynamic_AddsApplyPatchWhenTaskRequiresIt(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}
+	]`)
+	task := "你是测试代理。请验证 apply_patch：\n1) 先读取 internal/codexfixture/patchprobe/message.txt。\n2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。"
+
+	augmented := augmentResponseToolsForPromptDynamic(raw, task)
+	catalog := buildResponseToolCatalog(augmented)
+	desc, ok := catalog["apply_patch"]
+	if !ok {
+		t.Fatalf("augmented catalog missing apply_patch: %#v", catalog)
+	}
+	if desc.Type != "custom" || desc.Structured {
+		t.Fatalf("apply_patch descriptor = %#v, want custom freeform tool", desc)
+	}
+}
+
+func TestAugmentResponseToolsForPromptDynamic_PreservesExistingApplyPatch(t *testing.T) {
+	raw := json.RawMessage(`[
+		{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}},
+		{"type":"custom","name":"apply_patch","description":"patch file"}
+	]`)
+	task := "必须使用 apply_patch 把 alpha 改为 beta。"
+
+	augmented := augmentResponseToolsForPromptDynamic(raw, task)
+	catalog := buildResponseToolCatalog(augmented)
+	if _, ok := catalog["apply_patch"]; !ok {
+		t.Fatalf("catalog missing apply_patch after preserve path: %#v", catalog)
+	}
+	var tools []map[string]any
+	if err := json.Unmarshal(augmented, &tools); err != nil {
+		t.Fatalf("json.Unmarshal augmented tools: %v", err)
+	}
+	count := 0
+	for _, tool := range tools {
+		if tool["name"] == "apply_patch" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("apply_patch descriptor count = %d, want 1", count)
+	}
+}
+
+func TestPromptDynamicApplyPatchRequired(t *testing.T) {
+	if !promptDynamicApplyPatchRequired("必须使用 apply_patch，把文件中的 alpha 改为 beta。") {
+		t.Fatal("expected explicit apply_patch task to require prompt-dynamic apply_patch")
+	}
+	if promptDynamicApplyPatchRequired("请读取 README.md 前三行。") {
+		t.Fatal("read-only task should not require prompt-dynamic apply_patch")
+	}
+}
+
 func TestSummarizeToolParameters_IncludesNestedTypesAndRequiredFields(t *testing.T) {
 	params := map[string]any{
 		"type": "object",
@@ -1193,6 +1246,62 @@ func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForReadOnlyFailedTe
 		if !strings.Contains(got, want) {
 			t.Fatalf("fallback text missing %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_UsesEvidenceForCompletedWriteTask(t *testing.T) {
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实但边界清晰的测试补强任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go 与现有 internal/proxy/*_test.go 风格。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go，添加测试 TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise。\n" +
+		"3) 执行 go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你新增或修改的文件；TEST: 测试结果；NOTE: 你完成的补强动作。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"sed -n '1,200p' 'internal/proxy/output_constraints.go'",
+			`python3 -c 'from pathlib import Path; Path("internal/proxy/output_constraints_test.go").write_text("package proxy\n", encoding="utf-8")'`,
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+		},
+		Outputs: []string{
+			"sed -n '1,200p' 'internal/proxy/output_constraints.go' => success=true package proxy",
+			`python3 -c 'from pathlib import Path; Path("internal/proxy/output_constraints_test.go").write_text("package proxy\n", encoding="utf-8")' => success=true`,
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok github.com/mison/firew2oai/internal/proxy 0.016s",
+		},
+	}
+
+	got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil)
+	if !ok {
+		t.Fatal("fallbackFinalTextForIncompleteResponses ok = false, want true")
+	}
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: internal/proxy/output_constraints_test.go",
+		"TEST:",
+		"NOTE: 只新增测试文件，未修改业务逻辑。",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("fallback text missing %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestFallbackFinalTextForIncompleteResponses_RejectsWriteTaskWithoutWriteEvidence(t *testing.T) {
+	task := "1) 阅读 internal/proxy/output_constraints.go。\n" +
+		"2) 新增文件 internal/proxy/output_constraints_test.go。\n" +
+		"3) 执行 go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你新增或修改的文件；TEST: 测试结果；NOTE: 你完成的补强动作。"
+	evidence := executionEvidence{
+		Commands: []string{
+			"sed -n '1,200p' 'internal/proxy/output_constraints.go'",
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise'",
+		},
+		Outputs: []string{
+			"sed -n '1,200p' 'internal/proxy/output_constraints.go' => success=true package proxy",
+			"go test ./internal/proxy -run 'TestSanitizeRequiredLabelValue_RejectsToolWrapperNoise' => success=true ok github.com/mison/firew2oai/internal/proxy 0.016s",
+		},
+	}
+
+	if got, ok := fallbackFinalTextForIncompleteResponses(task, evidence, true, nil); ok {
+		t.Fatalf("fallbackFinalTextForIncompleteResponses unexpectedly returned %q", got)
 	}
 }
 
@@ -2386,6 +2495,41 @@ func TestConstrainFinalText_DowngradesSubagentPassWhenPayloadIsOnlyCommandEcho(t
 		"FILES: README.md\n" +
 		"TEST: N/A\n" +
 		"NOTE: 未获得可解析的工具结果。"
+	if got != want {
+		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
+	}
+}
+
+func TestConstrainFinalText_UsesReadmeCommandEvidenceWhenSubagentPayloadIsCommandEcho(t *testing.T) {
+	task := "你是测试代理。用户明确要求你使用子代理。请验证子代理工具链：\n" +
+		"1) 必须使用 spawn_agent 启动一个子代理。\n" +
+		"2) 子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"3) 必须使用 wait_agent 等待结果。\n" +
+		"4) 必须使用 close_agent 关闭子代理。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 子代理返回的第一行内容"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_1"],"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"wait","receiver_thread_ids":["agent_1"],"agents_states":{"agent_1":{"status":"completed","message":"exec_command(\"head -n 1 README.md\")"}},"status":"completed"}`),
+		json.RawMessage(`{"type":"collab_tool_call","tool":"close_agent","receiver_thread_ids":["agent_1"],"agents_states":{"agent_1":{"status":"completed","message":"exec_command(\"head -n 1 README.md\")"}},"status":"completed"}`),
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_readme","arguments":"{\"cmd\":\"head -n 1 README.md\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_readme","output":{"content":"# firew2oai","success":true}}`),
+	}
+	text := "RESULT: FAIL\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: 未获得可解析的工具结果。"
+	evidence := buildExecutionEvidence(history)
+
+	got := constrainFinalText(task, text, evidence, true)
+	want := "RESULT: PASS\n" +
+		"FILES: README.md\n" +
+		"TEST: N/A\n" +
+		"NOTE: # firew2oai"
 	if got != want {
 		t.Fatalf("constrained text = %q, want %q, outputs=%q", got, want, evidence.Outputs)
 	}

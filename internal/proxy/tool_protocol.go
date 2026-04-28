@@ -596,23 +596,6 @@ func toolProtocolErrorString(err error) string {
 	return err.Error()
 }
 
-func parseLegacyToolCallOutput(text string, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallResult {
-	batch := parseLegacyToolCallOutputs(text, allowedTools, requiredTool)
-	result := parsedToolCallResult{
-		candidateFound: batch.candidateFound,
-		err:            batch.err,
-	}
-	if len(batch.calls) > 1 {
-		result.candidateFound = true
-		result.err = errors.New("multiple tool calls require parseToolCallOutputs")
-		return result
-	}
-	if len(batch.calls) == 1 {
-		result.call = &batch.calls[0]
-	}
-	return result
-}
-
 func parseLegacyToolCallOutputs(text string, allowedTools map[string]responseToolDescriptor, requiredTool string) parsedToolCallBatchResult {
 	candidateSource := strings.TrimSpace(stripMarkdownCodeFence(text))
 	if candidateSource == "" {
@@ -1195,21 +1178,36 @@ func normalizeStructuredToolArguments(toolName, sourceToolName string, args any)
 		if !ok {
 			return args, false
 		}
-		if library, ok := firstStringField(value, "library"); ok && library != "" {
-			return args, false
-		}
-		source, _ := firstStringField(value, "source", "docs", "docset", "library_name", "libraryName")
-		if source == "" {
-			source = inferDocforkLibraryFromQuery(value)
-		}
-		if source == "" {
-			return args, false
-		}
 		normalized := cloneMap(value)
-		for _, alias := range []string{"source", "docs", "docset", "library_name", "libraryName"} {
-			delete(normalized, alias)
+		changed := false
+		library, _ := firstStringField(value, "library")
+		if library == "" {
+			library, _ = firstStringField(value, "source", "docs", "docset", "library_name", "libraryName")
 		}
-		normalized["library"] = source
+		if library == "" {
+			library = inferDocforkLibraryFromQuery(value)
+		}
+		if library != "" {
+			if _, hasLibrary := value["library"]; !hasLibrary {
+				normalized["library"] = library
+				changed = true
+			}
+			for _, alias := range []string{"source", "docs", "docset", "library_name", "libraryName"} {
+				if _, ok := normalized[alias]; ok {
+					delete(normalized, alias)
+					changed = true
+				}
+			}
+			if query, ok := firstStringField(value, "query"); ok {
+				if cleaned, ok := trimDocforkQueryLibraryPrefix(query, library); ok {
+					normalized["query"] = cleaned
+					changed = true
+				}
+			}
+		}
+		if !changed {
+			return args, false
+		}
 		return normalized, true
 	case "spawn_agent":
 		value, ok := args.(map[string]any)
@@ -1244,6 +1242,36 @@ func inferDocforkLibraryFromQuery(values map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func trimDocforkQueryLibraryPrefix(query, library string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(query))
+	if len(fields) < 2 {
+		return query, false
+	}
+	first := strings.ToLower(strings.Trim(fields[0], " \t\r\n`'\""))
+	aliases := docforkLibraryAliases(library)
+	for _, alias := range aliases {
+		if first == alias {
+			return strings.Join(fields[1:], " "), true
+		}
+	}
+	return query, false
+}
+
+func docforkLibraryAliases(library string) []string {
+	normalized := strings.ToLower(strings.TrimSpace(library))
+	switch normalized {
+	case "react", "react.dev":
+		return []string{"react", "react.dev"}
+	case "nextjs", "next.js":
+		return []string{"nextjs", "next.js", "next"}
+	default:
+		if normalized == "" {
+			return nil
+		}
+		return []string{normalized}
+	}
 }
 
 func firstNonEmptyNormalizedToolName(names ...string) string {
@@ -1385,7 +1413,7 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 			return nil, fmt.Errorf("function_call for %q must include arguments", name)
 		}
 		args := raw["arguments"]
-		argsText := "{}"
+		var argsText string
 		switch value := args.(type) {
 		case string:
 			argsText = value

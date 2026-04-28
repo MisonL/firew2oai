@@ -82,6 +82,18 @@ func TestExtractWriteTargetFiles_DocsSyncIgnoresDoNotModifyGoCodeScope(t *testin
 	}
 }
 
+func TestExtractWriteTargetFiles_ApplyPatchUsesMentionedFile(t *testing.T) {
+	task := "你是测试代理。请验证 apply_patch：\n" +
+		"1) 先读取 internal/codexfixture/patchprobe/message.txt。\n" +
+		"2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。"
+
+	got := extractWriteTargetFiles(task)
+	want := []string{"internal/codexfixture/patchprobe/message.txt"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("extractWriteTargetFiles mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestExtractRequiredCommands_IgnoresOutputLabelDescription(t *testing.T) {
 	task := "执行 rg -n \"REALDOCS_TIMEOUT|REALDOCS_RETRIES\" docs/codexfixture/realdocs.md。\n" +
 		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: 你修改的文件；TEST: rg 结果；NOTE: 文档同步摘要。"

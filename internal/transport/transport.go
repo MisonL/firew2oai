@@ -266,7 +266,7 @@ func (t *FireworksTransport) streamPostOnce(ctx context.Context, url string, bod
 
 	if resp.StatusCode != http.StatusOK {
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		return nil, transientUpstreamError{statusCode: resp.StatusCode, retryAfter: retryAfter}
 	}
 

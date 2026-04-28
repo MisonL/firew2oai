@@ -159,7 +159,9 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 	if _, statErr := os.Stat(configStr); statErr == nil {
 		f, err := os.Open(configStr)
 		if err == nil {
-			defer f.Close()
+			defer func() {
+				_ = f.Close()
+			}()
 			data, err := io.ReadAll(f)
 			if err != nil {
 				return nil, fmt.Errorf("read token config file: %w", err)
@@ -470,8 +472,8 @@ func writeAuthError(w http.ResponseWriter, code, message string) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(http.StatusUnauthorized)
-	w.Write(data)
-	w.Write([]byte("\n"))
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }
 
 func writeLimitError(w http.ResponseWriter, code, message string) {
@@ -494,6 +496,6 @@ func writeLimitError(w http.ResponseWriter, code, message string) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
-	w.Write(data)
-	w.Write([]byte("\n"))
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }

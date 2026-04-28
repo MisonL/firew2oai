@@ -7,8 +7,8 @@ import (
 )
 
 const (
-	defaultUpstreamEmptyRetryCount   = 2
-	defaultUpstreamEmptyRetryBackoff = 200 * time.Millisecond
+	defaultUpstreamEmptyRetryCount   = 4
+	defaultUpstreamEmptyRetryBackoff = 500 * time.Millisecond
 )
 
 type upstreamEmptyRetryPolicy struct {

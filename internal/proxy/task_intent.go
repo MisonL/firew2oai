@@ -22,6 +22,7 @@ var taskTargetKeywords = []string{
 
 var taskToolKeywords = []string{
 	"exec_command",
+	"apply_patch",
 	"write_stdin",
 	"update_plan",
 	"js_repl",
@@ -54,8 +55,8 @@ var taskPlainResponseKeywords = []string{
 }
 
 var taskWriteKeywords = []string{
-	"edit", "modify", "update", "fix", "patch", "implement", "add", "create", "write", "change", "refactor",
-	"修改", "修复", "新增", "添加", "实现", "重构", "优化", "完善", "补充", "补强", "更新",
+	"edit", "modify", "update", "fix", "patch", "apply_patch", "implement", "add", "create", "write", "change", "refactor",
+	"修改", "修复", "新增", "添加", "实现", "重构", "优化", "完善", "补充", "补强", "更新", "改为", "变成", "替换",
 }
 
 var taskReadOnlyMarkers = []string{
@@ -785,6 +786,7 @@ func buildExplicitToolUseBlock(task string, toolCatalog map[string]responseToolD
 func extractRequiredToolNames(task string) []string {
 	candidateTools := []string{
 		"exec_command",
+		"apply_patch",
 		"update_plan",
 		"write_stdin",
 		"js_repl",
@@ -944,10 +946,15 @@ func extractWriteTargetFiles(task string) []string {
 
 func taskWideWriteIntentAppliesToAllMentionedFiles(task string) bool {
 	lowerTask := strings.ToLower(task)
-	return strings.Contains(lowerTask, "重构") || strings.Contains(lowerTask, "refactor")
+	return strings.Contains(lowerTask, "重构") ||
+		strings.Contains(lowerTask, "refactor") ||
+		strings.Contains(lowerTask, "apply_patch")
 }
 
 func segmentWriteIntentAppliesToAllMentionedFiles(lowerSegment string) bool {
+	if strings.Contains(lowerSegment, "apply_patch") {
+		return true
+	}
 	if strings.Contains(lowerSegment, "追加") && strings.Contains(lowerSegment, "测试") {
 		return true
 	}
@@ -997,13 +1004,19 @@ func expandSiblingBareFileMentions(segment string, knownPaths []string) []string
 		if strings.Contains(bare, "/") {
 			continue
 		}
+		chosen := ""
 		for _, dir := range dirs {
 			candidate := path.Join(dir, bare)
-			resolved = append(resolved, candidate)
 			if _, ok := known[candidate]; ok {
+				chosen = candidate
 				break
 			}
-			break
+			if chosen == "" {
+				chosen = candidate
+			}
+		}
+		if chosen != "" {
+			resolved = append(resolved, chosen)
 		}
 	}
 	return dedupePreserveOrder(resolved)

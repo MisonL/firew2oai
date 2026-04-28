@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -35,7 +36,9 @@ func TestHandleResponses_NonStreamServerSideWebSearchFollowup(t *testing.T) {
 	requests := make([]FireworksRequest, 0, 2)
 	errCh := make(chan error, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var fwReq FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
 			recordWebSearchTestError(errCh, "decode upstream request: %v", err)
@@ -141,7 +144,9 @@ func TestHandleResponses_StreamServerSideWebSearchFollowup(t *testing.T) {
 	requests := make([]FireworksRequest, 0, 2)
 	errCh := make(chan error, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var fwReq FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
 			recordWebSearchTestError(errCh, "decode upstream request: %v", err)
@@ -248,7 +253,9 @@ func TestBuildResponsesWebSearchFollowupPrompt_OmitsBaseInstructionsAndKeepsTask
 func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturnsAdapterError(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 
 		var fwReq FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
@@ -311,7 +318,9 @@ func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturn
 
 func TestHandleResponses_NonStreamServerSideWebSearchFollowupUpstream500UsesFallbackFinal(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
+		defer func() {
+			_ = r.Body.Close()
+		}()
 		var fwReq FireworksRequest
 		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
 			t.Fatalf("decode upstream request: %v", err)
@@ -396,6 +405,53 @@ func TestParseWebSearchResults_FallsBackToHTMLWhenJSONDecodeFails(t *testing.T) 
 	}
 }
 
+func TestParseWebSearchResultsHTML_ParsesDuckDuckGoLiteMarkup(t *testing.T) {
+	body := `<html><body>
+		<a rel="nofollow" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fgo.dev%2Fdoc%2Fdevel%2Frelease&amp;rut=abc" class='result-link'>Release History - The Go Programming Language</a>
+		<td class='result-snippet'>Go 1.25.3 was released on September 29, 2025.</td>
+	</body></html>`
+
+	results, err := parseWebSearchResultsHTML(body)
+	if err != nil {
+		t.Fatalf("parseWebSearchResultsHTML error = %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].URL != "https://go.dev/doc/devel/release" {
+		t.Fatalf("URL = %q", results[0].URL)
+	}
+	if results[0].Title != "Release History - The Go Programming Language" {
+		t.Fatalf("Title = %q", results[0].Title)
+	}
+	if !strings.Contains(results[0].Snippet, "Go 1.25.3") {
+		t.Fatalf("Snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestBuildWebSearchRequestURLs_AddsLiteFallbackForDefaultEndpoint(t *testing.T) {
+	urls, err := buildWebSearchRequestURLs("", "latest Go release")
+	if err != nil {
+		t.Fatalf("buildWebSearchRequestURLs error = %v", err)
+	}
+	if len(urls) != 2 {
+		t.Fatalf("len(urls) = %d, want 2: %#v", len(urls), urls)
+	}
+	if !strings.Contains(urls[0], "html.duckduckgo.com") || !strings.Contains(urls[1], "lite.duckduckgo.com") {
+		t.Fatalf("unexpected fallback urls: %#v", urls)
+	}
+}
+
+func TestBuildWebSearchRequestURLs_DoesNotAddFallbackForCustomEndpoint(t *testing.T) {
+	urls, err := buildWebSearchRequestURLs("http://example.test/search", "latest Go release")
+	if err != nil {
+		t.Fatalf("buildWebSearchRequestURLs error = %v", err)
+	}
+	if len(urls) != 1 {
+		t.Fatalf("len(urls) = %d, want 1: %#v", len(urls), urls)
+	}
+}
+
 func TestBuildWebSearchFallbackFinalText_PreservesUTF8Boundary(t *testing.T) {
 	task := "最后只输出两行：RESULT: PASS 或 FAIL；NOTE: 说明。"
 	summary := strings.Repeat("你", 400)
@@ -403,5 +459,59 @@ func TestBuildWebSearchFallbackFinalText_PreservesUTF8Boundary(t *testing.T) {
 	got := buildWebSearchFallbackFinalText(task, []string{summary})
 	if !utf8.ValidString(got) {
 		t.Fatalf("fallback text is not valid UTF-8: %q", got)
+	}
+}
+
+func TestRunWebSearch_RetriesTemporaryStatus(t *testing.T) {
+	var attempts int
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts == 1 {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go 1.25.3 is released","url":"https://go.dev/doc/devel/release#go1.25.3","snippet":"Go 1.25.3 was released on September 29, 2025."}]}`))
+	}))
+	defer search.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, "http://example.invalid")
+	p.webSearchEndpoint = search.URL
+	p.webSearchClient = search.Client()
+
+	summary, err := p.runWebSearch(context.Background(), "latest Go release")
+	if err != nil {
+		t.Fatalf("runWebSearch error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if !strings.Contains(summary, "Go 1.25.3 is released") {
+		t.Fatalf("summary missing search result:\n%s", summary)
+	}
+}
+
+func TestRunWebSearch_DoesNotRetryParseFailure(t *testing.T) {
+	var attempts int
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body>no results markup</body></html>`))
+	}))
+	defer search.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, "http://example.invalid")
+	p.webSearchEndpoint = search.URL
+	p.webSearchClient = search.Client()
+
+	_, err := p.runWebSearch(context.Background(), "latest Go release")
+	if err == nil {
+		t.Fatal("runWebSearch error = nil, want parse failure")
+	}
+	if attempts != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts)
+	}
+	if !strings.Contains(err.Error(), "after 1 attempt") {
+		t.Fatalf("error does not report actual attempt count: %v", err)
 	}
 }

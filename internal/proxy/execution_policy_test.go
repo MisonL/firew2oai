@@ -60,6 +60,56 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceForcesSingleStepEvenForNonStri
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesChromeNewPage(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__chrome_devtools__new_page": {Name: "mcp__chrome_devtools__new_page", Type: "function", Structured: true, Namespace: "mcp__chrome_devtools__"},
+	}
+	task := "必须使用 mcp__chrome_devtools__new_page 打开这个 data URL：" +
+		"data:text/html,%3Cbutton%20id%3D%22go%22%3EGo%3C%2Fbutton%3E"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "mcp__chrome_devtools__new_page" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__chrome_devtools__new_page", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic new_page call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "new_page" {
+		t.Fatalf("synthetic tool name = %q, want new_page", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "url"); got != "data:text/html,%3Cbutton%20id%3D%22go%22%3EGo%3C%2Fbutton%3E" {
+		t.Fatalf("synthetic new_page url = %q", got)
+	}
+}
+
+func TestApplyExecutionPolicyToParseResult_SynthesizesChromeNewPageOnFinalMode(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__chrome_devtools__new_page": {Name: "mcp__chrome_devtools__new_page", Type: "function", Structured: true, Namespace: "mcp__chrome_devtools__"},
+	}
+	task := "必须使用 mcp__chrome_devtools__new_page 打开这个 data URL：" +
+		"data:text/html,%3Cbutton%20id%3D%22go%22%3EGo%3C%2Fbutton%3E"
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, nil, toolCatalog, true, false, true)
+	content := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: clicked\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"final\"}\n<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{
+		RequiredTool: "mcp__chrome_devtools__new_page",
+		RequireTool:  true,
+	})
+
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{
+		RequiredTool: "mcp__chrome_devtools__new_page",
+		RequireTool:  true,
+	})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if name := parsedCallName(t, got.calls[0]); name != "new_page" {
+		t.Fatalf("tool name = %q, want new_page", name)
+	}
+}
+
 func TestApplyExecutionPolicyToParseResult_SynthesizesCommandOnFinalMode(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
@@ -640,6 +690,50 @@ func TestApplyExecutionPolicyToParseResult_RewritesRepeatedDocforkToRemainingRea
 	}
 }
 
+func TestApplyExecutionPolicyToParseResult_OverridesStaleDocforkToolChoiceForRemainingRead(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command":              {Name: "exec_command", Type: "function", Structured: true},
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"id":"item_0","type":"mcp_tool_call","server":"docfork","tool":"search_docs","arguments":{"library":"react","query":"useEffectEvent"},"result":{"content":[{"type":"text","text":"Searched: react | 1 results\n\n[1] useEffectEvent\n    https://react.dev/reference/react/useEffectEvent\n\nUse fetch_doc on any URL above for full content."}]},"error":null,"status":"completed"}`),
+		json.RawMessage(`{"id":"item_1","type":"mcp_tool_call","server":"docfork","tool":"fetch_doc","arguments":{"url":"https://react.dev/reference/react/useEffectEvent"},"result":{"content":[{"type":"text","text":"Source: https://react.dev/reference/react/useEffectEvent\n\nuseEffectEvent lets you extract non-reactive logic into an Effect Event."}]},"error":null,"status":"completed"}`),
+	}
+	policy := buildExecutionPolicyWithCatalog(
+		"qwen3-vl-30b-a3b-thinking",
+		"你是资深 Go 工程师。请模拟真实 Codex 查文档任务：\n1) 必须使用 mcp__docfork__search_docs 搜索 react useEffectEvent。\n2) 必须使用 mcp__docfork__fetch_doc 获取相关页面。\n3) 阅读 README.md 的项目描述。\n4) 不要修改任何文件。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+	if policy.NextRequiredTool != "" {
+		t.Fatalf("policy.NextRequiredTool = %q, want empty after docfork tools completed", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want remaining README read call")
+	}
+
+	content := "继续查文档。\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"mcp__docfork__search_docs\",\"arguments\":{\"library\":\"react\",\"query\":\"react useEffectEvent\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	constraints := toolProtocolConstraints{
+		RequiredTool: "mcp__docfork__search_docs",
+		RequireTool:  true,
+	}
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, constraints)
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, constraints)
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	if command := parsedCallCommand(t, got.calls[0]); command != buildReadFileCommand("README.md") {
+		t.Fatalf("command = %q, want README read", command)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceSanitizesSyntheticDocforkURL(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
@@ -683,6 +777,36 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesDocforkSearchDocsAr
 	}
 	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search_docs" {
 		t.Fatalf("synthetic tool name = %q, want search_docs", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "library"); got != "react" {
+		t.Fatalf("synthetic search_docs library = %q, want react", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "query"); got != "useEffectEvent" {
+		t.Fatalf("synthetic search_docs query = %q, want useEffectEvent", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesDocforkSearchDocsFromCompactPrompt(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"qwen3-vl-30b-a3b-thinking",
+		"你是资深 Go 工程师。请模拟真实 Codex 查文档任务：\n1) 必须使用 mcp__docfork__search_docs 搜索 react useEffectEvent。\n2) 必须使用 mcp__docfork__fetch_doc 获取相关页面。\n3) 阅读 README.md 的项目描述。\n4) 不要修改任何文件。",
+		nil,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__search_docs" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__search_docs", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic search_docs call")
 	}
 	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "library"); got != "react" {
 		t.Fatalf("synthetic search_docs library = %q, want react", got)
@@ -914,6 +1038,32 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesJSReplReset(t *test
 	}
 	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "js_repl_reset" {
 		t.Fatalf("synthetic tool name = %q, want js_repl_reset", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesInitialJSRepl(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"js_repl":       {Name: "js_repl", Type: "custom", Structured: false},
+		"js_repl_reset": {Name: "js_repl_reset", Type: "function", Structured: true},
+	}
+	task := "你是测试代理。请验证 js_repl：\n" +
+		"1) 必须先使用 js_repl 计算数组 [2,3,5] 的和。\n" +
+		"2) 然后调用 js_repl_reset。\n" +
+		"3) 再次使用 js_repl 计算 7 * 8。\n" +
+		"4) 不要使用 exec_command 代替 js_repl。"
+
+	policy := buildExecutionPolicyWithCatalog("gpt-oss-20b", task, nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "js_repl" {
+		t.Fatalf("policy.NextRequiredTool = %q, want js_repl", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic initial js_repl call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "js_repl" {
+		t.Fatalf("synthetic tool name = %q, want js_repl", got)
+	}
+	if got := parsedCallInput(t, *policy.SyntheticToolCall); got != "[2,3,5].reduce((a,b)=>a+b,0)" {
+		t.Fatalf("synthetic tool input = %q, want array sum expression", got)
 	}
 }
 
@@ -1444,7 +1594,7 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesApplyPatch(t *testi
 		"apply_patch":  {Name: "apply_patch", Type: "custom", Structured: false},
 	}
 	history := []json.RawMessage{
-		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,20p' tmp/apply_patch_probe.txt\"}"}`),
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,200p' 'tmp/apply_patch_probe.txt'\"}"}`),
 		json.RawMessage(`{"type":"function_call_output","call_id":"call_read_1","output":{"content":"alpha\n","success":true}}`),
 	}
 	task := "你是测试代理。请验证 apply_patch：\n" +
@@ -1459,13 +1609,13 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesApplyPatch(t *testi
 		t.Fatalf("policy.NextRequiredTool = %q, want apply_patch", policy.NextRequiredTool)
 	}
 	if policy.SyntheticToolCall == nil {
-		t.Fatal("policy.SyntheticToolCall = nil, want synthetic apply_patch call")
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic apply_patch command")
 	}
-	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "apply_patch" {
-		t.Fatalf("synthetic tool name = %q, want apply_patch", got)
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "exec_command" {
+		t.Fatalf("synthetic tool name = %q, want exec_command", got)
 	}
-	if got := parsedCallInput(t, *policy.SyntheticToolCall); !strings.Contains(got, "*** Update File: tmp/apply_patch_probe.txt") || !strings.Contains(got, "-alpha") || !strings.Contains(got, "+beta") {
-		t.Fatalf("synthetic apply_patch input = %q, want minimal alpha->beta patch", got)
+	if got := parsedCallCommand(t, *policy.SyntheticToolCall); !strings.Contains(got, "| apply_patch") || !strings.Contains(got, "*** Update File: tmp/apply_patch_probe.txt") || !strings.Contains(got, "-alpha") || !strings.Contains(got, "+beta") {
+		t.Fatalf("synthetic apply_patch command = %q, want minimal alpha->beta patch command", got)
 	}
 }
 
@@ -1478,7 +1628,12 @@ func TestApplyExecutionPolicyToParseResult_SynthesizesApplyPatchWhenRequiredTool
 		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,20p' tmp/apply_patch_probe.txt\"}"}`),
 		json.RawMessage(`{"type":"function_call_output","call_id":"call_read_1","output":{"content":"alpha\n","success":true}}`),
 	}
-	task := "1) 先使用 exec_command 读取 tmp/apply_patch_probe.txt。\n2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。"
+	task := "你是测试代理。请验证 apply_patch：\n" +
+		"1) 先使用 exec_command 读取 tmp/apply_patch_probe.txt。\n" +
+		"2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。\n" +
+		"3) 禁止使用 exec_command + python/sed/perl/cat 重写文件代替 apply_patch。\n" +
+		"4) 不要执行测试，也不要修改其他文件。\n" +
+		"最后只输出四行：RESULT: PASS 或 FAIL；FILES: tmp/apply_patch_probe.txt；TEST: N/A；NOTE: 是否真正使用了 apply_patch。"
 
 	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
 	if policy.SyntheticToolCall == nil {
@@ -1496,8 +1651,11 @@ func TestApplyExecutionPolicyToParseResult_SynthesizesApplyPatchWhenRequiredTool
 	if len(got.calls) != 1 {
 		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
 	}
-	if gotName := parsedCallName(t, got.calls[0]); gotName != "apply_patch" {
-		t.Fatalf("tool name = %q, want apply_patch", gotName)
+	if gotName := parsedCallName(t, got.calls[0]); gotName != "exec_command" {
+		t.Fatalf("tool name = %q, want exec_command", gotName)
+	}
+	if command := parsedCallCommand(t, got.calls[0]); !strings.Contains(command, "| apply_patch") {
+		t.Fatalf("tool command = %q, want apply_patch command", command)
 	}
 }
 
@@ -1520,6 +1678,38 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceDefersApplyPatchUntilReadSeede
 	}
 	if got := policy.NextCommand; got != buildReadFileCommand("internal/codexfixture/patchprobe/message.txt") {
 		t.Fatalf("policy.NextCommand = %q, want initial read command", got)
+	}
+}
+
+func TestBuildExecutionPolicy_PromptDynamicApplyPatchSynthesizesAfterRead(t *testing.T) {
+	rawTools := json.RawMessage(`[
+		{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}
+	]`)
+	task := "你是测试代理。请验证 apply_patch：\n" +
+		"1) 先读取 internal/codexfixture/patchprobe/message.txt。\n" +
+		"2) 必须使用 apply_patch，把文件中的 alpha 改为 beta。\n" +
+		"3) 再读取同一文件确认内容已经变成 beta。"
+	toolCatalog := buildResponseToolCatalog(augmentResponseToolsForPromptDynamic(rawTools, task))
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_read_1","arguments":"{\"cmd\":\"sed -n '1,200p' 'internal/codexfixture/patchprobe/message.txt'\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_read_1","output":{"content":"alpha\n","success":true}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog("glm-4p7", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "apply_patch" {
+		t.Fatalf("policy.NextRequiredTool = %q, want apply_patch", policy.NextRequiredTool)
+	}
+	if !policy.PendingWrite {
+		t.Fatal("policy.PendingWrite = false, want true until apply_patch executes")
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic apply_patch command")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "exec_command" {
+		t.Fatalf("synthetic tool name = %q, want exec_command", got)
+	}
+	if got := parsedCallCommand(t, *policy.SyntheticToolCall); !strings.Contains(got, "| apply_patch") || !strings.Contains(got, "*** Update File: internal/codexfixture/patchprobe/message.txt") || !strings.Contains(got, "-alpha") || !strings.Contains(got, "+beta") {
+		t.Fatalf("synthetic apply_patch command = %q, want alpha to beta patch command", got)
 	}
 }
 
@@ -1764,6 +1954,32 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceAdvancesFromCompletedCollabWai
 	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
 	if policy.NextRequiredTool != "close_agent" {
 		t.Fatalf("policy.NextRequiredTool = %q, want close_agent", policy.NextRequiredTool)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceAdvancesFromFailedWaitAgentOutput(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+		"wait_agent":  {Name: "wait_agent", Type: "function", Structured: true},
+		"close_agent": {Name: "close_agent", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"spawn_agent","call_id":"call_spawn_1","arguments":"{\"message\":\"读取 README.md 第一行\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_spawn_1","output":{"content":"{\"agent_id\":\"agent_123\",\"nickname\":\"Planck\"}","success":true}}`),
+		json.RawMessage(`{"type":"function_call","name":"wait_agent","call_id":"call_wait_1","arguments":"{\"targets\":[\"agent_123\"]}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_wait_1","output":{"content":"{\"status\":{\"agent_123\":{\"completed\":\"Codex adapter error: upstream stream failed before content\"}},\"timed_out\":false}","success":false}}`),
+	}
+	task := "必须使用 spawn_agent 启动一个子代理，然后必须使用 wait_agent 等待结果，最后必须使用 close_agent 关闭子代理。"
+
+	policy := buildExecutionPolicyWithCatalog("minimax-m2p5", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "close_agent" {
+		t.Fatalf("policy.NextRequiredTool = %q, want close_agent", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic close_agent call")
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "target"); got != "agent_123" {
+		t.Fatalf("synthetic close_agent target = %q, want agent_123", got)
 	}
 }
 
@@ -2080,6 +2296,80 @@ func TestInferToolOutputSuccess_RecognizesWriteStdinRuntimeError(t *testing.T) {
 	got := inferToolOutputSuccess("write_stdin failed: Unknown process id 1")
 	if got == nil || *got {
 		t.Fatalf("inferToolOutputSuccess should return false for write_stdin runtime error, got %#v", got)
+	}
+}
+
+func TestInferToolOutputSuccess_RecognizesRateLimitError(t *testing.T) {
+	got := inferToolOutputSuccess(`429 Too Many Requests: {"error":"Too Many Requests","message":"Monthly rate limit exceeded."}`)
+	if got == nil || *got {
+		t.Fatalf("inferToolOutputSuccess should return false for rate limit error, got %#v", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsDocforkSearchAfterRateLimit(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"search_docs","namespace":"mcp__docfork__","call_id":"call_docfork_1","arguments":"{\"library\":\"react\",\"query\":\"useEffectEvent\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_docfork_1","output":{"content":"429 Too Many Requests: {\"error\":\"Too Many Requests\",\"message\":\"Monthly rate limit exceeded.\"}"}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"llama-v3p3-70b-instruct",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__search_docs" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__search_docs after rate limit", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want retryable synthetic search_docs call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search_docs" {
+		t.Fatalf("synthetic tool name = %q, want search_docs", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceStopsAfterRepeatedDocforkRateLimit(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"search_docs","namespace":"mcp__docfork__","call_id":"call_docfork_1","arguments":"{\"library\":\"react\",\"query\":\"useEffectEvent\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_docfork_1","output":{"content":"429 Too Many Requests: {\"message\":\"Monthly rate limit exceeded.\"}"}}`),
+		json.RawMessage(`{"type":"function_call","name":"search_docs","namespace":"mcp__docfork__","call_id":"call_docfork_2","arguments":"{\"library\":\"react\",\"query\":\"useEffectEvent\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_docfork_2","output":{"content":"429 Too Many Requests: {\"message\":\"Monthly rate limit exceeded.\"}"}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"llama-v3p3-70b-instruct",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "" {
+		t.Fatalf("policy.NextRequiredTool = %q, want empty after repeated rate limit", policy.NextRequiredTool)
+	}
+	if policy.RequireTool {
+		t.Fatal("policy.RequireTool = true, want false after repeated external failure")
+	}
+	if policy.Stage != "finalize" {
+		t.Fatalf("policy.Stage = %q, want finalize", policy.Stage)
+	}
+	if policy.SyntheticToolCall != nil {
+		t.Fatalf("policy.SyntheticToolCall = %#v, want nil", policy.SyntheticToolCall)
 	}
 }
 

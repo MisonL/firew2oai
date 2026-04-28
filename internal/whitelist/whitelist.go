@@ -190,8 +190,8 @@ func (c *Checker) Middleware(trustedProxyCount int) func(http.HandlerFunc) http.
 					},
 				}
 				data, _ := json.Marshal(resp)
-				w.Write(data)
-				w.Write([]byte("\n"))
+				_, _ = w.Write(data)
+				_, _ = w.Write([]byte("\n"))
 				return
 			}
 

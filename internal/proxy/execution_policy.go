@@ -12,6 +12,8 @@ import (
 	"strings"
 )
 
+const explicitToolFailureStopThreshold = 2
+
 type executionPolicy struct {
 	Enabled              bool
 	Stage                string
@@ -90,6 +92,9 @@ func buildExecutionPolicyWithCatalog(model, currentTask string, historyItems []j
 	nextRequiredTool := nextUnmetExplicitToolFromSequence(explicitTools, toolCatalog, historyItems)
 	if nextRequiredTool == "" && jsReplFollowupStillRequired(task, historyItems, toolCatalog) {
 		nextRequiredTool = "js_repl"
+	}
+	if nextRequiredTool != "" && explicitToolFailureCount(historyItems, toolCatalog, nextRequiredTool) >= explicitToolFailureStopThreshold {
+		nextRequiredTool = ""
 	}
 	if len(explicitTools) > 1 {
 		policy.ForceSingleToolCall = true
@@ -179,29 +184,12 @@ func buildExecutionPolicyWithCatalog(model, currentTask string, historyItems []j
 			policy.Stage = "execute"
 		}
 		policy.SyntheticToolCall = buildSyntheticExplicitToolCall(nextRequiredTool, currentTask, historyItems, toolCatalog, nextCommand)
+	} else if shouldForceSyntheticNextCommand(policy) {
+		if synthetic, ok := buildSyntheticExecCommandCall(nextCommand, toolCatalog, ""); ok {
+			policy.SyntheticToolCall = &synthetic
+		}
 	}
 	return policy
-}
-
-func filterOutFiles(allFiles, excluded []string) []string {
-	if len(allFiles) == 0 {
-		return nil
-	}
-	if len(excluded) == 0 {
-		return append([]string(nil), allFiles...)
-	}
-	excludedSet := make(map[string]struct{}, len(excluded))
-	for _, filePath := range excluded {
-		excludedSet[strings.TrimSpace(filePath)] = struct{}{}
-	}
-	filtered := make([]string, 0, len(allFiles))
-	for _, filePath := range allFiles {
-		if _, ok := excludedSet[strings.TrimSpace(filePath)]; ok {
-			continue
-		}
-		filtered = append(filtered, filePath)
-	}
-	return filtered
 }
 
 func mergeExecutionSequenceFiles(allMentionedFiles, writeTargets []string) []string {
@@ -335,10 +323,11 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 		result.candidateFound = true
 		return result
 	}
-	if policy.Enabled && policy.RequireTool && len(result.calls) > 0 && policy.NextRequiredTool != "" && policy.SyntheticToolCall != nil && shouldRewriteCallsToSynthetic(result.calls, *policy.SyntheticToolCall) {
+	if policy.Enabled && policy.RequireTool && len(result.calls) > 0 && policy.SyntheticToolCall != nil && (policy.NextRequiredTool != "" || shouldForceSyntheticNextCommand(policy)) && shouldRewriteCallsToSynthetic(result.calls, *policy.SyntheticToolCall) {
 		slog.Info("execution policy rewrite to synthetic required tool",
 			"stage", policy.Stage,
 			"next_required_tool", policy.NextRequiredTool,
+			"next_command", policy.NextCommand,
 		)
 		result.calls = []parsedToolCall{*policy.SyntheticToolCall}
 		result.err = nil
@@ -470,6 +459,10 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 	return result
 }
 
+func shouldForceSyntheticNextCommand(policy executionPolicy) bool {
+	return policy.Stage == "verify" && policy.NextRequiredTool == "" && strings.TrimSpace(policy.NextCommand) != ""
+}
+
 func buildPendingWriteGuardCommand(policy executionPolicy, calls []parsedToolCall) string {
 	if !policy.PendingWrite || len(policy.RequiredFiles) == 0 || len(calls) == 0 {
 		return ""
@@ -595,7 +588,7 @@ func shouldRewriteSequentialExecCallsToNext(calls []parsedToolCall, nextCommand 
 		if hasSatisfiedRequiredCommand([]string{command}, next) {
 			matchedNext = true
 		}
-		if !(isReadOnlyCommand(command) || isTestCommand(command) || isGuardFailureCommand(command)) {
+		if !isReadOnlyCommand(command) && !isTestCommand(command) && !isGuardFailureCommand(command) {
 			allSequentialExec = false
 			break
 		}
@@ -1135,13 +1128,11 @@ func chooseUnreadStyleReferenceFile(output string, requiredFiles, seenCommands [
 	if len(candidates) == 0 {
 		return ""
 	}
-	for _, candidate := range candidates {
-		if hasSeenReadForFile(seenCommands, candidate) {
-			return ""
-		}
-		return candidate
+	candidate := candidates[0]
+	if hasSeenReadForFile(seenCommands, candidate) {
+		return ""
 	}
-	return ""
+	return candidate
 }
 
 func buildSeedWriteCommand(task string, requiredFiles []string, signals executionHistorySignals) string {
@@ -1862,6 +1853,10 @@ func inferToolOutputSuccess(text string) *bool {
 		"upstream error",
 		"mcp error",
 		"tool error",
+		"429 too many requests",
+		"too many requests",
+		"rate limit exceeded",
+		"monthly rate limit exceeded",
 		"process exited with code 1",
 		"process exited with code 2",
 		"process exited with code 126",
@@ -2365,22 +2360,6 @@ func extractExecCommandFromArgumentsText(argsText string) string {
 	return sanitizeExecCommandText(trimmed)
 }
 
-func allParsedCallsReadOnly(calls []parsedToolCall) bool {
-	if len(calls) == 0 {
-		return false
-	}
-	for _, call := range calls {
-		name, command, ok := parsedToolCallInvocation(call)
-		if !ok {
-			return false
-		}
-		if !isReadOnlyInvocation(name, command) {
-			return false
-		}
-	}
-	return true
-}
-
 func parsedCallsContainMutationTool(calls []parsedToolCall) bool {
 	for _, call := range calls {
 		name, _, ok := parsedToolCallInvocation(call)
@@ -2542,6 +2521,7 @@ func nextUnmetExplicitToolFromSequence(explicitTools []string, toolCatalog map[s
 func collectSatisfiedToolNames(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) []string {
 	names := make([]string, 0, 8)
 	callIDToTool := make(map[string]string, len(historyItems))
+	callIDToCommand := make(map[string]string, len(historyItems))
 	callIDHasOutput := make(map[string]bool, len(historyItems))
 	seen := make(map[string]struct{}, len(historyItems))
 
@@ -2557,6 +2537,11 @@ func collectSatisfiedToolNames(historyItems []json.RawMessage, toolCatalog map[s
 		if name := observedToolNameFromHistoryItem(item, toolCatalog); name != "" {
 			if callID := historyToolCallIdentifier(item); callID != "" {
 				callIDToTool[callID] = name
+				if name == "exec_command" {
+					if command := extractExecCommandFromFunctionCall(item, name); command != "" {
+						callIDToCommand[callID] = command
+					}
+				}
 			}
 		}
 
@@ -2634,7 +2619,10 @@ func collectSatisfiedToolNames(historyItems []json.RawMessage, toolCatalog map[s
 				continue
 			}
 			name := callIDToTool[callID]
-			if name == "" || !historyToolOutputSucceeded(item["output"]) {
+			if name == "" {
+				continue
+			}
+			if !historyToolOutputSucceeded(item["output"]) && !failedToolOutputStillSatisfiesExplicitSequence(name, item["output"]) {
 				continue
 			}
 			key := typ + "|" + name + "|" + callID
@@ -2643,9 +2631,80 @@ func collectSatisfiedToolNames(historyItems []json.RawMessage, toolCatalog map[s
 			}
 			seen[key] = struct{}{}
 			names = append(names, name)
+			if name == "exec_command" && execCommandUsesApplyPatch(callIDToCommand[callID]) {
+				patchKey := typ + "|apply_patch|" + callID
+				if _, ok := seen[patchKey]; !ok {
+					seen[patchKey] = struct{}{}
+					names = append(names, "apply_patch")
+				}
+			}
 		}
 	}
 	return names
+}
+
+func explicitToolFailureCount(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, toolName string) int {
+	if strings.TrimSpace(toolName) == "" {
+		return 0
+	}
+	callIDToTool := make(map[string]string, len(historyItems))
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		name := observedToolNameFromHistoryItem(item, toolCatalog)
+		if name == "" {
+			continue
+		}
+		if callID := historyToolCallIdentifier(item); callID != "" {
+			callIDToTool[callID] = name
+		}
+	}
+
+	failures := 0
+	for _, raw := range historyItems {
+		if len(raw) == 0 {
+			continue
+		}
+		var item map[string]any
+		if err := json.Unmarshal(raw, &item); err != nil {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		switch typ {
+		case "function_call_output", "custom_tool_call_output", "mcp_tool_call_output":
+			callID := historyToolCallIdentifier(item)
+			if callID == "" || callIDToTool[callID] != toolName {
+				continue
+			}
+			if toolOutputFailed(item["output"]) {
+				failures++
+			}
+		}
+	}
+	return failures
+}
+
+func toolOutputFailed(output any) bool {
+	text, success := extractToolOutputText(output)
+	if success == nil {
+		success = inferToolOutputSuccess(text)
+	}
+	return success != nil && !*success
+}
+
+func failedToolOutputStillSatisfiesExplicitSequence(name string, output any) bool {
+	switch name {
+	case "wait_agent", "close_agent":
+	default:
+		return false
+	}
+	text, _ := extractToolOutputText(output)
+	return strings.TrimSpace(text) != ""
 }
 
 func historyToolCallCompleted(item map[string]any) bool {
@@ -2831,12 +2890,17 @@ func observedToolNameFromHistoryItem(item map[string]any, toolCatalog map[string
 var explicitToolURLPattern = regexp.MustCompile(`https?://[^\s<>"')]+`)
 var syntheticToolURLTrailingReferencePattern = regexp.MustCompile(`(?:\[[0-9]+\]|【[0-9]+】)+$`)
 var taskJSReplFollowupPattern = regexp.MustCompile(`(?:再次|再一次|然后再次|然后再)\s*(?:使用\s+)?js_repl(?:\s*工具)?(?:\s*[:：])?(?:\s*(?:计算|执行|运行))?\s*([^\n。]+)`)
+var taskJSReplInitialPattern = regexp.MustCompile(`(?:先|首先|必须先)?\s*(?:使用\s+)?js_repl(?:\s*工具)?(?:\s*[:：])?(?:\s*(?:计算|执行|运行))?\s*([^\n。]+)`)
+var taskJSReplArraySumPattern = regexp.MustCompile(`\[[0-9,\s]+\]`)
+var taskJSReplArithmeticPattern = regexp.MustCompile(`^[0-9\s+\-*/().]+$`)
 var syntheticImagePathPattern = regexp.MustCompile(`(?i)(?:/)?(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.(?:png|jpe?g|webp|gif)`)
 var syntheticChromeSnapshotButtonUIDPattern = regexp.MustCompile(`(?m)uid=([A-Za-z0-9_:.\\-]+)\s+button\b`)
+var syntheticChromeURLPattern = regexp.MustCompile(`(?i)\b(?:data:text/[^\s]+|https?://[^\s]+)`)
 var syntheticWaitForTextPattern = regexp.MustCompile(`(?is)wait_for[\s\S]{0,160}?(?:出现|显示|包含|become|show|shows|contains?)\s+([A-Za-z0-9_./:-]+)`)
 var syntheticAgentIDPattern = regexp.MustCompile(`(?i)"agent_id"\s*:\s*"([^"]+)"`)
 var syntheticSpawnAgentTaskPattern = regexp.MustCompile(`(?is)(?:子代理任务(?:是|为)?|spawn_agent[\s\S]{0,80}?)(读取[\s\S]{0,120}?(?:返回结果|返回|汇报|并返回结果|即可返回|即可))`)
 var syntheticDocforkSearchPattern = regexp.MustCompile(`(?i)search_docs\s+搜索\s+([A-Za-z0-9._/-]+)\s+文档中的\s+([A-Za-z0-9_.:/#-]+)|搜索\s+([A-Za-z0-9._/-]+)\s+文档中的\s+([A-Za-z0-9_.:/#-]+)`)
+var syntheticDocforkCompactSearchPattern = regexp.MustCompile(`(?i)(?:search_docs\s+)?搜索\s+([A-Za-z0-9._/-]+)\s+([A-Za-z0-9_.:/#-]+)(?:[。；;\n]|$)`)
 var syntheticWebSearchQueryPattern = regexp.MustCompile(`(?:必须使用\s+)?web_search\s*(?:查询|搜索)\s*([^\n。；;]+)`)
 var syntheticWriteStdinCommandPattern = regexp.MustCompile(`(?m)(print\([^)\n]+\)|exit\(\))`)
 var syntheticSessionIDPattern = regexp.MustCompile(`(?i)(?:session[_ ]id|session ID)\D+(\d+)`)
@@ -2865,6 +2929,8 @@ func buildSyntheticExplicitToolCall(nextRequiredTool, task string, historyItems 
 		return buildSyntheticApplyPatchCall(nextRequiredTool, task, historyItems, toolCatalog)
 	case "view_image":
 		return buildSyntheticViewImageCall(nextRequiredTool, task, historyItems, toolCatalog)
+	case "new_page":
+		return buildSyntheticChromeNewPageCall(nextRequiredTool, task, toolCatalog)
 	case "click":
 		return buildSyntheticChromeClickCall(nextRequiredTool, historyItems, toolCatalog)
 	case "wait_for":
@@ -2962,10 +3028,15 @@ func buildSyntheticCustomToolCall(name, input string, toolCatalog map[string]res
 }
 
 func buildSyntheticJSReplCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
-	if countObservedToolName(historyItems, toolCatalog, "js_repl") == 0 || countObservedToolName(historyItems, toolCatalog, "js_repl_reset") == 0 {
-		return nil
+	jsReplCalls := countObservedToolName(historyItems, toolCatalog, "js_repl")
+	resetCalls := countObservedToolName(historyItems, toolCatalog, "js_repl_reset")
+	var expr string
+	var ok bool
+	if jsReplCalls == 0 {
+		expr, ok = extractTaskJSReplInitialInput(task)
+	} else if resetCalls > 0 {
+		expr, ok = extractTaskJSReplFollowupInput(task)
 	}
-	expr, ok := extractTaskJSReplFollowupInput(task)
 	if !ok {
 		return nil
 	}
@@ -3074,7 +3145,6 @@ func extractSessionIDFromToolOutput(output any) string {
 		text, _ := extractToolOutputText(output)
 		return extractSessionIDFromText(text)
 	}
-	return ""
 }
 
 func extractSessionIDFromText(text string) string {
@@ -3112,11 +3182,64 @@ func buildSyntheticApplyPatchCall(nextRequiredTool, task string, historyItems []
 		"*** End Patch",
 		"",
 	}, "\n")
+	if call := buildSyntheticApplyPatchExecCommandCall(patch, toolCatalog); call != nil {
+		return call
+	}
 	call, ok := buildSyntheticCustomToolCall(nextRequiredTool, patch, toolCatalog, nextRequiredTool)
 	if !ok {
 		return nil
 	}
 	return call
+}
+
+func buildSyntheticApplyPatchExecCommandCall(patch string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	patch = strings.TrimSpace(patch)
+	if patch == "" {
+		return nil
+	}
+	if len(toolCatalog) > 0 {
+		desc, ok := toolCatalog["exec_command"]
+		if !ok || !desc.Structured {
+			return nil
+		}
+	}
+	command := "printf '%s' " + shellQuoteANSI(patch+"\n") + " | apply_patch"
+	call, err := buildParsedToolCall(map[string]any{
+		"type":      "function_call",
+		"name":      "exec_command",
+		"arguments": map[string]any{"cmd": command},
+	}, toolCatalog, "", false)
+	if err != nil {
+		return nil
+	}
+	return call
+}
+
+func shellQuoteANSI(text string) string {
+	var b strings.Builder
+	b.WriteString("$'")
+	for _, r := range text {
+		switch r {
+		case '\\':
+			b.WriteString("\\\\")
+		case '\'':
+			b.WriteString("\\'")
+		case '\n':
+			b.WriteString("\\n")
+		case '\r':
+			b.WriteString("\\r")
+		case '\t':
+			b.WriteString("\\t")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteString("'")
+	return b.String()
+}
+
+func execCommandUsesApplyPatch(command string) bool {
+	return strings.Contains(strings.ToLower(command), "apply_patch")
 }
 
 func extractSyntheticApplyPatchPlan(task string) (string, string, string) {
@@ -3253,6 +3376,23 @@ func firstNonEmptyOutputLine(text string) string {
 	return ""
 }
 
+func buildSyntheticChromeNewPageCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	targetURL := extractTaskURL(task)
+	if targetURL == "" {
+		return nil
+	}
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"url": targetURL}, toolCatalog, nextRequiredTool)
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func extractTaskURL(task string) string {
+	match := syntheticChromeURLPattern.FindString(task)
+	return strings.TrimRight(strings.TrimSpace(match), "`\"，。；;,")
+}
+
 func buildSyntheticChromeClickCall(nextRequiredTool string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
 	text := latestToolOutputTextByName(historyItems, toolCatalog, "mcp__chrome_devtools__take_snapshot")
 	if text == "" {
@@ -3374,11 +3514,42 @@ func extractTaskJSReplFollowupInput(task string) (string, bool) {
 	if len(matches) == 0 {
 		return "", false
 	}
-	expr := normalizeJSReplInput(matches[len(matches)-1][1])
+	expr := normalizeTaskJSReplExpression(matches[len(matches)-1][1])
 	if expr == "" {
 		return "", false
 	}
 	return expr, true
+}
+
+func extractTaskJSReplInitialInput(task string) (string, bool) {
+	matches := taskJSReplInitialPattern.FindAllStringSubmatch(task, -1)
+	for _, match := range matches {
+		if len(match) < 2 {
+			continue
+		}
+		expr := normalizeTaskJSReplExpression(match[1])
+		if expr != "" {
+			return expr, true
+		}
+	}
+	return "", false
+}
+
+func normalizeTaskJSReplExpression(input string) string {
+	normalized := normalizeJSReplInput(input)
+	if normalized == "" {
+		return ""
+	}
+	if array := taskJSReplArraySumPattern.FindString(normalized); array != "" && strings.Contains(normalized, "和") {
+		return array + ".reduce((a,b)=>a+b,0)"
+	}
+	normalized = strings.TrimSpace(strings.TrimSuffix(normalized, "。"))
+	normalized = strings.TrimSpace(strings.TrimSuffix(normalized, "；"))
+	normalized = strings.TrimSpace(strings.TrimSuffix(normalized, ";"))
+	if taskJSReplArithmeticPattern.MatchString(normalized) {
+		return normalized
+	}
+	return ""
 }
 
 func normalizeJSReplInput(input string) string {
@@ -3614,11 +3785,27 @@ func extractSyntheticDocforkSearchInputs(task string) (string, string) {
 		}
 		for _, pair := range pairs {
 			if pair[0] != "" && pair[1] != "" {
-				return pair[0], pair[1]
+				return normalizeSyntheticDocforkSearchInputs(pair[0], pair[1])
 			}
 		}
 	}
+	matches = syntheticDocforkCompactSearchPattern.FindStringSubmatch(task)
+	if len(matches) >= 3 {
+		return normalizeSyntheticDocforkSearchInputs(matches[1], matches[2])
+	}
 	return "", ""
+}
+
+func normalizeSyntheticDocforkSearchInputs(library, query string) (string, string) {
+	library = strings.TrimSpace(library)
+	query = strings.TrimSpace(query)
+	if library == "" || query == "" {
+		return "", ""
+	}
+	if cleaned, ok := trimDocforkQueryLibraryPrefix(query, library); ok {
+		query = cleaned
+	}
+	return library, query
 }
 
 func buildSyntheticWebSearchCall(nextRequiredTool, task string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
