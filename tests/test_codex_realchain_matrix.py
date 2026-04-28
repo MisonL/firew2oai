@@ -951,6 +951,12 @@ class RunHelperTests(TestCase):
             ["mcp__docfork__search_docs", "mcp__docfork__fetch_doc"],
         )
 
+    def test_docfork_probe_result_is_based_on_tool_success_not_doc_title(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "docfork_probe")
+
+        self.assertIn("RESULT 只表示 Docfork 工具是否真实调用并返回内容", scenario.prompt)
+        self.assertIn("文档标题或内容中的 Error 不代表本测试失败", scenario.prompt)
+
     def test_classify_failure_reason_ignores_unrelated_mcp_auth_stderr(self) -> None:
         self.assertEqual(
             matrix.classify_failure_reason(

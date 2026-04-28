@@ -125,3 +125,54 @@ New API log ownership after `2026-04-28 12:05:00+08`:
 Residual process check:
 
 - No `codex_realchain_matrix` or `codex exec` process remained after the targeted retest.
+
+## 2026-04-28 15:10 Follow-up Full Matrix
+
+Full matrix after commit `9915d31`:
+
+```bash
+CODEX_MATRIX_MODELS='qwen3-vl-30b-a3b-instruct,minimax-m2p5,llama-v3p3-70b-instruct,kimi-k2p5,qwen3-vl-30b-a3b-thinking,gpt-oss-20b,glm-5,qwen3-8b,glm-4p7,gpt-oss-120b,deepseek-v3p1,deepseek-v3p2' \
+CODEX_MATRIX_WORKERS=2 \
+CODEX_MATRIX_TIMEOUT=900 \
+CODEX_MATRIX_BASE_URL=http://127.0.0.1:3000/v1 \
+CODEX_MATRIX_WIRE_API=responses \
+CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
+python3 scripts/codex_realchain_matrix.py
+```
+
+Summary file:
+
+`/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-140920/summary.tsv`
+
+Result: `179 ok / 1 fail`.
+
+Failure:
+
+- `gpt-oss-20b/docfork_probe`: `semantic_result_fail`. Docfork `search_docs` and `fetch_doc` both completed. The model marked `RESULT: FAIL` because the fetched React Compiler document title contains `Error`, not because the Docfork tool chain failed.
+
+Fix:
+
+- Tightened `docfork_probe` prompt so `RESULT` is based on required Docfork tool calls returning content, and document titles or content containing `Error` do not mean the probe failed.
+- Added a regression assertion that the scenario prompt keeps this distinction explicit.
+
+Targeted realchain retest after the prompt fix:
+
+```bash
+CODEX_MATRIX_INCLUDE_DIRTY_WORKSPACE=1 \
+CODEX_MATRIX_MODELS='gpt-oss-20b' \
+CODEX_MATRIX_SCENARIOS='docfork_probe' \
+CODEX_MATRIX_WORKERS=1 \
+CODEX_MATRIX_TIMEOUT=420 \
+CODEX_MATRIX_BASE_URL=http://127.0.0.1:3000/v1 \
+CODEX_MATRIX_WIRE_API=responses \
+CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
+python3 scripts/codex_realchain_matrix.py
+```
+
+Summary file:
+
+`/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-151029/summary.tsv`
+
+Result:
+
+- `gpt-oss-20b/docfork_probe`: `ok`

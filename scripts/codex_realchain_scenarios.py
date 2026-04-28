@@ -220,6 +220,7 @@ SCENARIOS = (
             "2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。\n"
             "3) 禁止使用 web_search 代替 Docfork。\n"
             "4) 不要修改任何文件。\n"
+            "5) RESULT 只表示 Docfork 工具是否真实调用并返回内容；文档标题或内容中的 Error 不代表本测试失败。\n"
             "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 你从文档中得到的一句结论。"
         ),
         expected_operations=(),
