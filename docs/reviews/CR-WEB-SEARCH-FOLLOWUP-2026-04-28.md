@@ -176,3 +176,48 @@ Summary file:
 Result:
 
 - `gpt-oss-20b/docfork_probe`: `ok`
+
+## 2026-04-28 16:25 Final Full Matrix
+
+Full matrix after commit `af7ed1d`:
+
+```bash
+CODEX_MATRIX_MODELS='qwen3-vl-30b-a3b-instruct,minimax-m2p5,llama-v3p3-70b-instruct,kimi-k2p5,qwen3-vl-30b-a3b-thinking,gpt-oss-20b,glm-5,qwen3-8b,glm-4p7,gpt-oss-120b,deepseek-v3p1,deepseek-v3p2' \
+CODEX_MATRIX_WORKERS=2 \
+CODEX_MATRIX_TIMEOUT=900 \
+CODEX_MATRIX_BASE_URL=http://127.0.0.1:3000/v1 \
+CODEX_MATRIX_WIRE_API=responses \
+CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
+python3 scripts/codex_realchain_matrix.py
+```
+
+Summary file:
+
+`/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-151305/summary.tsv`
+
+Result: `180 ok / 0 fail`.
+
+Per-model result:
+
+- `deepseek-v3p1`: `15/15`
+- `deepseek-v3p2`: `15/15`
+- `glm-4p7`: `15/15`
+- `glm-5`: `15/15`
+- `gpt-oss-120b`: `15/15`
+- `gpt-oss-20b`: `15/15`
+- `kimi-k2p5`: `15/15`
+- `llama-v3p3-70b-instruct`: `15/15`
+- `minimax-m2p5`: `15/15`
+- `qwen3-8b`: `15/15`
+- `qwen3-vl-30b-a3b-instruct`: `15/15`
+- `qwen3-vl-30b-a3b-thinking`: `15/15`
+
+New API log ownership after `2026-04-28 15:13:05+08`:
+
+- Matrix requests: `token_id=5`, `user_id=1`, `username=mison`, `token_name=mison`, `count=1584`
+- Non-matrix model test: `token_id=0`, `user_id=1`, `username=mison`, `token_name=模型测试`, `model_name=claude-opus-4-6`, `content=模型测试`, `count=1`
+- No `token_id=3` records.
+
+Residual process check:
+
+- No `codex_realchain_matrix` or `codex exec` process remained after the final full matrix.
