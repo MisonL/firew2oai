@@ -10,12 +10,16 @@
 
 - `web_search_followup_unstructured`: the follow-up model output contained a complete required label block, but it also included a preface before `RESULT:`. The server-side web search adapter only accepted required labels when they started at the first non-empty line, so it misclassified the output as unstructured.
 - `web_search_challenge_blocked`: DuckDuckGo returned an anti-bot challenge to the anonymous search request. The tool call itself was emitted and observed; the backend search provider blocked the HTTP request. This is external and can recur when the current egress is challenged.
+- Full matrix follow-up found one `glm-4p7/web_search_probe` run where web_search succeeded but the follow-up answer said it did not have search results. The adapter returned `web_search_followup_not_grounded` instead of finalizing from the already captured real search summary.
+- Full matrix follow-up found one `glm-4p7/docfork_probe` run where Docfork `search_docs` returned `504 Gateway Timeout: upstream request timeout`. The execution policy treated the non-empty output as successful and advanced to the required `fetch_doc` step too early.
 
 ## Change
 
 - Normalize server-side web search follow-up output with the existing required-label extractor before applying the strict top-line label check.
 - Keep missing-label behavior strict: outputs without the required labels still return `web_search follow-up omitted required output labels`.
 - Do not synthesize success for search provider challenge responses.
+- When a web_search follow-up refuses to answer from captured results, finalize structured no-file tasks from the real captured search summary instead of returning an adapter error.
+- Treat gateway timeout and upstream request timeout tool outputs as failed outputs, so Docfork retries or stops on the search step instead of incorrectly requiring `fetch_doc`.
 
 ## Validation
 
@@ -72,6 +76,47 @@ Result:
 
 - `minimax-m2p5/web_search_probe`: `ok`
 - `qwen3-8b/web_search_probe`: `ok`
+
+Full matrix before the follow-up fix:
+
+```bash
+CODEX_MATRIX_MODELS='qwen3-vl-30b-a3b-instruct,minimax-m2p5,llama-v3p3-70b-instruct,kimi-k2p5,qwen3-vl-30b-a3b-thinking,gpt-oss-20b,glm-5,qwen3-8b,glm-4p7,gpt-oss-120b,deepseek-v3p1,deepseek-v3p2' \
+CODEX_MATRIX_WORKERS=2 \
+CODEX_MATRIX_TIMEOUT=900 \
+CODEX_MATRIX_BASE_URL=http://127.0.0.1:3000/v1 \
+CODEX_MATRIX_WIRE_API=responses \
+CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
+python3 scripts/codex_realchain_matrix.py
+```
+
+Summary file:
+
+`/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-125802/summary.tsv`
+
+Result: `173 ok / 7 fail`. Failure reasons: `docfork_rate_limited=5`, `missed_docfork_fetch_doc=1`, `web_search_followup_not_grounded=1`.
+
+Follow-up targeted realchain retest after the gateway-timeout and ungrounded-fallback fixes:
+
+```bash
+CODEX_MATRIX_INCLUDE_DIRTY_WORKSPACE=1 \
+CODEX_MATRIX_MODELS='glm-4p7' \
+CODEX_MATRIX_SCENARIOS='web_search_probe,docfork_probe' \
+CODEX_MATRIX_WORKERS=1 \
+CODEX_MATRIX_TIMEOUT=420 \
+CODEX_MATRIX_BASE_URL=http://127.0.0.1:3000/v1 \
+CODEX_MATRIX_WIRE_API=responses \
+CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
+python3 scripts/codex_realchain_matrix.py
+```
+
+Summary file:
+
+`/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-140512/summary.tsv`
+
+Result:
+
+- `glm-4p7/web_search_probe`: `ok`
+- `glm-4p7/docfork_probe`: `ok`
 
 New API log ownership after `2026-04-28 12:05:00+08`:
 

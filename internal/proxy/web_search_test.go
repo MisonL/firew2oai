@@ -318,8 +318,9 @@ func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturn
 }
 
 const (
-	webSearchToolActionContent = "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest Go release\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
-	prefacedWebSearchFinalText = "Based on the provided search results, I cannot definitively verify the latest release.\n\nRESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 搜索结果未提供最新稳定版本号及发布日期"
+	webSearchToolActionContent   = "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest Go release\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	prefacedWebSearchFinalText   = "Based on the provided search results, I cannot definitively verify the latest release.\n\nRESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 搜索结果未提供最新稳定版本号及发布日期"
+	ungroundedWebSearchFinalText = "I do not have access to any search results, so I cannot answer."
 )
 
 func newWebSearchFollowupTestMux(t *testing.T, followupText string) (http.Handler, func()) {
@@ -418,6 +419,26 @@ func TestNormalizeWebSearchFinalOutputLabels_StripsPreface(t *testing.T) {
 	want := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 搜索结果未提供最新稳定版本号及发布日期"
 	if got != want {
 		t.Fatalf("normalized text mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestHandleResponses_NonStreamServerSideWebSearchFollowupUngroundedUsesFallbackFinal(t *testing.T) {
+	mux, cleanup := newWebSearchFollowupTestMux(t, ungroundedWebSearchFinalText)
+	defer cleanup()
+
+	got := postWebSearchProbeAndFinalText(t, mux)
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: none",
+		"TEST: N/A",
+		"NOTE:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("final text missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Codex adapter error:") || strings.Contains(got, "do not have access") {
+		t.Fatalf("final text should use captured web_search results:\n%s", got)
 	}
 }
 

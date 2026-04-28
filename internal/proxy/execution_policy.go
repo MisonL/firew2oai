@@ -1977,6 +1977,8 @@ func inferToolOutputSuccess(text string) *bool {
 		"permission denied",
 		"codex adapter guard:",
 		"upstream error",
+		"gateway timeout",
+		"upstream request timeout",
 		"mcp error",
 		"tool error",
 		"429 too many requests",

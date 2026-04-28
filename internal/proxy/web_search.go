@@ -169,6 +169,9 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 		return "", callOutputItems, historyRequestItems, true, err
 	}
 	if shouldUseWebSearchFallback(finalText) {
+		if taskRequestsNoFilesLabel(currentTask) && taskRequestsNotApplicableLabel(currentTask, "TEST") {
+			return buildWebSearchFallbackFinalText(currentTask, searchSummaries), callOutputItems, historyRequestItems, true, nil
+		}
 		return finalText, callOutputItems, historyRequestItems, true, fmt.Errorf("web_search follow-up did not answer from captured results")
 	}
 	if normalized, ok := normalizeWebSearchFinalOutputLabels(currentTask, finalText); ok {

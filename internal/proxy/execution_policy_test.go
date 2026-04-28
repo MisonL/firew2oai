@@ -2341,6 +2341,44 @@ func TestInferToolOutputSuccess_RecognizesRateLimitError(t *testing.T) {
 	}
 }
 
+func TestInferToolOutputSuccess_RecognizesGatewayTimeout(t *testing.T) {
+	got := inferToolOutputSuccess("504 Gateway Timeout: upstream request timeout")
+	if got == nil || *got {
+		t.Fatalf("inferToolOutputSuccess should return false for gateway timeout, got %#v", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsDocforkSearchAfterGatewayTimeout(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+		"mcp__docfork__fetch_doc":   {Name: "mcp__docfork__fetch_doc", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"search_docs","namespace":"mcp__docfork__","call_id":"call_docfork_1","arguments":"{\"library\":\"react\",\"query\":\"useEffectEvent\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_docfork_1","output":{"content":"504 Gateway Timeout: upstream request timeout"}}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog(
+		"glm-4p7",
+		"你是测试代理。请验证 Docfork MCP：\n1) 必须使用 mcp__docfork__search_docs 搜索 react 文档中的 useEffectEvent。\n2) 必须再使用 mcp__docfork__fetch_doc 获取相关文档内容。",
+		history,
+		toolCatalog,
+		true,
+		false,
+		true,
+	)
+
+	if policy.NextRequiredTool != "mcp__docfork__search_docs" {
+		t.Fatalf("policy.NextRequiredTool = %q, want mcp__docfork__search_docs after gateway timeout", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want retryable synthetic search_docs call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "search_docs" {
+		t.Fatalf("synthetic tool name = %q, want search_docs", got)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceKeepsDocforkSearchAfterRateLimit(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
