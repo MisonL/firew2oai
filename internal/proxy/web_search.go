@@ -171,6 +171,9 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 	if shouldUseWebSearchFallback(finalText) {
 		return finalText, callOutputItems, historyRequestItems, true, fmt.Errorf("web_search follow-up did not answer from captured results")
 	}
+	if normalized, ok := normalizeWebSearchFinalOutputLabels(currentTask, finalText); ok {
+		finalText = normalized
+	}
 	if missingRequiredOutputLabels(currentTask, finalText) {
 		return finalText, callOutputItems, historyRequestItems, true, fmt.Errorf("web_search follow-up omitted required output labels")
 	}
@@ -712,6 +715,18 @@ func missingRequiredOutputLabels(task, text string) bool {
 		}
 	}
 	return false
+}
+
+func normalizeWebSearchFinalOutputLabels(task, text string) (string, bool) {
+	labels := dedupePreserveOrder(extractRequiredOutputLabels(task))
+	if len(labels) == 0 {
+		return text, false
+	}
+	normalized, missing := normalizeRequiredLabelOutput(text, labels)
+	if len(missing) > 0 {
+		return text, false
+	}
+	return normalized, true
 }
 
 func buildWebSearchFallbackFinalText(task string, summaries []string) string {

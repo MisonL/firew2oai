@@ -317,6 +317,110 @@ func TestHandleResponses_NonStreamServerSideWebSearchFollowupMissingLabelsReturn
 	}
 }
 
+const (
+	webSearchToolActionContent = "<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"web_search\",\"arguments\":{\"query\":\"latest Go release\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	prefacedWebSearchFinalText = "Based on the provided search results, I cannot definitively verify the latest release.\n\nRESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 搜索结果未提供最新稳定版本号及发布日期"
+)
+
+func newWebSearchFollowupTestMux(t *testing.T, followupText string) (http.Handler, func()) {
+	t.Helper()
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		defer func() {
+			_ = r.Body.Close()
+		}()
+
+		var fwReq FireworksRequest
+		if err := json.NewDecoder(r.Body).Decode(&fwReq); err != nil {
+			t.Fatalf("decode upstream request: %v", err)
+		}
+		content := webSearchToolActionContent
+		if strings.Contains(fwReq.Messages[0].Content, "Web search query: latest Go release") {
+			content = followupText
+		}
+		_, _ = w.Write([]byte(marshalSSEContent(t, content)))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+
+	search := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"Go release notes","url":"https://go.dev/doc/devel/release","snippet":"Release history for Go."}]}`))
+	}))
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	p.webSearchEndpoint = search.URL
+	p.webSearchClient = search.Client()
+	cleanup := func() {
+		upstream.Close()
+		search.Close()
+	}
+	return newTestMux(t, p, "*"), cleanup
+}
+
+func postWebSearchProbeAndFinalText(t *testing.T, handler http.Handler) string {
+	t.Helper()
+	body := `{"model":"minimax-m2p5","stream":false,"input":"你是测试代理。请验证 web_search：\n1) 必须使用 web_search 查询 Go 官方最新稳定版本与发布日期。\n2) 禁止使用 exec_command、docfork 或其他工具代替 web_search。\n3) web_search 返回后，必须直接用四行格式收口，不要输出前言或解释工具行为。\n4) 不要修改任何文件。\n最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。","tools":[{"type":"web_search","external_web_access":true}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var resp ResponsesResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Output) != 2 {
+		t.Fatalf("output len = %d, want 2", len(resp.Output))
+	}
+
+	var messageItem ResponseOutputMessage
+	if err := json.Unmarshal(resp.Output[1], &messageItem); err != nil {
+		t.Fatalf("decode message item: %v", err)
+	}
+	if len(messageItem.Content) == 0 {
+		t.Fatal("expected at least one content item in ResponseOutputMessage, got 0")
+	}
+	return messageItem.Content[0].Text
+}
+
+func TestHandleResponses_NonStreamServerSideWebSearchFollowupNormalizesPrefacedLabels(t *testing.T) {
+	mux, cleanup := newWebSearchFollowupTestMux(t, prefacedWebSearchFinalText)
+	defer cleanup()
+
+	got := postWebSearchProbeAndFinalText(t, mux)
+	for _, want := range []string{
+		"RESULT: PASS",
+		"FILES: none",
+		"TEST: N/A",
+		"NOTE:",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("final text missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "Based on") || strings.Contains(got, "Codex adapter error:") {
+		t.Fatalf("final text should contain only normalized labels:\n%s", got)
+	}
+}
+
+func TestNormalizeWebSearchFinalOutputLabels_StripsPreface(t *testing.T) {
+	task := "最后只输出四行：RESULT: PASS 或 FAIL；FILES: none；TEST: N/A；NOTE: 版本号与日期。"
+
+	got, ok := normalizeWebSearchFinalOutputLabels(task, prefacedWebSearchFinalText)
+	if !ok {
+		t.Fatal("normalizeWebSearchFinalOutputLabels ok = false, want true")
+	}
+	want := "RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 搜索结果未提供最新稳定版本号及发布日期"
+	if got != want {
+		t.Fatalf("normalized text mismatch\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestHandleResponses_NonStreamServerSideWebSearchFollowupUpstream500UsesFallbackFinal(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
