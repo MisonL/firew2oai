@@ -1,5 +1,9 @@
 # Codex Known Issues Follow-up - 2026-04-28
 
+## Latest Status
+
+本文件记录已知问题的定向修复与复测。后续最终全量矩阵已在 2026-04-28 16:25 CST 通过，结果为 `180 ok / 0 fail`，12 个模型均为 `15/15`。当前已无 `web_search_challenge_blocked`、`web_search_followup_unstructured`、`upstream_sse_idle_timeout` 或 `semantic_result_fail` 残留。
+
 ## Scope
 
 本记录覆盖 2026-04-28 对已知 Codex realchain 问题的继续分析、适配优化和复测。

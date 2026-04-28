@@ -1,5 +1,11 @@
 # Codex Full Matrix Regression - 2026-04-28
 
+## Latest Status
+
+本文件记录的是 2026-04-27 22:50 CST 开始的一次中间失败快照。后续已完成 web_search、Docfork probe、严格工具循环和子代理链路适配，最终全量矩阵在 2026-04-28 16:25 CST 复测为 `180 ok / 0 fail`。
+
+最新权威结果见 `docs/reviews/CR-WEB-SEARCH-FOLLOWUP-2026-04-28.md` 的 `2026-04-28 16:25 Final Full Matrix` 段落。本文以下失败分类仅用于保留当时问题分析证据，不代表当前状态。
+
 ## Scope
 
 本记录覆盖本轮默认全量矩阵复测，不包含 `builtin-tools` 额外套件。矩阵使用本地 `firew2oai` 到本地 `new-api` 链路，Bearer token 从 `/tmp/firew2oai-mison-newapi-token` 读取，未在命令或日志中输出。

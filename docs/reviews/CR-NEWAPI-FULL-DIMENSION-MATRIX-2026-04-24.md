@@ -2,6 +2,8 @@
 
 日期：2026-04-24
 
+最新状态：本文件是 2026-04-24 的历史快照，内部“当前”表述均指当日状态。new-api 网关链路的最新权威结果已更新为 2026-04-28 16:25 CST 全量矩阵 `180 ok / 0 fail`，见 `docs/reviews/CR-WEB-SEARCH-FOLLOWUP-2026-04-28.md`。
+
 范围：
 
 - 链路：`Codex -> new-api -> firew2oai`

@@ -4,6 +4,8 @@
 
 范围：`Codex -> new-api -> firew2oai` 真实链路下的 `real_docfork_api_lookup` 聚焦复测。
 
+最新状态：本文件保留 2026-04-25 Docfork 专项修复证据。后续全量矩阵已在 2026-04-28 16:25 CST 复测为 `180 ok / 0 fail`，`qwen3-vl-30b-a3b-thinking` 已达到 `15/15`，不再作为当前剩余风险记录。
+
 ## 背景
 
 此前该场景在全模型矩阵中表现为 `0/12 PASS`。失败集中在 Docfork MCP 参数、AI_ACTIONS 解析容错、以及 MCP 工具序列后的执行策略推进。
@@ -81,11 +83,11 @@ python3 scripts/codex_realchain_matrix.py
 - `qwen3-vl-30b-a3b-instruct`
 - `qwen3-vl-30b-a3b-thinking`
 
-通过样本均完成 `mcp__docfork__search_docs -> mcp__docfork__fetch_doc -> exec_command README.md -> RESULT: PASS`。`qwen3-vl-30b-a3b-thinking` 最新全矩阵耗时 `275.8s`，仍是长尾样本，但已不再因工具循环或初始非工具叙述失败。
+通过样本均完成 `mcp__docfork__search_docs -> mcp__docfork__fetch_doc -> exec_command README.md -> RESULT: PASS`。当日样本中 `qwen3-vl-30b-a3b-thinking` 全矩阵耗时 `275.8s`，属于当时的耗时长尾，但已不再因工具循环或初始非工具叙述失败。
 
 ## 结论
 
-本轮问题主要是适配层和评测口径缺口，不是 Docfork 工具本身不可用。修复后 Docfork 场景已从 `0/12 PASS` 收敛为 `12/12 PASS`。剩余风险不再是功能失败，而是 `qwen3-vl-30b-a3b-thinking` 的耗时长尾。
+本轮问题主要是适配层和评测口径缺口，不是 Docfork 工具本身不可用。修复后 Docfork 场景已从 `0/12 PASS` 收敛为 `12/12 PASS`。当日剩余风险不再是功能失败，而是 `qwen3-vl-30b-a3b-thinking` 的耗时长尾；该风险已被 2026-04-28 最终全量矩阵覆盖。
 
 ## 二次优化记录
 

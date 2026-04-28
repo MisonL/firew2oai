@@ -2,6 +2,8 @@
 
 日期：2026-04-26
 
+最新状态：本文件是 2026-04-26 的工具信号修复历史快照。后续已补齐 `apply_patch`、`js_repl`、`view_image`、subagent、web_search、Docfork 和 Chrome DevTools 场景适配，最终全量矩阵在 2026-04-28 16:25 CST 为 `180 ok / 0 fail`。
+
 范围：
 
 - 评分脚本：`scripts/codex_realchain_matrix.py`
