@@ -501,6 +501,38 @@ func TestApplyExecutionPolicyToParseResult_ExplicitCommandsRewriteRepeatedReadCo
 	}
 }
 
+func TestApplyExecutionPolicyToParseResult_RewritesRepeatedRequiredFileReadBeforeRequiredTests(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	task := "你是资深 Go 工程师。请在当前仓库完成一个真实 Coding 只读核验任务：\n" +
+		"1) 阅读 internal/proxy/output_constraints.go。\n" +
+		"2) 阅读 internal/proxy/execution_evidence.go。\n" +
+		"3) 执行 go test ./internal/proxy。\n" +
+		"4) 执行 go test ./...。"
+	history := historyExecCommandItems("sed -n '1,200p' 'internal/proxy/output_constraints.go'")
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextCommand != "sed -n '1,200p' 'internal/proxy/execution_evidence.go'" {
+		t.Fatalf("policy.NextCommand = %q, want second required file read", policy.NextCommand)
+	}
+
+	content := "重复读取第一份文件。\n<<<AI_ACTIONS_V1>>>\n" +
+		"{\"mode\":\"tool\",\"calls\":[{\"name\":\"exec_command\",\"arguments\":{\"cmd\":\"sed -n '1,200p' 'internal/proxy/output_constraints.go'\"}}]}\n" +
+		"<<<END_AI_ACTIONS_V1>>>"
+	parseResult := parseToolCallOutputsWithConstraints(content, toolCatalog, toolProtocolConstraints{})
+	got := applyExecutionPolicyToParseResult(parseResult, policy, toolCatalog, toolProtocolConstraints{})
+	if got.err != nil {
+		t.Fatalf("got.err = %v, want nil", got.err)
+	}
+	if len(got.calls) != 1 {
+		t.Fatalf("len(got.calls) = %d, want 1", len(got.calls))
+	}
+	command := parsedCallCommand(t, got.calls[0])
+	if command != "sed -n '1,200p' 'internal/proxy/execution_evidence.go'" {
+		t.Fatalf("command = %q, want rewritten to second required file read", command)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceRequiresNextTool(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__docfork__search_docs": {Name: "mcp__docfork__search_docs", Type: "function", Structured: true, Namespace: "mcp__docfork__"},
@@ -1835,6 +1867,9 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesWaitAgentAndCloseAg
 	if got := parsedCallArgumentList(t, *waitPolicy.SyntheticToolCall, "targets"); !reflect.DeepEqual(got, []string{"agent_123"}) {
 		t.Fatalf("synthetic wait_agent targets = %#v, want []string{\"agent_123\"}", got)
 	}
+	if got := parsedCallArgument(t, *waitPolicy.SyntheticToolCall, "timeout_ms"); got != strconv.Itoa(syntheticWaitAgentTimeoutMS) {
+		t.Fatalf("synthetic wait_agent timeout_ms = %q, want %d", got, syntheticWaitAgentTimeoutMS)
+	}
 
 	closeHistory := append(append([]json.RawMessage(nil), history...),
 		json.RawMessage(`{"type":"function_call","name":"wait_agent","call_id":"call_wait_1","arguments":"{\"targets\":[\"agent_123\"]}"}`),
@@ -2910,6 +2945,54 @@ func TestBuildExecutionPolicy_ReadOnlyTaskKeepsNextRequiredCommand(t *testing.T)
 	}
 	if policy.NextCommand != "sed -n '170,260p' internal/proxy/tool_protocol.go" {
 		t.Fatalf("next command = %q", policy.NextCommand)
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyTaskPollsRunningRequiredCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	task := "只读审计：\n1) 执行 `go test ./internal/proxy`\n2) 执行 `go test ./...`"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_test_1","arguments":"{\"cmd\":\"go test ./internal/proxy\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_test_1","output":"Chunk ID: b2d050\nWall time: 10.0009 seconds\nProcess running with session ID 32760\nOriginal token count: 0\nOutput:\n"}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = %q, want write_stdin", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want polling write_stdin call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "write_stdin" {
+		t.Fatalf("synthetic tool name = %q, want write_stdin", got)
+	}
+	if got := parsedCallArgument(t, *policy.SyntheticToolCall, "session_id"); got != "32760" {
+		t.Fatalf("synthetic write_stdin session_id = %q, want 32760", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ReadOnlyTaskAdvancesAfterPolledCommandExit(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"write_stdin":  {Name: "write_stdin", Type: "function", Structured: true},
+	}
+	task := "只读审计：\n1) 执行 `go test ./internal/proxy`\n2) 执行 `go test ./...`"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_test_1","arguments":"{\"cmd\":\"go test ./internal/proxy\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_test_1","output":"Chunk ID: b2d050\nWall time: 10.0009 seconds\nProcess running with session ID 32760\nOriginal token count: 0\nOutput:\n"}`),
+		json.RawMessage(`{"type":"function_call","name":"write_stdin","call_id":"call_poll_1","arguments":"{\"session_id\":32760,\"chars\":\"\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_poll_1","output":"Chunk ID: b2d050\nWall time: 18.0000 seconds\nProcess exited with code 0\nOutput:\nok  \tgithub.com/mison/firew2oai/internal/proxy\t18.000s"}`),
+	}
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool == "write_stdin" {
+		t.Fatalf("policy.NextRequiredTool = write_stdin, want next required command after process exit: %+v", policy)
+	}
+	if policy.NextCommand != "go test ./..." {
+		t.Fatalf("policy.NextCommand = %q, want go test ./...", policy.NextCommand)
 	}
 }
 

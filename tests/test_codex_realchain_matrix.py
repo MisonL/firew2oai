@@ -845,6 +845,20 @@ class RunHelperTests(TestCase):
             "web_search_no_results",
         )
 
+    def test_classify_failure_reason_marks_web_search_challenge_blocked(self) -> None:
+        self.assertEqual(
+            matrix.classify_failure_reason(
+                exit_code="0",
+                expected_signals=("web_search",),
+                observed_signals=["web_search"],
+                final_preview="Codex adapter error: web search failed after 1 attempt(s): web search backend blocked request with DuckDuckGo challenge",
+                stderr_preview="",
+                labels_ok=False,
+                result_pass=False,
+            ),
+            "web_search_challenge_blocked",
+        )
+
     def test_classify_failure_reason_marks_mcp_search_invalid_args(self) -> None:
         self.assertEqual(
             matrix.classify_failure_reason(

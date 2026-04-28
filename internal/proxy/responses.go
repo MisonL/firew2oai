@@ -2114,6 +2114,81 @@ func buildSyntheticToolOutputItems(policy executionPolicy) []json.RawMessage {
 	return buildParsedToolOutputItems([]parsedToolCall{*policy.SyntheticToolCall})
 }
 
+func shouldServeSyntheticToolCallDirect(policy executionPolicy) bool {
+	if policy.SyntheticToolCall == nil || !policy.RequireTool || policy.Stage == "finalize" {
+		return false
+	}
+	name, command, ok := parsedToolCallInvocation(*policy.SyntheticToolCall)
+	if !ok {
+		return false
+	}
+	switch name {
+	case "spawn_agent", "wait_agent", "close_agent":
+		return shortToolName(policy.NextRequiredTool) == name
+	case "write_stdin":
+		return policy.NextRequiredTool == "write_stdin"
+	case "exec_command":
+		nextCommand := strings.TrimSpace(policy.NextCommand)
+		return nextCommand != "" && command != "" && hasSatisfiedRequiredCommand([]string{command}, nextCommand)
+	default:
+		return false
+	}
+}
+
+func (p *Proxy) writeSyntheticResponsesToolCall(w http.ResponseWriter, stream bool, responseID, messageID, model string, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, policy executionPolicy) {
+	outputItems := buildSyntheticToolOutputItems(policy)
+	if len(outputItems) == 0 {
+		return
+	}
+	createdAt := time.Now().Unix()
+	completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
+	p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+	if !stream {
+		writeJSON(w, http.StatusOK, completed)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, canFlush := w.(http.Flusher)
+	writeAndFlushEvent := func(event string, payload any) bool {
+		if err := writeSSEEvent(w, event, payload); err != nil {
+			slog.Debug("client disconnected, stopping synthetic responses stream", "response_id", responseID, "error", err)
+			return false
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		return true
+	}
+
+	created := newResponsesResponse(responseID, messageID, model, createdAt, "in_progress", "")
+	if !writeAndFlushEvent("response.created", newResponseLifecycleEvent("response.created", created)) {
+		return
+	}
+	for index, item := range outputItems {
+		if !writeAndFlushEvent("response.output_item.added", ResponseOutputItemAddedEvent{
+			Type:        "response.output_item.added",
+			ResponseID:  responseID,
+			OutputIndex: index,
+			Item:        item,
+		}) {
+			return
+		}
+		if !writeAndFlushEvent("response.output_item.done", ResponseOutputItemDoneEvent{
+			Type:        "response.output_item.done",
+			ResponseID:  responseID,
+			OutputIndex: index,
+			Item:        item,
+		}) {
+			return
+		}
+	}
+	writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
+}
+
 func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed, use POST")
@@ -2268,6 +2343,19 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		"evidence_outputs", compactCommandsForLog(executionEvidence.Outputs),
 		"history_item_types", summarizeRawItemTypes(policyHistoryItems),
 	)
+	if bufferForToolCalls && shouldServeSyntheticToolCallDirect(executionPolicy) {
+		name, command, _ := parsedToolCallInvocation(*executionPolicy.SyntheticToolCall)
+		slog.Info("responses direct synthetic tool call",
+			"response_id", responseID,
+			"tool", name,
+			"command", command,
+			"execution_stage", executionPolicy.Stage,
+			"execution_next_command", executionPolicy.NextCommand,
+			"required_tool", executionPolicy.NextRequiredTool,
+		)
+		p.writeSyntheticResponsesToolCall(w, req.Stream, responseID, messageID, req.Model, requestItems, baseHistoryItems, promptInputItems, executionPolicy)
+		return
+	}
 	if req.Stream {
 		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 		return

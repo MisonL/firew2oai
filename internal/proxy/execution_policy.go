@@ -12,7 +12,10 @@ import (
 	"strings"
 )
 
-const explicitToolFailureStopThreshold = 2
+const (
+	explicitToolFailureStopThreshold = 2
+	syntheticWaitAgentTimeoutMS      = 120000
+)
 
 type executionPolicy struct {
 	Enabled              bool
@@ -47,6 +50,8 @@ type executionHistorySignals struct {
 	FailedCommands      []string
 	EmptyCommands       []string
 	CommandOutputs      map[string]string
+	RunningSessionID    string
+	RunningCommand      string
 	LastWritePos        int
 	LastFailedTestPos   int
 	ReadResultPosByFile map[string]int
@@ -117,6 +122,20 @@ func buildExecutionPolicyWithCatalog(model, currentTask string, historyItems []j
 	}
 	styleCommands := dedupePreserveOrder(extractStyleInspectionCommands(task))
 	needsWrite := taskLikelyNeedsWrite(task) && !taskRequestsReadOnlyDiagnosis(task)
+	if shouldPollRunningCommand(signals, task, nextRequiredTool, toolCatalog) {
+		if synthetic := buildSyntheticWriteStdinPollCall(signals.RunningSessionID, toolCatalog); synthetic != nil {
+			policy.Enabled = true
+			policy.Stage = "verify"
+			policy.RequireTool = true
+			policy.NextRequiredTool = "write_stdin"
+			policy.RequiredCommands = requiredCommands
+			policy.RequiredFiles = requiredFiles
+			policy.ExplicitTools = explicitTools
+			policy.SeenCommands = dedupePreserveOrder(signals.Commands)
+			policy.SyntheticToolCall = synthetic
+			return policy
+		}
+	}
 	nextCommand := chooseNextExecutionCommandWithStyles(requiredCommands, sequenceFiles, styleCommands, signals, needsWrite, requiredFiles)
 	if seedWriteCommand := buildSeedWriteCommand(task, requiredFiles, signals); needsWrite && shouldPreferSeedWriteCommand(requiredFiles, signals, seedWriteCommand) {
 		nextCommand = seedWriteCommand
@@ -184,7 +203,7 @@ func buildExecutionPolicyWithCatalog(model, currentTask string, historyItems []j
 			policy.Stage = "execute"
 		}
 		policy.SyntheticToolCall = buildSyntheticExplicitToolCall(nextRequiredTool, currentTask, historyItems, toolCatalog, nextCommand)
-	} else if shouldForceSyntheticNextCommand(policy) {
+	} else if shouldBuildSyntheticNextCommand(policy, needsWrite) {
 		if synthetic, ok := buildSyntheticExecCommandCall(nextCommand, toolCatalog, ""); ok {
 			policy.SyntheticToolCall = &synthetic
 		}
@@ -460,7 +479,17 @@ func applyExecutionPolicyToParseResult(result parsedToolCallBatchResult, policy 
 }
 
 func shouldForceSyntheticNextCommand(policy executionPolicy) bool {
-	return policy.Stage == "verify" && policy.NextRequiredTool == "" && strings.TrimSpace(policy.NextCommand) != ""
+	if policy.NextRequiredTool != "" || strings.TrimSpace(policy.NextCommand) == "" {
+		return false
+	}
+	return policy.Stage == "verify" || (policy.Stage == "explore" && policy.ForceSingleToolCall)
+}
+
+func shouldBuildSyntheticNextCommand(policy executionPolicy, needsWrite bool) bool {
+	if !shouldForceSyntheticNextCommand(policy) {
+		return false
+	}
+	return policy.Stage != "explore" || !needsWrite
 }
 
 func buildPendingWriteGuardCommand(policy executionPolicy, calls []parsedToolCall) string {
@@ -786,7 +815,8 @@ func modelNeedsStrictToolLoop(model string) bool {
 	case strings.Contains(lower, "minimax-m2p5"),
 		strings.Contains(lower, "kimi-k2p5"),
 		strings.Contains(lower, "glm-4p7"),
-		strings.Contains(lower, "deepseek-v3p1"):
+		strings.Contains(lower, "deepseek-v3p1"),
+		strings.Contains(lower, "qwen3-vl-30b-a3b-thinking"):
 		return true
 	default:
 		return false
@@ -804,6 +834,12 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 		ReadResultPosByFile: make(map[string]int, 8),
 	}
 	callIDToCommand := make(map[string]string, 8)
+	callIDToTool := make(map[string]string, 8)
+	callIDToSession := make(map[string]string, 4)
+	sessionIDToCommand := make(map[string]string, 4)
+	sessionIDToPos := make(map[string]int, 4)
+	runningSessions := make(map[string]struct{}, 4)
+	runningSessionOrder := make([]string, 0, 4)
 	callIDToPos := make(map[string]int, 8)
 	callPos := 0
 
@@ -825,6 +861,13 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 				continue
 			}
 			signals.ToolCalls++
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToTool[callID] = normalizedName
+				if normalizedName == "write_stdin" {
+					callIDToSession[callID] = extractSessionIDFromFunctionCall(item)
+				}
+			}
 			if isMutationToolName(normalizedName) {
 				signals.WriteCalls++
 				continue
@@ -838,7 +881,6 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			}
 			callPos++
 			signals.Commands = append(signals.Commands, command)
-			callID, _ := item["call_id"].(string)
 			if callID != "" {
 				callIDToCommand[callID] = command
 				callIDToPos[callID] = callPos
@@ -873,6 +915,13 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 				continue
 			}
 			signals.ToolCalls++
+			callID, _ := item["call_id"].(string)
+			if callID != "" {
+				callIDToTool[callID] = normalizedName
+				if normalizedName == "write_stdin" {
+					callIDToSession[callID] = extractSessionIDFromFunctionCall(item)
+				}
+			}
 			if isMutationToolName(normalizedName) {
 				signals.WriteCalls++
 				continue
@@ -887,7 +936,6 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			}
 			callPos++
 			signals.Commands = append(signals.Commands, command)
-			callID, _ := item["call_id"].(string)
 			if callID != "" {
 				callIDToCommand[callID] = command
 				callIDToPos[callID] = callPos
@@ -909,13 +957,40 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			}
 		case "function_call_output", "custom_tool_call_output":
 			callID, _ := item["call_id"].(string)
+			if callIDToTool[callID] == "write_stdin" {
+				sessionID := strings.TrimSpace(callIDToSession[callID])
+				command := strings.TrimSpace(sessionIDToCommand[sessionID])
+				if command == "" {
+					continue
+				}
+				text, success := extractToolOutputText(item["output"])
+				statusText := text + "\n" + toolOutputStatusText(item["output"])
+				if processExited, exitSuccess := processExitStatus(statusText); processExited {
+					if success == nil {
+						success = &exitSuccess
+					}
+					recordCommandResult(&signals, command, text, success, sessionIDToPos[sessionID])
+					delete(runningSessions, sessionID)
+				}
+				continue
+			}
 			command := strings.TrimSpace(callIDToCommand[callID])
 			if command == "" {
 				continue
 			}
 			pos := callIDToPos[callID]
-			signals.CommandsWithResult = append(signals.CommandsWithResult, command)
 			text, success := extractToolOutputText(item["output"])
+			statusText := text + "\n" + toolOutputStatusText(item["output"])
+			if sessionID := extractSessionIDFromToolOutput(item["output"]); sessionID != "" && processStillRunning(statusText) {
+				sessionIDToCommand[sessionID] = command
+				sessionIDToPos[sessionID] = pos
+				runningSessions[sessionID] = struct{}{}
+				runningSessionOrder = append(runningSessionOrder, sessionID)
+				if strings.TrimSpace(text) != "" {
+					signals.CommandOutputs[command] = text
+				}
+				continue
+			}
 			if success == nil {
 				if isTestCommand(command) {
 					success = inferTestCommandOutputSuccess(text)
@@ -923,37 +998,88 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 					success = inferToolOutputSuccess(text)
 				}
 			}
-			if isReadOnlyCommand(command) {
-				if filePath := strings.TrimSpace(taskFilePathPattern.FindString(command)); filePath != "" && pos > 0 {
-					signals.ReadResultPosByFile[filePath] = pos
-				}
-			}
-			successful := success == nil || *success
-			if isTestCommand(command) {
-				successful = success != nil && *success
-			}
-			if successful {
-				signals.SuccessfulCommands = append(signals.SuccessfulCommands, command)
-				if strings.TrimSpace(text) != "" {
-					signals.CommandOutputs[command] = text
-				}
-				if isReadOnlyCommand(command) && strings.TrimSpace(text) == "" {
-					signals.EmptyCommands = append(signals.EmptyCommands, command)
-				}
-			} else {
-				signals.FailedCommands = append(signals.FailedCommands, command)
-				if isTestCommand(command) && pos > 0 {
-					signals.LastFailedTestPos = pos
-				}
-			}
+			recordCommandResult(&signals, command, text, success, pos)
 		}
 	}
 
+	for i := len(runningSessionOrder) - 1; i >= 0; i-- {
+		sessionID := runningSessionOrder[i]
+		if _, ok := runningSessions[sessionID]; !ok {
+			continue
+		}
+		signals.RunningSessionID = sessionID
+		signals.RunningCommand = sessionIDToCommand[sessionID]
+		break
+	}
 	signals.SuccessfulCommands = dedupePreserveOrder(signals.SuccessfulCommands)
 	signals.CommandsWithResult = dedupePreserveOrder(signals.CommandsWithResult)
 	signals.FailedCommands = dedupePreserveOrder(signals.FailedCommands)
 	signals.EmptyCommands = dedupePreserveOrder(signals.EmptyCommands)
 	return signals
+}
+
+func recordCommandResult(signals *executionHistorySignals, command, text string, success *bool, pos int) {
+	signals.CommandsWithResult = append(signals.CommandsWithResult, command)
+	if isReadOnlyCommand(command) {
+		if filePath := strings.TrimSpace(taskFilePathPattern.FindString(command)); filePath != "" && pos > 0 {
+			signals.ReadResultPosByFile[filePath] = pos
+		}
+	}
+	successful := success == nil || *success
+	if isTestCommand(command) {
+		successful = success != nil && *success
+	}
+	if successful {
+		signals.SuccessfulCommands = append(signals.SuccessfulCommands, command)
+		if strings.TrimSpace(text) != "" {
+			signals.CommandOutputs[command] = text
+		}
+		if isReadOnlyCommand(command) && strings.TrimSpace(text) == "" {
+			signals.EmptyCommands = append(signals.EmptyCommands, command)
+		}
+		return
+	}
+	signals.FailedCommands = append(signals.FailedCommands, command)
+	if isTestCommand(command) && pos > 0 {
+		signals.LastFailedTestPos = pos
+	}
+}
+
+func processStillRunning(text string) bool {
+	return strings.Contains(strings.ToLower(text), "process running with session id")
+}
+
+func processExitStatus(text string) (bool, bool) {
+	matches := processExitCodePattern.FindStringSubmatch(text)
+	if len(matches) < 2 {
+		return false, false
+	}
+	code, err := strconv.Atoi(strings.TrimSpace(matches[1]))
+	if err != nil {
+		return true, false
+	}
+	return true, code == 0
+}
+
+func toolOutputStatusText(output any) string {
+	switch value := output.(type) {
+	case string:
+		return value
+	case map[string]any:
+		parts := make([]string, 0, 4)
+		for _, key := range []string{"content", "text", "output", "message"} {
+			if text := toolOutputStatusText(value[key]); strings.TrimSpace(text) != "" {
+				parts = append(parts, text)
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	}
+	if encoded, err := json.Marshal(output); err == nil {
+		return string(encoded)
+	}
+	return ""
 }
 
 func chooseNextExecutionCommand(requiredCommands, requiredFiles []string, signals executionHistorySignals, needsWrite bool) string {
@@ -2904,6 +3030,7 @@ var syntheticDocforkCompactSearchPattern = regexp.MustCompile(`(?i)(?:search_doc
 var syntheticWebSearchQueryPattern = regexp.MustCompile(`(?:必须使用\s+)?web_search\s*(?:查询|搜索)\s*([^\n。；;]+)`)
 var syntheticWriteStdinCommandPattern = regexp.MustCompile(`(?m)(print\([^)\n]+\)|exit\(\))`)
 var syntheticSessionIDPattern = regexp.MustCompile(`(?i)(?:session[_ ]id|session ID)\D+(\d+)`)
+var processExitCodePattern = regexp.MustCompile(`(?i)process exited with code\s+(-?\d+)`)
 var syntheticApplyPatchReplacePattern = regexp.MustCompile(`(?:把|将)(?:文件|内容)?中?的?\s*([A-Za-z0-9_.-]+)\s*改为\s*([A-Za-z0-9_.-]+)|replace\s+([A-Za-z0-9_.-]+)\s+with\s+([A-Za-z0-9_.-]+)`)
 var syntheticGenericFilePathPattern = regexp.MustCompile(`(?i)(?:[a-z0-9_.-]+/)+[a-z0-9_.-]+\.[a-z0-9_.-]+`)
 var syntheticContext7ResolvePattern = regexp.MustCompile(`(?:查找|搜索)\s+([A-Za-z0-9._/-]+)`)
@@ -3068,6 +3195,80 @@ func buildSyntheticWriteStdinCall(nextRequiredTool, task string, historyItems []
 		return nil
 	}
 	return call
+}
+
+func shouldPollRunningCommand(signals executionHistorySignals, task, nextRequiredTool string, toolCatalog map[string]responseToolDescriptor) bool {
+	if strings.TrimSpace(signals.RunningSessionID) == "" || !toolAvailableForPolicy(toolCatalog, "write_stdin") {
+		return false
+	}
+	if nextRequiredTool == "write_stdin" && strings.Contains(strings.ToLower(task), "write_stdin") {
+		return false
+	}
+	return true
+}
+
+func toolAvailableForPolicy(toolCatalog map[string]responseToolDescriptor, name string) bool {
+	if len(toolCatalog) == 0 {
+		return true
+	}
+	_, ok := toolCatalog[name]
+	return ok
+}
+
+func buildSyntheticWriteStdinPollCall(sessionID string, toolCatalog map[string]responseToolDescriptor) *parsedToolCall {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	sessionArg := any(sessionID)
+	if parsed, err := strconv.Atoi(sessionID); err == nil {
+		sessionArg = parsed
+	}
+	call, ok := buildSyntheticStructuredToolCall("write_stdin", map[string]any{
+		"session_id":        sessionArg,
+		"chars":             "",
+		"yield_time_ms":     1000,
+		"max_output_tokens": 6000,
+	}, toolCatalog, "write_stdin")
+	if !ok {
+		return nil
+	}
+	return call
+}
+
+func extractSessionIDFromFunctionCall(item map[string]any) string {
+	rawArgs, ok := item["arguments"]
+	if !ok {
+		return ""
+	}
+	switch args := rawArgs.(type) {
+	case string:
+		var decoded any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(args)), &decoded); err != nil {
+			return ""
+		}
+		return extractSessionIDFromArguments(decoded)
+	default:
+		return extractSessionIDFromArguments(args)
+	}
+}
+
+func extractSessionIDFromArguments(args any) string {
+	value, ok := args.(map[string]any)
+	if !ok {
+		return ""
+	}
+	for _, key := range []string{"session_id", "sessionId"} {
+		switch raw := value[key].(type) {
+		case string:
+			return strings.TrimSpace(raw)
+		case float64:
+			return strconv.Itoa(int(raw))
+		case int:
+			return strconv.Itoa(raw)
+		}
+	}
+	return ""
 }
 
 func latestInteractiveSessionID(historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor) string {
@@ -3442,7 +3643,10 @@ func buildSyntheticWaitAgentCall(nextRequiredTool string, historyItems []json.Ra
 	if agentID == "" {
 		return nil
 	}
-	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{"targets": []string{agentID}}, toolCatalog, nextRequiredTool)
+	call, ok := buildSyntheticStructuredToolCall(nextRequiredTool, map[string]any{
+		"targets":    []string{agentID},
+		"timeout_ms": syntheticWaitAgentTimeoutMS,
+	}, toolCatalog, nextRequiredTool)
 	if !ok {
 		return nil
 	}

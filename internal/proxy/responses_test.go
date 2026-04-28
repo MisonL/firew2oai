@@ -1342,6 +1342,143 @@ func TestHandleResponses_StreamFunctionToolCall(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_StreamDirectSyntheticExecCommandSkipsUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"should not be used\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	body := `{"model":"qwen3-vl-30b-a3b-thinking","input":"只读核验：1) 执行 ` + "`pwd`" + `。最后输出 RESULT: PASS。","stream":true,"tools":[{"type":"function","name":"exec_command","description":"run shell","parameters":{"type":"object","properties":{"cmd":{"type":"string"}}}}]}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0 for deterministic synthetic tool call", got)
+	}
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.created",
+		"event: response.output_item.done",
+		`"type":"function_call"`,
+		`"name":"exec_command"`,
+		`"cmd\":\"pwd\"`,
+		"event: response.completed",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+	if strings.Contains(bodyText, "response.output_text.delta") {
+		t.Fatalf("direct synthetic tool-call stream should not emit text deltas:\n%s", bodyText)
+	}
+}
+
+func TestHandleResponses_StreamDirectSyntheticSpawnAgentSkipsUpstream(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"should not be used\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	mux := newTestMux(t, p, "*")
+	task := "必须使用 spawn_agent 启动一个子代理。\n" +
+		"子代理任务是读取 README.md 第一行并返回结果。\n" +
+		"必须使用 wait_agent 等待结果。\n" +
+		"必须使用 close_agent 关闭子代理。"
+	bodyBytes, err := json.Marshal(map[string]any{
+		"model":  "qwen3-vl-30b-a3b-thinking",
+		"input":  task,
+		"stream": true,
+		"tools": []map[string]any{
+			{
+				"type":        "function",
+				"name":        "spawn_agent",
+				"description": "spawn a sub agent",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{"message": map[string]any{"type": "string"}}},
+			},
+			{
+				"type":        "function",
+				"name":        "wait_agent",
+				"description": "wait for a sub agent",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{"targets": map[string]any{"type": "array", "items": map[string]any{"type": "string"}}}},
+			},
+			{
+				"type":        "function",
+				"name":        "close_agent",
+				"description": "close a sub agent",
+				"parameters":  map[string]any{"type": "object", "properties": map[string]any{"target": map[string]any{"type": "string"}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request body: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(string(bodyBytes)))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("upstream calls = %d, want 0 for deterministic spawn_agent call", got)
+	}
+	bodyText := rec.Body.String()
+	for _, want := range []string{
+		"event: response.output_item.done",
+		`"type":"function_call"`,
+		`"name":"spawn_agent"`,
+		"head -n 1 README.md",
+	} {
+		if !strings.Contains(bodyText, want) {
+			t.Fatalf("stream body missing %q:\n%s", want, bodyText)
+		}
+	}
+}
+
+func TestShouldServeSyntheticToolCallDirect_AllowsAgentLifecycleTools(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"spawn_agent": {Name: "spawn_agent", Type: "function", Structured: true},
+		"wait_agent":  {Name: "wait_agent", Type: "function", Structured: true},
+		"close_agent": {Name: "close_agent", Type: "function", Structured: true},
+	}
+	task := "必须使用 spawn_agent 启动一个子代理，然后必须使用 wait_agent 等待结果，最后必须使用 close_agent 关闭子代理。"
+	spawnHistory := []json.RawMessage{
+		json.RawMessage(`{"type":"collab_tool_call","tool":"spawn_agent","receiver_thread_ids":["agent_789"],"status":"completed"}`),
+	}
+	waitPolicy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, spawnHistory, toolCatalog, true, false, true)
+	if !shouldServeSyntheticToolCallDirect(waitPolicy) {
+		t.Fatalf("shouldServeSyntheticToolCallDirect(waitPolicy) = false, want true")
+	}
+
+	closeHistory := append(append([]json.RawMessage(nil), spawnHistory...),
+		json.RawMessage(`{"type":"function_call","name":"wait_agent","call_id":"call_wait_1","arguments":"{\"targets\":[\"agent_789\"]}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_wait_1","output":{"content":"{\"status\":{\"agent_789\":{\"completed\":\"# firew2oai\"}},\"timed_out\":false}","success":true}}`),
+	)
+	closePolicy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, closeHistory, toolCatalog, true, false, true)
+	if !shouldServeSyntheticToolCallDirect(closePolicy) {
+		t.Fatalf("shouldServeSyntheticToolCallDirect(closePolicy) = false, want true")
+	}
+}
+
 func TestHandleResponses_StreamToolFinalOutputIsConstrained(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)

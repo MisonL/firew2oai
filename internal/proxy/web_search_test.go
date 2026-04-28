@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -426,6 +427,26 @@ func TestParseWebSearchResultsHTML_ParsesDuckDuckGoLiteMarkup(t *testing.T) {
 	}
 	if !strings.Contains(results[0].Snippet, "Go 1.25.3") {
 		t.Fatalf("Snippet = %q", results[0].Snippet)
+	}
+}
+
+func TestParseWebSearchResultsHTML_DetectsDuckDuckGoChallenge(t *testing.T) {
+	body := `<html><body>
+		<p>Unfortunately, bots use DuckDuckGo too.</p>
+		<p>Please complete the following challenge to confirm this search was made by a human.</p>
+		<script src="/dist/anomaly.js"></script>
+	</body></html>`
+
+	_, err := parseWebSearchResultsHTML(body)
+	if err == nil {
+		t.Fatal("parseWebSearchResultsHTML error = nil, want challenge error")
+	}
+	var challengeErr webSearchChallengeError
+	if !errors.As(err, &challengeErr) {
+		t.Fatalf("error = %v, want webSearchChallengeError", err)
+	}
+	if challengeErr.Provider != "DuckDuckGo" {
+		t.Fatalf("Provider = %q, want DuckDuckGo", challengeErr.Provider)
 	}
 }
 

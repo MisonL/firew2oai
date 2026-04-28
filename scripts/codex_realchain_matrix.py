@@ -1286,6 +1286,8 @@ def classify_failure_reason(
         return "web_search_followup_not_grounded"
     if "web_search follow-up omitted required output labels" in combined:
         return "web_search_followup_unstructured"
+    if "web search backend blocked request" in combined and "challenge" in combined:
+        return "web_search_challenge_blocked"
     if "web search failed after" in combined and "no results found" in combined:
         return "web_search_no_results"
     if "execute web search request:" in combined:

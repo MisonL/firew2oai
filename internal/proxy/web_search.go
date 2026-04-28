@@ -35,6 +35,18 @@ func (e webSearchStatusError) Error() string {
 	return fmt.Sprintf("web search endpoint returned %d", e.StatusCode)
 }
 
+type webSearchChallengeError struct {
+	Provider string
+}
+
+func (e webSearchChallengeError) Error() string {
+	provider := strings.TrimSpace(e.Provider)
+	if provider == "" {
+		provider = "search backend"
+	}
+	return fmt.Sprintf("web search backend blocked request with %s challenge", provider)
+}
+
 var (
 	webSearchAnchorPattern          = regexp.MustCompile(`(?is)<a\b([^>]*)>(.*?)</a>`)
 	webSearchResultLinkClassPattern = regexp.MustCompile(`(?is)\bclass\s*=\s*(?:"[^"]*(?:result__a|result-link)[^"]*"|'[^']*(?:result__a|result-link)[^']*')`)
@@ -510,6 +522,9 @@ func parseWebSearchResultsJSON(body []byte) ([]webSearchResult, bool, error) {
 }
 
 func parseWebSearchResultsHTML(body string) ([]webSearchResult, error) {
+	if isDuckDuckGoChallengePage(body) {
+		return nil, webSearchChallengeError{Provider: "DuckDuckGo"}
+	}
 	links := extractWebSearchResultLinks(body)
 	snippets := webSearchResultSnippetPattern.FindAllStringSubmatch(body, maxWebSearchResults)
 	if len(links) == 0 {
@@ -539,6 +554,24 @@ func parseWebSearchResultsHTML(body string) ([]webSearchResult, error) {
 		return nil, fmt.Errorf("parse web search html: no usable results found")
 	}
 	return results, nil
+}
+
+func isDuckDuckGoChallengePage(body string) bool {
+	lower := strings.ToLower(body)
+	if !strings.Contains(lower, "duckduckgo") {
+		return false
+	}
+	matches := 0
+	for _, marker := range []string{
+		"unfortunately, bots use duckduckgo too",
+		"please complete the following challenge",
+		"anomaly.js",
+	} {
+		if strings.Contains(lower, marker) {
+			matches++
+		}
+	}
+	return matches >= 2
 }
 
 type webSearchHTMLLink struct {
