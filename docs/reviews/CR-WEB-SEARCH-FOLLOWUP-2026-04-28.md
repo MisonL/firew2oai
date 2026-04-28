@@ -191,6 +191,12 @@ CODEX_MATRIX_BEARER_TOKEN_FILE=/tmp/firew2oai-mison-newapi-token \
 python3 scripts/codex_realchain_matrix.py
 ```
 
+Effective chain:
+
+```text
+codex exec -> Codex CLI -> new-api http://127.0.0.1:3000/v1 -> firew2oai-local -> firew2oai http://10.0.90.200:39527 -> upstream model -> firew2oai -> new-api -> Codex CLI
+```
+
 Summary file:
 
 `/var/folders/hq/q19jry150l16mrrbkh7wm0_m0000gn/T/firew2oai-realchain-matrix-20260428-151305/summary.tsv`

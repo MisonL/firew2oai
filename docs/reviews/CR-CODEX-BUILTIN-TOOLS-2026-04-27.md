@@ -9,8 +9,10 @@
 链路：
 
 ```text
-codex exec -> firew2oai -> new-api http://127.0.0.1:3000/v1 -> mison token -> upstream model
+codex exec -> Codex CLI -> new-api http://127.0.0.1:3000/v1 -> firew2oai -> upstream model -> firew2oai -> new-api -> Codex CLI
 ```
+
+说明：Codex CLI 的 `CODEX_MATRIX_BASE_URL` 指向 new-api，new-api 再通过 `firew2oai-local` 渠道转发到本地 firew2oai；返回路径按反向链路经过 firew2oai 和 new-api 回到 Codex CLI。
 
 本轮不把 Docfork 和 Chrome DevTools 计入内置工具集合。它们属于外部 MCP server，已由全量矩阵的外部工具场景覆盖。
 
