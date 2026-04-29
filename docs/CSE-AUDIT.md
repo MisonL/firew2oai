@@ -15,14 +15,14 @@
 
 ## 发现问题总计: 21 个
 
-### P0 (5 个) — 安全 / 数据完整性
+### P0 (5 个) - 安全 / 数据完整性
 1. bin/ 目录 ~35MB 二进制已提交到 git
 2. 零测试覆盖（无 *_test.go）
 3. extractIP 信任 X-Forwarded-For 导致 SSRF/限流绕过
 4. non-stream 模式 scanner.Err() 后直接 return 可能丢弃已有内容
 5. json.Marshal 错误被静默忽略（writeJSON/sseChunk/writeError）
 
-### P1 (7 个) — 可靠性 / 正确性
+### P1 (7 个) - 可靠性 / 正确性
 6. Limiter.cleanupLoop goroutine 泄漏（无 Stop 机制）
 7. responseWriter 不实现 http.Flusher（SSE 流式写入中断）
 8. ValidModel 线性扫描 O(n)
@@ -31,35 +31,35 @@
 11. Config.Load 静默忽略无效环境变量
 12. 空目录 scripts/ 和 internal/middleware/ 已提交
 
-### P2 (9 个) — 工程规范 / 可维护性
+### P2 (9 个) - 工程规范 / 可维护性
 13-21: README 与实现不一致、Dockerfile 版本硬编码、docker-compose 不完整等
 
 ## 修复状态
-- [x] Batch 1: P0 — bin/清理、测试覆盖(53+ tests)、TrustedProxyCount、scanner.Err()保留内容、json.Marshal错误处理
-- [x] Batch 2: P1 — rateLimiter.Stop()、responseWriter.Unwrap()、ValidModel O(1)、空结果处理、rand.Read fallback、env校验、空目录清理
-- [x] Batch 3: P2 — README同步、Dockerfile多阶段、docker-compose完整、.env.example、.dockerignore、LICENSE、非root容器、日志限制
-- [x] L0/L1/L2 验证 — go vet clean、go test -race 53+ tests pass、5平台交叉编译clean
+- [x] Batch 1: P0 - bin/清理、测试覆盖(53+ tests)、TrustedProxyCount、scanner.Err()保留内容、json.Marshal错误处理
+- [x] Batch 2: P1 - rateLimiter.Stop()、responseWriter.Unwrap()、ValidModel O(1)、空结果处理、rand.Read fallback、env校验、空目录清理
+- [x] Batch 3: P2 - README同步、Dockerfile多阶段、docker-compose完整、.env.example、.dockerignore、LICENSE、非root容器、日志限制
+- [x] L0/L1/L2 验证 - go vet clean、go test -race 53+ tests pass、5平台交叉编译clean
 
 ## 额外优化（代码审查）
-- [x] W1: flag.Parse 与 go test 冲突 — 分离为 ApplyFlags()
-- [x] W2: Authenticate() 伪恒定时间比较 — 移除，使用 map 查找
-- [x] W3: SetGlobalRateLimit() 死代码 — 删除
-- [x] W4: /v1/models 不限制 HTTP 方法 — 限制 GET
-- [x] W5: cogito-671b-v2-p1 已下线 — 从 AvailableModels 移除
-- [x] W6: temperature/max_tokens 透传 — 添加到 FireworksRequest
-- [x] C1: Trusted Proxy 配置 — 添加 TrustedProxyCount
-- [x] C2: JSON 注入修复 — 使用 authErrorResponse 结构体
-- [x] C3: 错误信息脱敏 — 不暴露 err.Error() 给客户端
-- [x] C4: WriteTimeout — 基于 TIMEOUT 配置
-- [x] S1: ValidModel map — O(1) 查找
-- [x] S2: 日志增强 — token 指纹
-- [x] S3: UA 配置化 — CHROME_USER_AGENT 环境变量
-- [x] S4: SSE 解析重构 — scanSSEEvents() 消除重复
-- [x] D1: LICENSE — MIT
+- [x] W1: flag.Parse 与 go test 冲突 - 分离为 ApplyFlags()
+- [x] W2: Authenticate() 伪恒定时间比较 - 移除，使用 map 查找
+- [x] W3: SetGlobalRateLimit() 死代码 - 删除
+- [x] W4: /v1/models 不限制 HTTP 方法 - 限制 GET
+- [x] W5: cogito-671b-v2-p1 已下线 - 从 AvailableModels 移除
+- [x] W6: temperature/max_tokens 透传 - 添加到 FireworksRequest
+- [x] C1: Trusted Proxy 配置 - 添加 TrustedProxyCount
+- [x] C2: JSON 注入修复 - 使用 authErrorResponse 结构体
+- [x] C3: 错误信息脱敏 - 不暴露 err.Error() 给客户端
+- [x] C4: WriteTimeout - 基于 TIMEOUT 配置
+- [x] S1: ValidModel map - O(1) 查找
+- [x] S2: 日志增强 - token 指纹
+- [x] S3: UA 配置化 - CHROME_USER_AGENT 环境变量
+- [x] S4: SSE 解析重构 - scanSSEEvents() 消除重复
+- [x] D1: LICENSE - MIT
 - [x] D2: .dockerignore
 - [x] D3: .env.example
-- [x] D4: Docker 非 root — appuser
-- [x] D5: Docker 日志限制 — 10MB × 3
+- [x] D4: Docker 非 root - appuser
+- [x] D5: Docker 日志限制 - 10MB x 3
 
 ## 当前维护口径
 

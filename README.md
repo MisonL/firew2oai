@@ -74,22 +74,24 @@ new-api 日志复核：
 git clone https://github.com/mison/firew2oai.git
 cd firew2oai
 make build
-./bin/firew2oai
+API_KEY=CHANGE_ME_sk-local-dev ./bin/firew2oai
 ```
 
-默认监听 `:39527`，默认 API Key 为 `sk-admin`。
+默认监听 `:39527`，`API_KEY` 必须显式配置；未配置时服务会拒绝启动。
 
 ### Docker 启动
 
 ```bash
-docker compose up -d --build
+API_KEY=CHANGE_ME_sk-local-dev docker compose up -d --build
 ```
+
+Compose quick start 会默认传入空 `IP_WHITELIST`，让宿主机通过 Docker 发布端口访问服务。生产环境应显式设置 `IP_WHITELIST` 为可信客户端或代理网段。
 
 或手动运行：
 
 ```bash
 docker build -t firew2oai:latest .
-docker run -d -p 39527:39527 -e API_KEY=sk-admin firew2oai:latest
+docker run -d -p 39527:39527 -e API_KEY=CHANGE_ME_sk-local-dev firew2oai:latest
 ```
 
 ## 配置说明
@@ -100,22 +102,22 @@ docker run -d -p 39527:39527 -e API_KEY=sk-admin firew2oai:latest
 |---|---|---|---|
 | `-port` | `PORT` | `39527` | 监听端口 |
 | `-host` | `HOST` | `""` | 监听地址，空表示所有网卡 |
-| `-api-key` | `API_KEY` | `sk-admin` | API Key 配置（见下文） |
+| `-api-key` | `API_KEY` | `""` | API Key 配置（必填，见下文） |
 | `-timeout` | `TIMEOUT` | `120` | 上游超时（秒） |
-| `-upstream-retry-count` | `UPSTREAM_RETRY_COUNT` | `1` | 首包前瞬时失败重试次数，适用于发送失败与 `429/502/503/504` |
-| `-upstream-retry-backoff-ms` | `UPSTREAM_RETRY_BACKOFF_MS` | `200` | 首包前瞬时失败重试基础退避（毫秒） |
-| `-upstream-empty-retry-count` | `UPSTREAM_EMPTY_RETRY_COUNT` | `1` | 上游已返回 `200` 但在任何内容或 `done` 信号前空结束时的重试次数 |
-| `-upstream-empty-retry-backoff-ms` | `UPSTREAM_EMPTY_RETRY_BACKOFF_MS` | `200` | 空流重试基础退避（毫秒） |
+| `-upstream-retry-count` | `UPSTREAM_RETRY_COUNT` | `4` | 首包前瞬时失败重试次数，适用于发送失败与 `429/502/503/504` |
+| `-upstream-retry-backoff-ms` | `UPSTREAM_RETRY_BACKOFF_MS` | `500` | 首包前瞬时失败重试基础退避（毫秒） |
+| `-upstream-empty-retry-count` | `UPSTREAM_EMPTY_RETRY_COUNT` | `4` | 上游已返回 `200` 但在任何内容或 `done` 信号前空结束时的重试次数 |
+| `-upstream-empty-retry-backoff-ms` | `UPSTREAM_EMPTY_RETRY_BACKOFF_MS` | `500` | 空流重试基础退避（毫秒） |
 | `-log-level` | `LOG_LEVEL` | `info` | `debug/info/warn/error` |
 | `-show-thinking` | `SHOW_THINKING` | `false` | 是否输出 thinking 内容 |
 | `-cors-origins` | `CORS_ORIGINS` | `*` | 允许跨域来源 |
 | `-rate-limit` | `RATE_LIMIT` | `0` | 全局每 Key 每分钟限流，0 表示关闭 |
-| `-ip-whitelist` | `IP_WHITELIST` | `127.0.0.1,::1` | 允许访问 IP/CIDR |
+| `-ip-whitelist` | `IP_WHITELIST` | `127.0.0.1,::1` | 允许访问 IP/CIDR；空值表示允许全部，Compose quick start 默认传空值 |
 | `-trusted-proxy-count` | `TRUSTED_PROXY_COUNT` | `0` | 信任代理层数 |
 
 ### 上游重试策略
 
-项目当前把上游容错拆成两层，默认都保守开启，且都可通过重试次数设为 `0` 关闭：
+项目当前把上游容错拆成两层，默认开启，且都可通过重试次数设为 `0` 关闭：
 
 - `UPSTREAM_RETRY_COUNT` / `UPSTREAM_RETRY_BACKOFF_MS`
   只处理首包前的基础设施级瞬时失败，包括发送失败以及 `429/502/503/504`。
@@ -133,21 +135,21 @@ docker run -d -p 39527:39527 -e API_KEY=sk-admin firew2oai:latest
 1. 单 Key
 
 ```bash
-./bin/firew2oai -api-key sk-admin
+./bin/firew2oai -api-key CHANGE_ME_sk-local-dev
 ```
 
 2. 多 Key（逗号分隔）
 
 ```bash
-./bin/firew2oai -api-key "sk-admin,sk-user1,sk-user2"
+./bin/firew2oai -api-key "CHANGE_ME_sk-local-dev,CHANGE_ME_sk-user1,CHANGE_ME_sk-user2"
 ```
 
 3. JSON 文件（推荐）
 
 ```json
 [
-  {"key":"sk-admin","quota":0,"rate_limit":0},
-  {"key":"sk-user1","quota":1000,"rate_limit":60}
+  {"key":"CHANGE_ME_sk-local-dev","quota":0,"rate_limit":0},
+  {"key":"CHANGE_ME_sk-user1","quota":1000,"rate_limit":60}
 ]
 ```
 
@@ -158,7 +160,7 @@ docker run -d -p 39527:39527 -e API_KEY=sk-admin firew2oai:latest
 4. 内联 JSON
 
 ```bash
-./bin/firew2oai -api-key '[{"key":"sk-admin"},{"key":"sk-user","quota":500,"rate_limit":20}]'
+./bin/firew2oai -api-key '[{"key":"CHANGE_ME_sk-local-dev"},{"key":"CHANGE_ME_sk-user","quota":500,"rate_limit":20}]'
 ```
 
 配额与限流响应头：
@@ -177,7 +179,7 @@ model_provider = "firew2oai"
 [model_providers.firew2oai]
 name = "firew2oai"
 base_url = "http://127.0.0.1:39527/v1"
-experimental_bearer_token = "sk-admin"
+experimental_bearer_token = "CHANGE_ME_sk-local-dev"
 wire_api = "responses"
 ```
 
@@ -288,18 +290,18 @@ wire_api = "responses"
 
 ```text
 firew2oai/
-├── cmd/server/main.go
-├── internal/
-│   ├── config/
-│   ├── proxy/
-│   ├── tokenauth/
-│   ├── transport/
-│   └── whitelist/
-├── docs/reviews/
-├── Dockerfile
-├── docker-compose.yml
-├── Makefile
-└── README.md
+- cmd/server/main.go
+- internal/
+  - config/
+  - proxy/
+  - tokenauth/
+  - transport/
+  - whitelist/
+- docs/reviews/
+- Dockerfile
+- docker-compose.yml
+- Makefile
+- README.md
 ```
 
 ## License

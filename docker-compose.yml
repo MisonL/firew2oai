@@ -16,7 +16,7 @@ services:
       - "${PORT:-39527}:39527"
     environment:
       - PORT=39527
-      - API_KEY=${API_KEY:-sk-admin}
+      - API_KEY=${API_KEY:?API_KEY must be set}
       - TIMEOUT=${TIMEOUT:-120}
       - RATE_LIMIT=${RATE_LIMIT:-0}
       - IP_WHITELIST=${IP_WHITELIST:-}
