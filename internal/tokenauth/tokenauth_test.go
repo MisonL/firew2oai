@@ -81,6 +81,14 @@ func TestNew_TrimSpaces(t *testing.T) {
 	}
 }
 
+func TestNew_DuplicateTokenRejected(t *testing.T) {
+	if _, err := New("sk-a,sk-a", 0); err == nil {
+		t.Fatal("expected duplicate token error")
+	} else if !strings.Contains(err.Error(), "duplicate token key") {
+		t.Fatalf("error = %v, want duplicate token key", err)
+	}
+}
+
 func TestNew_JSONFile(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "tokens.json")
@@ -328,6 +336,29 @@ func TestMiddleware_QuotaExceeded(t *testing.T) {
 	}
 }
 
+func TestCheckAndReserve_QuotaReservationIsAtomic(t *testing.T) {
+	m := newTestManager(t, `[{"key":"sk-one","quota":1}]`, 0)
+	defer m.Stop()
+
+	first := m.checkAndReserve("sk-one")
+	if !first.authenticated || first.quotaExceeded {
+		t.Fatalf("first result = %+v, want authenticated quota pass", first)
+	}
+	if first.quotaRemaining != 0 {
+		t.Fatalf("first quotaRemaining = %d, want 0", first.quotaRemaining)
+	}
+
+	second := m.checkAndReserve("sk-one")
+	if !second.authenticated || !second.quotaExceeded {
+		t.Fatalf("second result = %+v, want quota exceeded", second)
+	}
+
+	ok, rem, limit := m.CheckQuota("sk-one")
+	if ok || rem != 0 || limit != 1 {
+		t.Fatalf("quota after reservations: ok=%v rem=%d limit=%d, want false 0 1", ok, rem, limit)
+	}
+}
+
 func TestMiddleware_RateLimitExceeded(t *testing.T) {
 	m := newTestManager(t, `[{"key":"sk-fast","rate_limit":1}]`, 0)
 	defer m.Stop()
@@ -394,6 +425,30 @@ func TestMiddleware_QuotaHeaders(t *testing.T) {
 	}
 	if h := rec.Header().Get("X-Quota-Remaining"); h != "99" {
 		t.Errorf("X-Quota-Remaining = %q, want 99 (quota recorded before header)", h)
+	}
+}
+
+func TestMiddleware_UnlimitedQuotaOmitsQuotaHeaders(t *testing.T) {
+	m := newTestManager(t, "sk-unlimited", 0)
+	defer m.Stop()
+
+	handler := m.Middleware()(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-unlimited")
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if h := rec.Header().Get("X-Quota-Limit"); h != "" {
+		t.Fatalf("X-Quota-Limit = %q, want empty for unlimited quota", h)
+	}
+	if h := rec.Header().Get("X-Quota-Remaining"); h != "" {
+		t.Fatalf("X-Quota-Remaining = %q, want empty for unlimited quota", h)
 	}
 }
 

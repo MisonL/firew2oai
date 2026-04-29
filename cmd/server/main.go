@@ -45,7 +45,7 @@ func main() {
 		"rate_limit", cfg.RateLimit,
 		"cors_origins", cfg.CORSOrigins,
 		"ip_whitelist", cfg.IPWhitelist,
-		"models", len(config.AvailableModels),
+		"models", len(config.AvailableModels()),
 		"gomaxprocs", runtime.GOMAXPROCS(0),
 		"num_cpu", runtime.NumCPU(),
 	)
@@ -55,9 +55,17 @@ func main() {
 	tp := transport.NewWithRetry(timeout, cfg.UpstreamRetryCount, time.Duration(cfg.UpstreamRetryBackoffMS)*time.Millisecond)
 
 	// Create token auth manager
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		slog.Error("API key configuration is required", "hint", "set API_KEY or pass -api-key")
+		os.Exit(1)
+	}
 	tm, err := tokenauth.New(cfg.APIKey, cfg.RateLimit)
 	if err != nil {
 		slog.Error("invalid token configuration", "error", err)
+		os.Exit(1)
+	}
+	if tm.TokenCount() == 0 {
+		slog.Error("API key configuration produced no valid tokens")
 		os.Exit(1)
 	}
 
@@ -68,10 +76,10 @@ func main() {
 
 	// Security warnings for overly permissive defaults
 	if cfg.CORSOrigins == "*" {
-		slog.Warn("CORS is set to wildcard (*) — any origin can access the API; restrict CORS_ORIGINS for production")
+		slog.Warn("CORS is set to wildcard (*) - any origin can access the API; restrict CORS_ORIGINS for production")
 	}
 	if cfg.IPWhitelist == "" {
-		slog.Warn("IP whitelist is empty — all IPs are allowed; set IP_WHITELIST for production")
+		slog.Warn("IP whitelist is empty - all IPs are allowed; set IP_WHITELIST for production")
 	}
 
 	// Create proxy handler

@@ -20,21 +20,33 @@ import (
 	"github.com/mison/firew2oai/internal/config"
 )
 
-func generateResponsesID() string {
-	return strings.Replace(generateRequestID(), "chatcmpl-", "resp_", 1)
+func generateResponsesID() (string, error) {
+	id, err := generateRequestID()
+	if err != nil {
+		return "", err
+	}
+	return strings.Replace(id, "chatcmpl-", "resp_", 1), nil
 }
 
-func generateResponseMessageID() string {
-	return strings.Replace(generateRequestID(), "chatcmpl-", "msg_", 1)
+func generateResponseMessageID() (string, error) {
+	id, err := generateRequestID()
+	if err != nil {
+		return "", err
+	}
+	return strings.Replace(id, "chatcmpl-", "msg_", 1), nil
 }
 
 func buildFireworksRequestBody(model, prompt string, temperature *float64, maxTokens *int) ([]byte, error) {
+	conversationID, err := generateConversationID()
+	if err != nil {
+		return nil, err
+	}
 	fwReq := FireworksRequest{
 		Messages: []FireworksMessage{
 			{Role: "user", Content: prompt},
 		},
 		ModelKey:            model,
-		ConversationID:      fmt.Sprintf("session_%d_%d", time.Now().UnixMilli(), time.Now().UnixNano()%10000),
+		ConversationID:      conversationID,
 		FunctionDefinitions: []interface{}{},
 		Temperature:         temperature,
 		MaxTokens:           maxTokens,
@@ -2135,14 +2147,14 @@ func shouldServeSyntheticToolCallDirect(policy executionPolicy) bool {
 	}
 }
 
-func (p *Proxy) writeSyntheticResponsesToolCall(w http.ResponseWriter, stream bool, responseID, messageID, model string, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, policy executionPolicy) {
+func (p *Proxy) writeSyntheticResponsesToolCall(w http.ResponseWriter, stream bool, owner, responseID, messageID, model string, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, policy executionPolicy) {
 	outputItems := buildSyntheticToolOutputItems(policy)
 	if len(outputItems) == 0 {
 		return
 	}
 	createdAt := time.Now().Unix()
 	completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-	p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+	p.responses.put(owner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 	if !stream {
 		writeJSON(w, http.StatusOK, completed)
 		return
@@ -2208,6 +2220,11 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	responseOwner := responseOwnerFromRequest(r)
+	if responseOwner == "" {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid or missing Bearer token")
+		return
+	}
 	currentMessages, requestItems, err := responseInputToMessagesAndItems(req.Input)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request_error", "invalid_input", "%s", err.Error())
@@ -2217,7 +2234,7 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 	baseMessages := []ChatMessage(nil)
 	baseHistoryItems := []json.RawMessage(nil)
 	if req.PreviousResponseID != "" {
-		entry, ok := p.responses.get(req.PreviousResponseID)
+		entry, ok := p.responses.get(responseOwner, req.PreviousResponseID)
 		if !ok {
 			writeError(w, http.StatusBadRequest, "invalid_request_error", "previous_response_not_found", "previous_response_id %q was not found", req.PreviousResponseID)
 			return
@@ -2226,8 +2243,18 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 		baseMessages = rawItemsToMessages(baseHistoryItems)
 	}
 
-	responseID := generateResponsesID()
-	messageID := generateResponseMessageID()
+	responseID, err := generateResponsesID()
+	if err != nil {
+		slog.Error("failed to generate response id", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "id_generation_failed", "failed to generate response id")
+		return
+	}
+	messageID, err := generateResponseMessageID()
+	if err != nil {
+		slog.Error("failed to generate response message id", "response_id", responseID, "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "id_generation_failed", "failed to generate response message id")
+		return
+	}
 	showThinking := resolveShowThinking(p.defaultShowThinking, req.ShowThinking)
 	allowParallelToolCalls := req.ParallelToolCalls == nil || *req.ParallelToolCalls
 	maxToolCalls := 0
@@ -2353,14 +2380,14 @@ func (p *Proxy) handleResponses(w http.ResponseWriter, r *http.Request) {
 			"execution_next_command", executionPolicy.NextCommand,
 			"required_tool", executionPolicy.NextRequiredTool,
 		)
-		p.writeSyntheticResponsesToolCall(w, req.Stream, responseID, messageID, req.Model, requestItems, baseHistoryItems, promptInputItems, executionPolicy)
+		p.writeSyntheticResponsesToolCall(w, req.Stream, responseOwner, responseID, messageID, req.Model, requestItems, baseHistoryItems, promptInputItems, executionPolicy)
 		return
 	}
 	if req.Stream {
-		p.handleResponsesStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
+		p.handleResponsesStream(w, r, responseOwner, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 		return
 	}
-	p.handleResponsesNonStream(w, r, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
+	p.handleResponsesNonStream(w, r, responseOwner, responseID, messageID, req.Model, bodyBytes, showThinking, requestItems, baseHistoryItems, promptInputItems, req.Instructions, req.Temperature, req.MaxOutputTokens, toolCatalog, toolConstraints, bufferForToolCalls, executionPolicy, currentTask, executionEvidence, len(toolCatalog) > 0)
 }
 
 func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
@@ -2375,11 +2402,16 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "response_not_found", "response not found")
 		return
 	}
+	responseOwner := responseOwnerFromRequest(r)
+	if responseOwner == "" {
+		writeError(w, http.StatusUnauthorized, "authentication_error", "invalid_api_key", "invalid or missing Bearer token")
+		return
+	}
 
 	if strings.HasSuffix(path, "/input_items") {
 		responseID := strings.TrimSuffix(path, "/input_items")
 		responseID = strings.TrimSuffix(responseID, "/")
-		entry, ok := p.responses.get(responseID)
+		entry, ok := p.responses.get(responseOwner, responseID)
 		if !ok {
 			writeError(w, http.StatusNotFound, "invalid_request_error", "response_not_found", "response %q was not found", responseID)
 			return
@@ -2388,7 +2420,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entry, ok := p.responses.get(path)
+	entry, ok := p.responses.get(responseOwner, path)
 	if !ok {
 		writeError(w, http.StatusNotFound, "invalid_request_error", "response_not_found", "response %q was not found", path)
 		return
@@ -2396,7 +2428,7 @@ func (p *Proxy) handleResponseByID(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, entry.response)
 }
 
-func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
+func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, responseOwner, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx := r.Context()
 
 	// Extract Authorization token from client request to forward to Fireworks
@@ -2521,7 +2553,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 							if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 								return false
 							}
-							p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+							p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
 							return true
 						}
 						outputItems := buildParsedToolOutputItems(parseResult.calls)
@@ -2549,7 +2581,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 						if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 							return false
 						}
-						p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+						p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 						return true
 					}
 					if parseResult.err != nil {
@@ -2569,7 +2601,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 					if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 						return false
 					}
-					p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+					p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 					return true
 				}
 				finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
@@ -2586,7 +2618,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 					return false
 				}
-				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 				return true
 			case "thinking_separator":
 				fallthrough
@@ -2684,7 +2716,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 					writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID)
 					writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
 					writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
-					p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+					p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
 					return
 				}
 				outputItems := buildParsedToolOutputItems(parseResult.calls)
@@ -2704,7 +2736,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 					})
 				}
 				writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
-				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 				return
 			}
 			if parseResult.err != nil {
@@ -2718,7 +2750,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			writeResponsesMessageAdded(writeAndFlushEvent, responseID, messageID)
 			writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
 			writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
-			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			return
 		}
 		finalText = constrainFinalText(currentTask, finalText, evidence, checkControlMarkup)
@@ -2729,7 +2761,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		writeResponsesMessageDone(writeAndFlushEvent, responseID, messageID, finalText)
 		completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
 		writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed))
-		p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+		p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 	}
 
 	// If stream ended without done/content, emit a terminal error response instead of leaving client pending.
@@ -2764,7 +2796,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 				if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 					return
 				}
-				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 				return
 			}
 		}
@@ -2787,12 +2819,12 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 			if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 				return
 			}
-			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			return
 		}
 		finalText := "Codex adapter error: upstream response ended without a completion signal"
 		if scanErr != nil {
-			finalText = "Codex adapter error: upstream stream failed before content: " + scanErr.Error()
+			finalText = "Codex adapter error: upstream stream failed before content"
 		}
 		slog.Error("responses stream ended without completion payload", "response_id", responseID, "error", scanErr)
 		outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
@@ -2813,7 +2845,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 		if !writeAndFlushEvent("response.completed", newResponseLifecycleEvent("response.completed", completed)) {
 			return
 		}
-		p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+		p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 		return
 	}
 
@@ -2822,7 +2854,7 @@ func (p *Proxy) handleResponsesStream(w http.ResponseWriter, r *http.Request, re
 	}
 }
 
-func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
+func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request, responseOwner, responseID, messageID, model string, body []byte, showThinking bool, requestItems, baseHistoryItems, promptInputItems []json.RawMessage, instructions string, temperature *float64, maxOutputTokens *int, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool, executionPolicy executionPolicy, currentTask string, evidence executionEvidence, checkControlMarkup bool) {
 	ctx, cancel := context.WithTimeout(r.Context(), p.transport.Timeout())
 	defer cancel()
 
@@ -2896,7 +2928,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 		// If we have content, return it even if there was a scanner error
 		if !contentEmitted && result.Len() == 0 {
 			slog.Error("responses stream read error (upstream incomplete)", "response_id", responseID, "error", scanErr)
-			writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "%s", scanErr.Error())
+			writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "upstream response ended before completion")
 			return
 		}
 		slog.Warn("responses stream read error but content available, returning partial response", "response_id", responseID, "error", scanErr)
@@ -2912,7 +2944,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 				)
 				createdAt := time.Now().Unix()
 				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+				p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 				writeJSON(w, http.StatusOK, completed)
 				return
 			}
@@ -2921,7 +2953,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 			createdAt := time.Now().Unix()
 			outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, fallbackText)}
 			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			writeJSON(w, http.StatusOK, completed)
 			return
 		}
@@ -2966,13 +2998,13 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 				outputItems := append(cloneRawItems(callOutputItems), messageItem)
 				followupPromptInputItems := buildHistoryItems(baseHistoryItems, historyRequestItems, nil)
 				completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, followupPromptInputItems)
-				p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
+				p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, historyRequestItems, []json.RawMessage{messageItem}))
 				writeJSON(w, http.StatusOK, completed)
 				return
 			}
 			outputItems := buildParsedToolOutputItems(parseResult.calls)
 			completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-			p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+			p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 			writeJSON(w, http.StatusOK, completed)
 			return
 		}
@@ -2986,7 +3018,7 @@ func (p *Proxy) handleResponsesNonStream(w http.ResponseWriter, r *http.Request,
 
 	outputItems := []json.RawMessage{buildResponsesMessageItem(messageID, finalText)}
 	completed := newCompletedResponse(responseID, messageID, model, createdAt, outputItems, promptInputItems)
-	p.responses.put(completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
+	p.responses.put(responseOwner, completed, requestItems, buildHistoryItems(baseHistoryItems, requestItems, outputItems))
 	writeJSON(w, http.StatusOK, completed)
 }
 

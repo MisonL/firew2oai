@@ -64,10 +64,25 @@ func TestValidModel(t *testing.T) {
 }
 
 func TestValidModel_AllAvailableModels(t *testing.T) {
-	for _, m := range AvailableModels {
+	for _, m := range AvailableModels() {
 		if !ValidModel(m) {
 			t.Errorf("AvailableModels contains %q but ValidModel returns false", m)
 		}
+	}
+}
+
+func TestAvailableModelsReturnsCopy(t *testing.T) {
+	models := AvailableModels()
+	if len(models) == 0 {
+		t.Fatal("AvailableModels returned empty list")
+	}
+	original := models[0]
+	models[0] = "mutated-model"
+	if AvailableModels()[0] != original {
+		t.Fatal("AvailableModels exposed mutable internal slice")
+	}
+	if ValidModel("mutated-model") {
+		t.Fatal("ValidModel accepted caller-mutated model")
 	}
 }
 
@@ -83,8 +98,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.Host != "" {
 		t.Errorf("default Host = %q, want empty", cfg.Host)
 	}
-	if cfg.APIKey != "sk-admin" {
-		t.Errorf("default APIKey = %q, want sk-admin", cfg.APIKey)
+	if cfg.APIKey != "" {
+		t.Errorf("default APIKey = %q, want empty", cfg.APIKey)
 	}
 	if cfg.Timeout != defaultTimeout {
 		t.Errorf("default Timeout = %d, want %d", cfg.Timeout, defaultTimeout)

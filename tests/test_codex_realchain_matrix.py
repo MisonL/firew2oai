@@ -204,6 +204,100 @@ class RunHelperTests(TestCase):
         self.assertIn("--disable", cmd)
         self.assertIn("apps", cmd)
 
+    def test_run_codex_exec_command_closes_stdin_explicitly(self) -> None:
+        with patch("codex_realchain_matrix.run") as mock_run:
+            mock_run.return_value = subprocess.CompletedProcess(["codex"], 0, "", "")
+            matrix.run_codex_exec_command(["codex", "exec", "prompt"], timeout_s=30)
+
+        _, kwargs = mock_run.call_args
+        self.assertEqual(kwargs.get("input_text"), "")
+        self.assertEqual(kwargs.get("cwd"), REPO_ROOT)
+        self.assertEqual(kwargs.get("timeout"), 30)
+
+    def test_codex_result_retryable_before_progress_accepts_sse_idle_timeout(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["codex"],
+            -9,
+            '{"type":"error","message":"Reconnecting... (stream disconnected before completion: idle timeout waiting for SSE)"}\n',
+            "Codex matrix command timeout after 900s",
+        )
+
+        self.assertTrue(matrix.codex_result_retryable_before_progress(result))
+
+    def test_codex_result_retryable_before_progress_rejects_tool_progress(self) -> None:
+        result = subprocess.CompletedProcess(
+            ["codex"],
+            -9,
+            (
+                '{"type":"item","item":{"type":"function_call","name":"exec_command"}}\n'
+                '{"type":"error","message":"stream disconnected before completion: idle timeout waiting for SSE"}\n'
+            ),
+            "Codex matrix command timeout after 900s",
+        )
+
+        self.assertFalse(matrix.codex_result_retryable_before_progress(result))
+
+    def test_run_case_retries_transient_sse_before_progress(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-retry-"))
+        worktree = output_dir / "worktree"
+        worktree.mkdir()
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+        scenario = matrix.Scenario(
+            name="retry_probe",
+            prompt="retry prompt",
+            expected_operations=(),
+            expected_files=(),
+            capabilities=("structured_final",),
+        )
+        last_path = output_dir / "model-a__retry_probe.last.txt"
+
+        def fake_codex_run(_cmd, _timeout):
+            if fake_codex_run.calls == 0:
+                fake_codex_run.calls += 1
+                return subprocess.CompletedProcess(
+                    ["codex"],
+                    -9,
+                    '{"type":"error","message":"stream disconnected before completion: idle timeout waiting for SSE"}\n',
+                    "Codex matrix command timeout after 900s",
+                )
+            fake_codex_run.calls += 1
+            last_path.write_text("RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: retried", encoding="utf-8")
+            return subprocess.CompletedProcess(["codex"], 0, "", "")
+
+        fake_codex_run.calls = 0
+        with patch("codex_realchain_matrix.create_worktree", return_value=worktree), \
+            patch("codex_realchain_matrix.prepare_fixture"), \
+            patch("codex_realchain_matrix.remove_worktree"), \
+            patch("codex_realchain_matrix.collect_changed_paths", return_value=[]), \
+            patch("codex_realchain_matrix.snapshot_paths", return_value={}), \
+            patch("codex_realchain_matrix.build_codex_exec_command", return_value=["codex", "exec", "retry"]), \
+            patch("codex_realchain_matrix.run_codex_exec_command", side_effect=fake_codex_run), \
+            patch("codex_realchain_matrix.collect_firew2oai_history_signals", return_value=([], "")):
+            row = matrix.run_case(output_dir, "codex", "model-a", scenario, timeout_s=30)
+
+        self.assertEqual(row["status"], "ok")
+        self.assertEqual(fake_codex_run.calls, 2)
+        self.assertTrue((output_dir / "model-a__retry_probe.attempt1.jsonl").exists())
+        self.assertTrue((output_dir / "model-a__retry_probe.stderr.attempt1.txt").exists())
+
+    def test_discover_declared_tools_uses_codex_exec_stdin_wrapper(self) -> None:
+        log_text = 'msg="responses request" prompt="TOOL_DISCOVERY_PROBE_123" tool_names="[exec_command js_repl]"\n'
+        with patch.dict("os.environ", {"CODEX_MATRIX_HISTORY_CONTAINER": "firew2oai"}, clear=True), \
+            patch("codex_realchain_matrix.time.time", return_value=123), \
+            patch("codex_realchain_matrix.create_worktree", return_value=Path("/tmp/worktree")), \
+            patch("codex_realchain_matrix.remove_worktree"), \
+            patch("codex_realchain_matrix.build_codex_exec_command", return_value=["codex", "exec", "prompt"]), \
+            patch("codex_realchain_matrix.run_codex_exec_command") as mock_codex_run, \
+            patch("codex_realchain_matrix.run") as mock_run:
+            mock_codex_run.return_value = subprocess.CompletedProcess(["codex"], 0, "", "")
+            mock_run.return_value = subprocess.CompletedProcess(["docker"], 0, log_text, "")
+
+            tools = matrix.discover_declared_tools(Path("/tmp/out"), "codex", "glm-4p7", timeout_s=30)
+
+        self.assertEqual(tools, ["exec_command", "js_repl"])
+        mock_codex_run.assert_called_once_with(["codex", "exec", "prompt"], 30)
+        self.assertEqual(mock_run.call_count, 1)
+
     def test_configure_child_tool_environment_sets_safe_go_cache(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             matrix.configure_child_tool_environment()
@@ -837,7 +931,7 @@ class RunHelperTests(TestCase):
                 exit_code="0",
                 expected_signals=("web_search",),
                 observed_signals=["web_search"],
-                final_preview="Codex adapter error: web search failed after 1 attempt(s): parse web search html: no results found",
+                final_preview="Codex adapter error: web search returned no results",
                 stderr_preview="",
                 labels_ok=False,
                 result_pass=False,
@@ -851,12 +945,26 @@ class RunHelperTests(TestCase):
                 exit_code="0",
                 expected_signals=("web_search",),
                 observed_signals=["web_search"],
-                final_preview="Codex adapter error: web search failed after 1 attempt(s): web search backend blocked request with DuckDuckGo challenge",
+                final_preview="Codex adapter error: web search backend blocked request with DuckDuckGo challenge",
                 stderr_preview="",
                 labels_ok=False,
                 result_pass=False,
             ),
             "web_search_challenge_blocked",
+        )
+
+    def test_classify_failure_reason_marks_web_search_transport_error_sanitized(self) -> None:
+        self.assertEqual(
+            matrix.classify_failure_reason(
+                exit_code="0",
+                expected_signals=("web_search",),
+                observed_signals=["web_search"],
+                final_preview="Codex adapter error: web search backend unavailable",
+                stderr_preview="",
+                labels_ok=False,
+                result_pass=False,
+            ),
+            "web_search_transport_error",
         )
 
     def test_classify_failure_reason_marks_mcp_search_invalid_args(self) -> None:
@@ -886,6 +994,111 @@ class RunHelperTests(TestCase):
             ),
             "semantic_result_fail",
         )
+
+    def test_tool_probe_result_label_drift_accepts_successful_web_search_signal(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "web_search_probe")
+
+        self.assertTrue(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text="RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: 已按要求完成当前任务。",
+            )
+        )
+
+    def test_tool_probe_result_label_drift_allows_negated_failure_words(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "web_search_probe")
+
+        self.assertTrue(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text="RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: completed without error; no failures detected.",
+            )
+        )
+
+    def test_tool_probe_result_label_drift_accepts_subagent_content_signal(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "subagent_probe")
+
+        self.assertTrue(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text=(
+                    "RESULT: FAIL\n"
+                    "FILES: README.md\n"
+                    "TEST: N/A\n"
+                    "NOTE: # firew2oai"
+                ),
+            )
+        )
+
+    def test_tool_probe_result_label_drift_keeps_explicit_tool_failures_failed(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "web_search_probe")
+
+        self.assertFalse(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text=(
+                    "RESULT: FAIL\n"
+                    "FILES: none\n"
+                    "TEST: N/A\n"
+                    "NOTE: web search backend blocked request with DuckDuckGo challenge"
+                ),
+            )
+        )
+
+    def test_tool_probe_result_label_drift_keeps_unnegated_error_failed(self) -> None:
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "web_search_probe")
+
+        self.assertFalse(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text="RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: tool returned an error before completion.",
+            )
+        )
+
+    def test_tool_probe_result_label_drift_does_not_rewrite_artifact(self) -> None:
+        output_dir = Path(tempfile.mkdtemp(prefix="matrix-result-drift-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(output_dir, ignore_errors=True))
+        last_path = output_dir / "case.last.txt"
+        last_path.write_text("RESULT: FAIL\nFILES: none\nTEST: N/A\nNOTE: done\n", encoding="utf-8")
+        scenario = next(item for item in matrix.SCENARIOS if item.name == "web_search_probe")
+
+        self.assertTrue(
+            matrix.should_accept_tool_probe_result_label_drift(
+                scenario=scenario,
+                signals_ok=True,
+                files_ok=True,
+                labels_ok=True,
+                result_pass=False,
+                final_substrings_ok=True,
+                final_text=last_path.read_text(encoding="utf-8"),
+            )
+        )
+        self.assertIn("RESULT: FAIL", last_path.read_text(encoding="utf-8"))
 
     def test_filter_declared_tools_for_matrix_keeps_only_allowed_mcp_tools(self) -> None:
         self.assertEqual(

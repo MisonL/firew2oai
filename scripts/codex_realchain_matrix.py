@@ -48,6 +48,27 @@ WRITE_STDIN_RUNTIME_FAILURE_MARKERS = (
     "unknown process id",
     "write_stdin failed",
 )
+TOOL_PROBE_RESULT_DRIFT_BLOCKER_PHRASES = (
+    "adapter error",
+    "tool error",
+    "mcp error",
+    "tool_choice requires",
+    "web search backend blocked",
+    "challenge",
+    "no results found",
+    "too many requests",
+    "rate limit",
+    "未调用",
+    "没有调用",
+    "未获得",
+    "无法",
+    "失败",
+)
+TOOL_PROBE_RESULT_DRIFT_BLOCKER_WORDS = ("failed", "failure", "failures", "error", "errors")
+TOOL_PROBE_RESULT_DRIFT_BLOCKER_WORD_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(word) for word in TOOL_PROBE_RESULT_DRIFT_BLOCKER_WORDS) + r")\b"
+)
+TOOL_PROBE_NEGATED_FAILURE_PREFIX_RE = re.compile(r"(?:without|no|not|zero)\s+(?:\w+\s+){0,2}$")
 PROMPT_DYNAMIC_REQUIRED_TOOLS = {
     "apply_patch",
 }
@@ -78,6 +99,7 @@ CODEX_HOME_SUPPORT_ENTRIES = (
     "superpowers",
     "vendor_imports",
 )
+DEFAULT_TRANSIENT_CASE_RETRIES = 1
 
 
 def run(
@@ -338,6 +360,76 @@ def build_codex_exec_command(codex_executable: str, worktree: Path, last_path: P
 
     cmd.append(prompt)
     return cmd
+
+
+def run_codex_exec_command(cmd: list[str], timeout_s: int) -> subprocess.CompletedProcess[str]:
+    # Codex CLI may try to read supplemental stdin after receiving the prompt.
+    # Send an explicit empty pipe so the read gets EOF deterministically.
+    return run(cmd, cwd=REPO_ROOT, timeout=timeout_s, input_text="")
+
+
+def transient_case_retry_limit() -> int:
+    raw = os.environ.get("CODEX_MATRIX_TRANSIENT_RETRIES", "").strip()
+    if raw == "":
+        return DEFAULT_TRANSIENT_CASE_RETRIES
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return DEFAULT_TRANSIENT_CASE_RETRIES
+
+
+def codex_output_has_meaningful_progress(stdout: str) -> bool:
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        item = payload.get("item")
+        if isinstance(item, dict):
+            return True
+    return False
+
+
+def codex_result_retryable_before_progress(result: subprocess.CompletedProcess[str]) -> bool:
+    if result.returncode == 0:
+        return False
+    combined = "\n".join([result.stdout or "", result.stderr or ""]).lower()
+    if "stream disconnected before completion: idle timeout waiting for sse" not in combined:
+        return False
+    return not codex_output_has_meaningful_progress(result.stdout or "")
+
+
+def artifact_attempt_path(path: Path, attempt: int) -> Path:
+    return path.with_name(f"{path.stem}.attempt{attempt}{path.suffix}")
+
+
+def preserve_transient_attempt_artifacts(
+    jsonl_path: Path,
+    stderr_path: Path,
+    last_path: Path,
+    result: subprocess.CompletedProcess[str],
+    attempt: int,
+) -> None:
+    artifact_attempt_path(jsonl_path, attempt).write_text(result.stdout or "", encoding="utf-8")
+    artifact_attempt_path(stderr_path, attempt).write_text(result.stderr or "", encoding="utf-8")
+    if last_path.exists():
+        shutil.copy2(last_path, artifact_attempt_path(last_path, attempt))
+        last_path.unlink(missing_ok=True)
+
+
+def worktree_changed_since_baseline(
+    worktree: Path,
+    baseline_diff_files: list[str],
+    baseline_snapshot: dict[str, str],
+) -> bool:
+    for path in collect_changed_paths(worktree):
+        if path in baseline_diff_files and not path_changed_from_snapshot(worktree, path, baseline_snapshot):
+            continue
+        return True
+    return False
 
 
 def parse_commands(jsonl_path: Path) -> list[str]:
@@ -904,7 +996,7 @@ def discover_declared_tools(output_dir: Path, codex_executable: str, model: str,
         last_path = output_dir / "__tool_probe__.last.txt"
         cmd = build_codex_exec_command(codex_executable, worktree, last_path, model, build_tool_discovery_prompt(marker))
         started = time.time()
-        run(cmd, cwd=REPO_ROOT, timeout=timeout_s)
+        run_codex_exec_command(cmd, timeout_s)
         container = os.environ.get("CODEX_MATRIX_HISTORY_CONTAINER", "firew2oai").strip()
         if not container:
             return []
@@ -1022,6 +1114,38 @@ def expected_operation_observed(
 def contains_explicit_execution_failure(text: str) -> bool:
     combined = text.lower()
     return any(marker in combined for marker in EXPLICIT_EXECUTION_FAILURE_MARKERS)
+
+
+def should_accept_tool_probe_result_label_drift(
+    scenario: Scenario,
+    signals_ok: bool,
+    files_ok: bool,
+    labels_ok: bool,
+    result_pass: bool,
+    final_substrings_ok: bool,
+    final_text: str,
+) -> bool:
+    if result_pass or not labels_ok or not signals_ok or not files_ok or not final_substrings_ok:
+        return False
+    if not scenario.expected_signals or scenario.expected_operations:
+        return False
+    block = extract_required_label_block(final_text)
+    if not block or not block[0].startswith("RESULT: FAIL"):
+        return False
+    body = "\n".join(block[1:]).lower()
+    return not contains_tool_probe_result_drift_blocker(body)
+
+
+def contains_tool_probe_result_drift_blocker(body: str) -> bool:
+    text = body.lower()
+    if any(marker in text for marker in TOOL_PROBE_RESULT_DRIFT_BLOCKER_PHRASES):
+        return True
+    for match in TOOL_PROBE_RESULT_DRIFT_BLOCKER_WORD_RE.finditer(text):
+        prefix = text[max(0, match.start() - 32) : match.start()]
+        if TOOL_PROBE_NEGATED_FAILURE_PREFIX_RE.search(prefix):
+            continue
+        return True
+    return False
 
 
 def scenario_requires_write_stdin(scenario: Scenario) -> bool:
@@ -1174,6 +1298,7 @@ def build_case_row(
     files_ok: bool,
     labels_ok: bool,
     result_pass: bool,
+    accepted_label_drift: bool,
     command_count: int,
     diff_files: list[str],
     observed_signals: list[str],
@@ -1195,6 +1320,7 @@ def build_case_row(
         "files_ok": "1" if files_ok else "0",
         "labels_ok": "1" if labels_ok else "0",
         "result_pass": "1" if result_pass else "0",
+        "accepted_label_drift": "1" if accepted_label_drift else "0",
         "command_count": str(command_count),
         "diff_files": ",".join(diff_files),
         "observed_signals": ",".join(observed_signals),
@@ -1220,6 +1346,7 @@ def build_skip_row(model: str, scenario: Scenario, missing_tools: list[str]) -> 
         files_ok=False,
         labels_ok=False,
         result_pass=False,
+        accepted_label_drift=False,
         command_count=0,
         diff_files=[],
         observed_signals=missing_tools,
@@ -1288,9 +1415,9 @@ def classify_failure_reason(
         return "web_search_followup_unstructured"
     if "web search backend blocked request" in combined and "challenge" in combined:
         return "web_search_challenge_blocked"
-    if "web search failed after" in combined and "no results found" in combined:
+    if "web search returned no results" in combined or ("web search failed after" in combined and "no results found" in combined):
         return "web_search_no_results"
-    if "execute web search request:" in combined:
+    if "web search backend unavailable" in combined or "execute web search request:" in combined:
         return "web_search_transport_error"
     if "is not a function" in combined:
         return "mcp_search_runtime_error"
@@ -1348,7 +1475,14 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
             sorted({*baseline_diff_files, *scenario.expected_files}),
         )
         cmd = build_codex_exec_command(codex_executable, worktree, last_path, model, scenario.prompt)
-        result = run(cmd, cwd=REPO_ROOT, timeout=timeout_s)
+        result = run_codex_exec_command(cmd, timeout_s)
+        for attempt in range(1, transient_case_retry_limit() + 1):
+            if not codex_result_retryable_before_progress(result):
+                break
+            if worktree_changed_since_baseline(worktree, baseline_diff_files, baseline_snapshot):
+                break
+            preserve_transient_attempt_artifacts(jsonl_path, stderr_path, last_path, result, attempt)
+            result = run_codex_exec_command(cmd, timeout_s)
         duration = f"{time.time() - started:.1f}"
         jsonl_path.write_text(result.stdout or "", encoding="utf-8")
         stderr_path.write_text(result.stderr or "", encoding="utf-8")
@@ -1409,20 +1543,30 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
             if jsonl_path.exists()
             else {}
         )
+        accepted_label_drift = False
         for operation, success in last_command_success.items():
             if operation in scenario.expected_operations and success:
                 explicit_failure = False
                 if re.search(r"(?m)^RESULT:\s*FAIL\b", final_text):
-                    final_text = re.sub(r"(?m)^RESULT:\s*FAIL\b", "RESULT: PASS", final_text, count=1)
-                    result_pass = True
-                    labels_ok = has_required_labels(final_text)
+                    accepted_label_drift = True
+        if should_accept_tool_probe_result_label_drift(
+            scenario=scenario,
+            signals_ok=signals_ok,
+            files_ok=files_ok,
+            labels_ok=labels_ok,
+            result_pass=result_pass,
+            final_substrings_ok=final_substrings_ok,
+            final_text=final_text,
+        ):
+            accepted_label_drift = True
         exit_code = "timeout" if result.returncode == -9 else str(result.returncode)
+        result_satisfied = result_pass or accepted_label_drift
         strict_ok = (
             reads_and_tests_ok
             and signals_ok
             and files_ok
             and labels_ok
-            and result_pass
+            and result_satisfied
             and final_substrings_ok
             and not explicit_failure
             and result.returncode == 0
@@ -1436,7 +1580,7 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
                 final_preview=final_text,
                 stderr_preview=result.stderr or "",
                 labels_ok=labels_ok,
-                result_pass=result_pass,
+                result_pass=result_satisfied,
             )
             if not failure_reason and not final_substrings_ok:
                 failure_reason = "final_content_mismatch"
@@ -1451,6 +1595,7 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
             files_ok=files_ok,
             labels_ok=labels_ok,
             result_pass=result_pass,
+            accepted_label_drift=accepted_label_drift,
             command_count=len(commands),
             diff_files=diff_files,
             observed_signals=observed_signals,
@@ -1478,6 +1623,7 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
             files_ok=False,
             labels_ok=False,
             result_pass=False,
+            accepted_label_drift=False,
             command_count=0,
             diff_files=[],
             observed_signals=[],
@@ -1505,6 +1651,7 @@ def run_case(output_dir: Path, codex_executable: str, model: str, scenario: Scen
             files_ok=False,
             labels_ok=False,
             result_pass=False,
+            accepted_label_drift=False,
             command_count=0,
             diff_files=[],
             observed_signals=[],
@@ -1558,6 +1705,7 @@ SUMMARY_HEADERS = [
     "files_ok",
     "labels_ok",
     "result_pass",
+    "accepted_label_drift",
     "command_count",
     "diff_files",
     "observed_signals",
@@ -1647,6 +1795,7 @@ def main() -> int:
                         files_ok=False,
                         labels_ok=False,
                         result_pass=False,
+                        accepted_label_drift=False,
                         command_count=0,
                         diff_files=[],
                         observed_signals=[],

@@ -218,7 +218,8 @@ func inferCollaborationToolOutputSuccess(action, text string) *bool {
 	if action == "wait" {
 		action = "wait_agent"
 	}
-	lower := strings.ToLower(strings.TrimSpace(text))
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
 	switch action {
 	case "spawn_agent":
 		if strings.Contains(lower, `"agent_id"`) {
@@ -226,7 +227,7 @@ func inferCollaborationToolOutputSuccess(action, text string) *bool {
 			return &flag
 		}
 	case "wait_agent":
-		if strings.Contains(lower, `"timed_out":true`) {
+		if containsJSONBoolLiteral(trimmed, "timed_out", true) {
 			flag := false
 			return &flag
 		}
@@ -241,6 +242,58 @@ func inferCollaborationToolOutputSuccess(action, text string) *bool {
 		}
 	}
 	return nil
+}
+
+func containsJSONBoolLiteral(text, key string, value bool) bool {
+	if key == "" {
+		return false
+	}
+	for _, candidate := range jsonCandidates(text) {
+		var decoded any
+		decoder := json.NewDecoder(strings.NewReader(candidate))
+		if err := decoder.Decode(&decoded); err != nil {
+			continue
+		}
+		if jsonValueContainsBoolLiteral(decoded, key, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func jsonCandidates(text string) []string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+	candidates := []string{trimmed}
+	for idx, r := range trimmed {
+		if r == '{' || r == '[' {
+			candidates = append(candidates, trimmed[idx:])
+		}
+	}
+	return candidates
+}
+
+func jsonValueContainsBoolLiteral(value any, key string, expected bool) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if actual, ok := typed[key].(bool); ok && actual == expected {
+			return true
+		}
+		for _, child := range typed {
+			if jsonValueContainsBoolLiteral(child, key, expected) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if jsonValueContainsBoolLiteral(child, key, expected) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func evidenceActionNameFromHistoryItem(item map[string]any) string {

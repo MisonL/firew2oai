@@ -95,7 +95,7 @@ func (c *Checker) Allowed(ip net.IP) bool {
 // proxies may preserve and forward the original X-Real-IP from the attacker.
 func ExtractClientIP(r *http.Request, trustedProxyCount int) (net.IP, error) {
 	if trustedProxyCount <= 0 {
-		// Trust no proxy headers — use only RemoteAddr
+		// Trust no proxy headers - use only RemoteAddr
 		host, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			host = r.RemoteAddr
@@ -127,7 +127,7 @@ func ExtractClientIP(r *http.Request, trustedProxyCount int) (net.IP, error) {
 		// Client IP index: skip rightmost trustedProxyCount entries
 		clientIdx := len(parts) - 1 - trustedProxyCount
 		if clientIdx < 0 {
-			// Not enough hops in XFF to satisfy trustedProxyCount — the header
+			// Not enough hops in XFF to satisfy trustedProxyCount - the header
 			// is unreliable (client may have injected a fake XFF value).
 			// Fall back to RemoteAddr instead of trusting potentially spoofed values.
 			host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -140,12 +140,9 @@ func ExtractClientIP(r *http.Request, trustedProxyCount int) (net.IP, error) {
 			}
 			return nil, fmt.Errorf("unable to parse client IP from %q", r.RemoteAddr)
 		}
-		// Walk from clientIdx leftward to find a valid IP
-		for i := clientIdx; i >= 0; i-- {
-			ip := net.ParseIP(strings.TrimSpace(parts[i]))
-			if ip != nil {
-				return ip, nil
-			}
+		ip := net.ParseIP(strings.TrimSpace(parts[clientIdx]))
+		if ip != nil {
+			return ip, nil
 		}
 	}
 
@@ -175,27 +172,35 @@ func (c *Checker) Middleware(trustedProxyCount int) func(http.HandlerFunc) http.
 
 			ip, err := ExtractClientIP(r, trustedProxyCount)
 			if err != nil {
-				http.Error(w, `{"error":{"message":"unable to determine client IP","type":"authentication_error","code":"ip_unavailable"}}`, http.StatusForbidden)
+				writeError(w, http.StatusForbidden, "unable to determine client IP", "ip_unavailable")
 				return
 			}
 
 			if !c.Allowed(ip) {
-				w.Header().Set("Content-Type", "application/json; charset=utf-8")
-				w.WriteHeader(http.StatusForbidden)
-				resp := map[string]interface{}{
-					"error": map[string]string{
-						"message": fmt.Sprintf("IP %s is not in whitelist", ip),
-						"type":    "authentication_error",
-						"code":    "ip_not_allowed",
-					},
-				}
-				data, _ := json.Marshal(resp)
-				_, _ = w.Write(data)
-				_, _ = w.Write([]byte("\n"))
+				writeError(w, http.StatusForbidden, "client IP is not in whitelist", "ip_not_allowed")
 				return
 			}
 
 			next(w, r)
 		}
 	}
+}
+
+func writeError(w http.ResponseWriter, status int, message, code string) {
+	resp := map[string]interface{}{
+		"error": map[string]string{
+			"message": message,
+			"type":    "authentication_error",
+			"code":    code,
+		},
+	}
+	data, err := json.Marshal(resp)
+	if err != nil {
+		http.Error(w, `{"error":{"message":"internal error","type":"server_error","code":"internal_error"}}`, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write(data)
+	_, _ = w.Write([]byte("\n"))
 }

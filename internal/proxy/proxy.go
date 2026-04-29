@@ -30,12 +30,12 @@ import (
 const (
 	upstreamURL = "https://chat.fireworks.ai/chat/single"
 
-	// thinkingSeparator is the emoji that Fireworks thinking models emit
+	// thinkingSeparator is the marker that Fireworks thinking models emit
 	// between the thinking block and the actual response.
-	thinkingSeparator = "\U0001f4af" // 💯
+	thinkingSeparator = "\U0001f4af"
 )
 
-// ─── SSE Event Types ──────────────────────────────────────────────────────
+// SSE Event Types
 
 // SSEEvent represents a parsed Fireworks SSE event.
 type SSEEvent struct {
@@ -44,7 +44,7 @@ type SSEEvent struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// ─── OpenAI Request / Response Types ──────────────────────────────────────
+// OpenAI Request / Response Types
 
 type ChatMessage struct {
 	Role       string         `json:"role"`
@@ -132,7 +132,7 @@ type ModelListResponse struct {
 	Data   []ModelObject `json:"data"`
 }
 
-// ─── Fireworks Request Format ─────────────────────────────────────────────
+// Fireworks Request Format
 
 type FireworksMessage struct {
 	Role    string `json:"role"`
@@ -148,7 +148,7 @@ type FireworksRequest struct {
 	MaxTokens           *int               `json:"max_tokens,omitempty"`
 }
 
-// ─── Proxy ────────────────────────────────────────────────────────────────
+// Proxy
 
 // Proxy handles OpenAI-to-Fireworks protocol conversion.
 type Proxy struct {
@@ -199,20 +199,29 @@ func newProxy(transport *transport.FireworksTransport, version string, defaultSh
 	}
 }
 
-// ─── Core Logic ───────────────────────────────────────────────────────────
+// Core Logic
 
 // generateRequestID creates an OpenAI-style chatcmpl- request ID.
-func generateRequestID() string {
-	b := make([]byte, 12)
-	if _, err := rand.Read(b); err != nil {
-		// Extremely unlikely with crypto/rand, but log and use timestamp fallback
-		slog.Error("crypto/rand.Read failed, using timestamp fallback", "error", err)
-		return fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	}
-	return fmt.Sprintf("chatcmpl-%x", b)
+func generateRequestID() (string, error) {
+	return generateRandomID("chatcmpl-", 12)
 }
 
-// ─── Route Handlers ───────────────────────────────────────────────────────
+func generateConversationID() (string, error) {
+	return generateRandomID("session_", 16)
+}
+
+func generateRandomID(prefix string, n int) (string, error) {
+	b := make([]byte, 12)
+	if n > 0 {
+		b = make([]byte, n)
+	}
+	if _, err := io.ReadFull(rand.Reader, b); err != nil {
+		return "", fmt.Errorf("generate random id: %w", err)
+	}
+	return fmt.Sprintf("%s%x", prefix, b), nil
+}
+
+// Route Handlers
 
 // handleRoot returns service info and available endpoints.
 func (p *Proxy) handleRoot(w http.ResponseWriter, _ *http.Request) {
@@ -230,6 +239,14 @@ func (p *Proxy) handleRoot(w http.ResponseWriter, _ *http.Request) {
 
 // handleHealth returns a simple health check response.
 func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method_not_allowed", "method not allowed, use GET or HEAD")
+		return
+	}
+	if r.Method == http.MethodHead {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "ok",
 	})
@@ -260,9 +277,10 @@ func (p *Proxy) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models := make([]ModelObject, len(config.AvailableModels))
+	availableModels := config.AvailableModels()
+	models := make([]ModelObject, len(availableModels))
 	now := time.Now().Unix()
-	for i, m := range config.AvailableModels {
+	for i, m := range availableModels {
 		models[i] = ModelObject{
 			ID:      m,
 			Object:  "model",
@@ -303,7 +321,12 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	requestID := generateRequestID()
+	requestID, err := generateRequestID()
+	if err != nil {
+		slog.Error("failed to generate request id", "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "id_generation_failed", "failed to generate request id")
+		return
+	}
 	showThinking := p.defaultShowThinking
 	if req.ShowThinking != nil {
 		showThinking = *req.ShowThinking
@@ -349,13 +372,20 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		"max_tool_calls", toolConstraints.MaxCalls,
 	)
 
+	conversationID, err := generateConversationID()
+	if err != nil {
+		slog.Error("failed to generate conversation id", "request_id", requestID, "error", err)
+		writeError(w, http.StatusInternalServerError, "server_error", "id_generation_failed", "failed to generate conversation id")
+		return
+	}
+
 	// Build Fireworks request body
 	fwReq := FireworksRequest{
 		Messages: []FireworksMessage{
 			{Role: "user", Content: prompt},
 		},
 		ModelKey:            req.Model,
-		ConversationID:      fmt.Sprintf("session_%d_%d", time.Now().UnixMilli(), time.Now().UnixNano()%10000),
+		ConversationID:      conversationID,
 		FunctionDefinitions: []interface{}{},
 		Temperature:         req.Temperature,
 		MaxTokens:           req.MaxTokens,
@@ -375,7 +405,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ─── Streaming Handler ────────────────────────────────────────────────────
+// Streaming Handler
 
 // handleStream converts Fireworks SSE events to OpenAI streaming format.
 func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, model string, body []byte, showThinking bool, toolCatalog map[string]responseToolDescriptor, toolConstraints toolProtocolConstraints, bufferForToolCalls bool) {
@@ -394,7 +424,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream service unavailable")
 		return
 	}
 
@@ -437,7 +467,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 		return true
 	}
 
-	// Pre-allocate timestamp once — reused for all chunks in this stream.
+	// Pre-allocate timestamp once and reuse it for all chunks in this stream.
 	// Sub-second precision is not required by the OpenAI SSE spec.
 	created := time.Now().Unix()
 
@@ -452,6 +482,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 		},
 	}
 	if !writeAndFlushChunk(roleChunk) {
+		_ = reader.Close()
 		return
 	}
 
@@ -539,7 +570,7 @@ func (p *Proxy) handleStream(w http.ResponseWriter, r *http.Request, requestID, 
 	if !doneReceived && !contentEmitted && result.Len() == 0 && !clientGone && !errors.Is(scanErr, context.Canceled) {
 		finalText := "Codex adapter error: upstream response ended without a completion signal"
 		if scanErr != nil {
-			finalText = "Codex adapter error: upstream stream failed before content: " + scanErr.Error()
+			finalText = "Codex adapter error: upstream stream failed before content"
 		}
 		slog.Error("chat stream ended without completion payload", "request_id", requestID, "error", scanErr)
 		writeTerminalChatStreamText(writeAndFlushChunk, writeAndFlushBytes, requestID, model, created, finalText)
@@ -685,7 +716,7 @@ func finalizeChatStream(
 	return writeDone([]byte("data: [DONE]\n\n"))
 }
 
-// ─── Non-Streaming Handler ────────────────────────────────────────────────
+// Non-Streaming Handler
 
 // handleNonStream collects the full response from Fireworks and returns it
 // in OpenAI non-streaming format.
@@ -712,7 +743,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 	reader, err := openReader()
 	if err != nil {
 		slog.Error("upstream non-stream error", "request_id", requestID, "error", err)
-		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream error: %s", err.Error())
+		writeError(w, http.StatusBadGateway, "upstream_error", "upstream_failed", "upstream service unavailable")
 		return
 	}
 
@@ -767,7 +798,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 	// can distinguish "complete response" from "truncated/corrupted response".
 	if scanErr != nil {
 		if errors.Is(scanErr, context.Canceled) {
-			// Client disconnected — don't write a response that nobody will read.
+			// Client disconnected; do not write a response that nobody will read.
 			slog.Debug("non-stream client disconnected", "request_id", requestID)
 			return
 		}
@@ -777,7 +808,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 			slog.Warn("stream read error but content available, returning partial response", "request_id", requestID, "error", scanErr)
 		} else {
 			slog.Error("stream read error (upstream incomplete)", "request_id", requestID, "error", scanErr)
-			writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "%s", scanErr.Error())
+			writeError(w, http.StatusBadGateway, "upstream_error", "upstream_incomplete", "upstream response ended before completion")
 			return
 		}
 	}
@@ -860,7 +891,7 @@ func (p *Proxy) handleNonStream(w http.ResponseWriter, r *http.Request, requestI
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ─── JSON / SSE Helpers ──────────────────────────────────────────────────
+// JSON / SSE Helpers
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	buf := getPooledJSONBuffer()
@@ -889,10 +920,14 @@ func writeError(w http.ResponseWriter, status int, errType string, errCode strin
 	defer putPooledJSONBuffer(buf)
 
 	enc := json.NewEncoder(buf)
+	message := format
+	if len(args) > 0 {
+		message = fmt.Sprintf(format, args...)
+	}
 	enc.SetEscapeHTML(false)
 	if err := enc.Encode(map[string]interface{}{
 		"error": map[string]interface{}{
-			"message": fmt.Sprintf(format, args...),
+			"message": message,
 			"type":    errType,
 			"code":    errCode,
 		},
@@ -948,6 +983,8 @@ func routeDurationKey(method, path string) string {
 }
 
 func (m *metricsCollector) observe(method, path string, status int, duration time.Duration) {
+	method = normalizeMetricsMethod(method)
+	path = normalizeMetricsPath(path)
 	m.requestTotal.Add(1)
 	m.durationTotalNS.Add(duration.Nanoseconds())
 	m.durationCount.Add(1)
@@ -968,6 +1005,30 @@ func escapeLabelValue(s string) string {
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	s = strings.ReplaceAll(s, `"`, `\"`)
 	return s
+}
+
+func normalizeMetricsMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodPost, http.MethodOptions, http.MethodHead,
+		http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return method
+	default:
+		return "OTHER"
+	}
+}
+
+func normalizeMetricsPath(path string) string {
+	switch path {
+	case "/", "/health", "/metrics", "/v1/models", "/v1/chat/completions", "/v1/responses":
+		return path
+	}
+	if strings.HasPrefix(path, "/v1/responses/") {
+		if strings.HasSuffix(path, "/input_items") {
+			return "/v1/responses/{response_id}/input_items"
+		}
+		return "/v1/responses/{response_id}"
+	}
+	return "__other__"
 }
 
 func (m *metricsCollector) Render() string {
@@ -1136,7 +1197,7 @@ func MetricsMiddleware(mc *metricsCollector) func(http.HandlerFunc) http.Handler
 	}
 }
 
-// ─── Middleware: Logging ─────────────────────────────────────────────────
+// Middleware: Logging
 
 // LoggingMiddleware logs incoming requests with structured output.
 func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -1170,15 +1231,32 @@ func LoggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 // preserving Flusher and Hijacker interfaces for SSE streaming.
 type responseWriter struct {
 	http.ResponseWriter
-	statusCode int
+	statusCode  int
+	headersSent bool
 }
 
 func (rw *responseWriter) WriteHeader(code int) {
+	if rw.headersSent {
+		return
+	}
+	rw.headersSent = true
 	rw.statusCode = code
 	rw.ResponseWriter.WriteHeader(code)
 }
 
+func (rw *responseWriter) Write(data []byte) (int, error) {
+	if !rw.headersSent {
+		rw.headersSent = true
+		rw.statusCode = http.StatusOK
+	}
+	return rw.ResponseWriter.Write(data)
+}
+
 func (rw *responseWriter) Flush() {
+	if !rw.headersSent {
+		rw.headersSent = true
+		rw.statusCode = http.StatusOK
+	}
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
 	}
@@ -1198,7 +1276,7 @@ func (rw *responseWriter) Unwrap() http.ResponseWriter {
 	return rw.ResponseWriter
 }
 
-// ─── Middleware: CORS ─────────────────────────────────────────────────────
+// Middleware: CORS
 
 // CORSMiddleware adds CORS headers for cross-origin API access.
 // origins is a comma-separated list; "*" allows all origins.
@@ -1259,25 +1337,28 @@ func parseOrigins(origins string) map[string]bool {
 	return m
 }
 
-// ─── Middleware: Recovery ─────────────────────────────────────────────────
+// Middleware: Recovery
 
 // RecoveryMiddleware catches panics and returns 500 instead of crashing.
 func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
 		defer func() {
 			if rec := recover(); rec != nil {
 				slog.Error("panic recovered",
 					"path", r.URL.Path,
 					"error", fmt.Sprintf("%v", rec),
 				)
-				writeError(w, http.StatusInternalServerError, "server_error", "internal_error", "internal server error")
+				if !rw.headersSent {
+					writeError(rw, http.StatusInternalServerError, "server_error", "internal_error", "internal server error")
+				}
 			}
 		}()
-		next(w, r)
+		next(rw, r)
 	}
 }
 
-// ─── Middleware Chain ─────────────────────────────────────────────────────
+// Middleware Chain
 
 // chain applies middlewares from outermost to innermost.
 func chain(handlers ...func(http.HandlerFunc) http.HandlerFunc) func(http.HandlerFunc) http.HandlerFunc {
@@ -1289,7 +1370,7 @@ func chain(handlers ...func(http.HandlerFunc) http.HandlerFunc) func(http.Handle
 	}
 }
 
-// ─── Router ───────────────────────────────────────────────────────────────
+// Router
 
 // NewMux creates the HTTP handler with all routes registered.
 // tm must be constructed by the caller so auth configuration errors fail fast at startup.

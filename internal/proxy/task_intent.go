@@ -124,6 +124,8 @@ var taskCommandTrailingDirectivePattern = regexp.MustCompile(`(?i)\s+(?:only out
 var taskCommandTrailingConnectorPattern = regexp.MustCompile(`(?:\s|，|,|、|；|;)*(?:和|以及|及|and|then|然后)\s*$`)
 var taskInlineStepMarkerPattern = regexp.MustCompile(`(?:^|\s)(?:\d+[.)]|[（(]?\d+[）)])\s+`)
 
+const outputLabelToolMentionPrefixWindow = 96
+
 func latestUserTask(messages []ChatMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if !strings.EqualFold(messages[i].Role, "user") {
@@ -384,6 +386,9 @@ func taskLikelyNeedsTools(task string) bool {
 		return false
 	}
 	lower := strings.ToLower(trimmed)
+	if taskExplicitlyDisablesTools(lower) {
+		return false
+	}
 
 	// Explicit command/test tasks should always route through tools.
 	for _, token := range []string{
@@ -407,6 +412,39 @@ func taskLikelyNeedsTools(task string) bool {
 	// Explicit plain-answer/summarization requests should not force tools.
 	if containsAny(lower, taskPlainResponseKeywords) && !hasTarget {
 		return false
+	}
+	return false
+}
+
+func taskExplicitlyDisablesTools(lowerTask string) bool {
+	lowerTask = strings.TrimSpace(lowerTask)
+	if lowerTask == "" {
+		return false
+	}
+	for _, marker := range []string{
+		"不要调用任何工具",
+		"不要使用任何工具",
+		"不调用任何工具",
+		"不使用任何工具",
+		"禁止调用任何工具",
+		"禁止使用任何工具",
+		"不得调用任何工具",
+		"不得使用任何工具",
+		"不能调用任何工具",
+		"不能使用任何工具",
+		"无需调用工具",
+		"无需使用工具",
+		"do not call any tool",
+		"do not use any tool",
+		"don't call any tool",
+		"don't use any tool",
+		"without calling tools",
+		"without using tools",
+		"no tools",
+	} {
+		if strings.Contains(lowerTask, marker) {
+			return true
+		}
 	}
 	return false
 }
@@ -700,6 +738,26 @@ func isDescriptiveToolMention(lowerTask, aliasLower string, index int) bool {
 	if suffixStart > len(lowerTask) {
 		suffixStart = len(lowerTask)
 	}
+	argumentSuffixEnd := suffixStart + 48
+	if argumentSuffixEnd > len(lowerTask) {
+		argumentSuffixEnd = len(lowerTask)
+	}
+	argumentSuffix := strings.TrimSpace(lowerTask[suffixStart:argumentSuffixEnd])
+	for _, marker := range []string{
+		"的 arguments",
+		"的 argument",
+		"的 parameters",
+		"的 parameter",
+		"的参数",
+		"arguments",
+		"argument",
+		"parameters",
+		"parameter",
+	} {
+		if strings.HasPrefix(argumentSuffix, marker) {
+			return true
+		}
+	}
 	suffixEnd := suffixStart + 8
 	if suffixEnd > len(lowerTask) {
 		suffixEnd = len(lowerTask)
@@ -727,7 +785,7 @@ func isOutputLabelToolMention(lowerTask, aliasLower string, index int) bool {
 	if index < 0 || aliasLower == "" {
 		return false
 	}
-	start := index - 32
+	start := index - outputLabelToolMentionPrefixWindow
 	if start < 0 {
 		start = 0
 	}

@@ -75,6 +75,33 @@ func TestHandleHealth(t *testing.T) {
 	}
 }
 
+func TestHandleHealthRejectsNonGET(t *testing.T) {
+	p := newTestProxy()
+	mux := newTestMux(t, p, "*")
+	req := httptest.NewRequest(http.MethodPost, "/health", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Errorf("status = %d, want 405", rec.Code)
+	}
+}
+
+func TestHandleHealthAllowsHEAD(t *testing.T) {
+	p := newTestProxy()
+	mux := newTestMux(t, p, "*")
+	req := httptest.NewRequest(http.MethodHead, "/health", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != 0 {
+		t.Fatalf("HEAD body length = %d, want 0", rec.Body.Len())
+	}
+}
+
 func TestHandleModels_NoAuth(t *testing.T) {
 	p := newTestProxy()
 	mux := newTestMux(t, p, "*")
@@ -267,6 +294,32 @@ func TestMessagesToPrompt(t *testing.T) {
 				t.Errorf("messagesToPrompt() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestParseChatMessageContentRejectsUnknownTextLikeType(t *testing.T) {
+	_, err := parseChatMessageContent(json.RawMessage(`[{"type":"output_text_delta","text":"partial"}]`))
+	if err == nil || !strings.Contains(err.Error(), "unsupported message content block type") {
+		t.Fatalf("expected unsupported content block error, got %v", err)
+	}
+}
+
+func TestParseChatToolCallOutputMarshalsObjectArguments(t *testing.T) {
+	text := "use tool\n<<<AI_ACTIONS_V1>>>\n{\"mode\":\"tool\",\"calls\":[{\"name\":\"Read\",\"arguments\":{\"file_path\":\"README.md\"}}]}\n<<<END_AI_ACTIONS_V1>>>"
+	calls, visible, err := parseChatToolCallOutput(text, map[string]responseToolDescriptor{
+		"Read": {Name: "Read", Type: "function", Structured: true},
+	}, toolProtocolConstraints{})
+	if err != nil {
+		t.Fatalf("parseChatToolCallOutput error: %v", err)
+	}
+	if visible != "use tool" {
+		t.Fatalf("visible = %q, want use tool", visible)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d, want 1", len(calls))
+	}
+	if calls[0].Function.Arguments != `{"file_path":"README.md"}` {
+		t.Fatalf("arguments = %q", calls[0].Function.Arguments)
 	}
 }
 
@@ -508,6 +561,23 @@ func TestRecoveryMiddleware(t *testing.T) {
 	}
 }
 
+func TestRecoveryMiddlewareDoesNotAppendAfterWrite(t *testing.T) {
+	handler := RecoveryMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("partial"))
+		panic("test panic after write")
+	})
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 after partial write", rec.Code)
+	}
+	if got := rec.Body.String(); got != "partial" {
+		t.Fatalf("body = %q, want only partial response", got)
+	}
+}
+
 func TestWriteError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	writeError(rec, http.StatusBadRequest, "test_type", "test_code", "test message %s", "arg")
@@ -615,13 +685,46 @@ func TestResponseWriterHijackPassthrough(t *testing.T) {
 }
 
 func TestGenerateRequestID(t *testing.T) {
-	id1 := generateRequestID()
-	id2 := generateRequestID()
+	id1, err := generateRequestID()
+	if err != nil {
+		t.Fatalf("generateRequestID returned error: %v", err)
+	}
+	id2, err := generateRequestID()
+	if err != nil {
+		t.Fatalf("generateRequestID returned error: %v", err)
+	}
 	if id1 == id2 {
 		t.Error("two request IDs should not be equal")
 	}
 	if !strings.HasPrefix(id1, "chatcmpl-") {
 		t.Errorf("request ID = %q, want chatcmpl- prefix", id1)
+	}
+}
+
+func TestGenerateConversationID(t *testing.T) {
+	id1, err := generateConversationID()
+	if err != nil {
+		t.Fatalf("generateConversationID returned error: %v", err)
+	}
+	id2, err := generateConversationID()
+	if err != nil {
+		t.Fatalf("generateConversationID returned error: %v", err)
+	}
+	if id1 == id2 {
+		t.Fatal("two conversation IDs should not be equal")
+	}
+	if !strings.HasPrefix(id1, "session_") {
+		t.Fatalf("conversation ID = %q, want session_ prefix", id1)
+	}
+	if strings.Count(id1, "_") != 1 || len(id1) != len("session_")+32 {
+		t.Fatalf("conversation ID should be session_ plus 16 random bytes in hex, got %q", id1)
+	}
+}
+
+func TestUpstreamEmptyRetryDelayIsCapped(t *testing.T) {
+	policy := newUpstreamEmptyRetryPolicy(10, 10*time.Second)
+	if got := policy.delay(4); got != maxUpstreamEmptyRetryDelay {
+		t.Fatalf("delay = %v, want %v", got, maxUpstreamEmptyRetryDelay)
 	}
 }
 
@@ -647,8 +750,8 @@ data: {"type":"done","content":""}
 
 func TestScanSSEEvents_ThinkingSeparator(t *testing.T) {
 	sse := `data: {"type":"content","content":"thinking..."}
-data: {"type":"content","content":"💯"}
-data: {"type":"content","content":"answer here"}
+` + `data: {"type":"content","content":"` + thinkingSeparator + `"}
+` + `data: {"type":"content","content":"answer here"}
 data: {"type":"done","content":""}
 `
 	var events []string
@@ -676,8 +779,8 @@ data: {"type":"done","content":""}
 func TestScanSSEEvents_ThinkingHidden(t *testing.T) {
 	// When showThinking=false, thinking content should be skipped
 	sse := `data: {"type":"content","content":"hidden thinking"}
-data: {"type":"content","content":"💯"}
-data: {"type":"content","content":"visible answer"}
+` + `data: {"type":"content","content":"` + thinkingSeparator + `"}
+` + `data: {"type":"content","content":"visible answer"}
 data: {"type":"done","content":""}
 `
 	var contents []string
@@ -779,11 +882,47 @@ data: {"type":"done","content":""}
 	}
 }
 
+func TestScanSSEEvents_ThinkingFallbackReportsContent(t *testing.T) {
+	sse := `data: {"type":"content","content":"ok"}
+data: {"type":"done","content":""}
+`
+	var contents []string
+	hasContent, err := scanSSEEvents(strings.NewReader(sse), true, false, func(evt sseContentEvent) bool {
+		if evt.Type == "content" {
+			contents = append(contents, evt.Content)
+		}
+		return true
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !hasContent {
+		t.Fatal("hasContent = false, want true after hidden fallback emission")
+	}
+	if len(contents) != 1 || contents[0] != "ok" {
+		t.Fatalf("contents = %v, want [ok]", contents)
+	}
+}
+
+func TestInferCollaborationToolOutputSuccessDetectsSpacedTimeout(t *testing.T) {
+	got := inferCollaborationToolOutputSuccess("wait_agent", `{"status": {}, "timed_out": true}`)
+	if got == nil || *got {
+		t.Fatalf("success = %v, want false", got)
+	}
+}
+
+func TestInferCollaborationToolOutputSuccessIgnoresQuotedTimeoutText(t *testing.T) {
+	got := inferCollaborationToolOutputSuccess("wait_agent", `{"message":"Wait, is timed_out: true?","timed_out":false}`)
+	if got != nil {
+		t.Fatalf("success = %v, want nil", got)
+	}
+}
+
 func TestScanSSEEvents_NonThinkingModel(t *testing.T) {
-	// Non-thinking model: 💯 should be skipped (consistent with original behavior).
-	// In practice, non-thinking models never emit 💯, but if they did, we skip it.
-	sse := `data: {"type":"content","content":"💯"}
-data: {"type":"content","content":"more"}
+	// Non-thinking model: the thinking marker should be skipped.
+	// In practice, non-thinking models never emit this marker, but if they did, we skip it.
+	sse := `data: {"type":"content","content":"` + thinkingSeparator + `"}
+` + `data: {"type":"content","content":"more"}
 data: {"type":"done","content":""}
 `
 	var contents []string
@@ -797,7 +936,7 @@ data: {"type":"done","content":""}
 		t.Errorf("unexpected error: %v", err)
 	}
 	if len(contents) != 1 || contents[0] != "more" {
-		t.Errorf("contents = %v, want [more] (💯 skipped for non-thinking model)", contents)
+		t.Errorf("contents = %v, want [more] (thinking marker skipped for non-thinking model)", contents)
 	}
 }
 
@@ -1040,7 +1179,7 @@ func TestCORSMiddleware_EmptyOrigins(t *testing.T) {
 }
 
 func TestCORSMiddleware_DirtyConfigBlocksAll(t *testing.T) {
-	// Dirty config like ",,," should NOT become wildcard — it should block all CORS
+	// Dirty config like ",,," should not become wildcard; it should block all CORS.
 	p := newTestProxy()
 	mux := newTestMux(t, p, ",,,")
 	req := httptest.NewRequest(http.MethodOptions, "/v1/models", nil)
@@ -1137,7 +1276,7 @@ func TestHandleNonStream_UpstreamIncomplete(t *testing.T) {
 		// Send some content but NO done event
 		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"partial\"}\n\n"))
 		flusher.Flush()
-		// Stream ends here — no done event
+		// Stream ends here with no done event.
 	}))
 	defer upstream.Close()
 
@@ -1163,6 +1302,31 @@ func TestHandleNonStream_UpstreamIncomplete(t *testing.T) {
 	}
 	if resp.Choices[0].Message.Content != "partial" {
 		t.Errorf("content = %q, want 'partial'", resp.Choices[0].Message.Content)
+	}
+}
+
+func TestHandleNonStream_UpstreamConnectErrorIsSanitized(t *testing.T) {
+	p := NewWithUpstream(transport.New(time.Second), "test", false, "http://127.0.0.1:1")
+	mux := newTestMux(t, p, "*")
+
+	body := `{"model":"deepseek-v3p2","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502, body=%s", rec.Code, rec.Body.String())
+	}
+	bodyText := rec.Body.String()
+	if !strings.Contains(bodyText, "upstream service unavailable") {
+		t.Fatalf("body missing sanitized upstream error: %s", bodyText)
+	}
+	for _, leaked := range []string{"127.0.0.1", "connect", "connection refused"} {
+		if strings.Contains(bodyText, leaked) {
+			t.Fatalf("body leaked upstream transport detail %q: %s", leaked, bodyText)
+		}
 	}
 }
 
@@ -1199,7 +1363,7 @@ func TestHandleNonStream_ContextCanceled(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 
-	// Cancel context immediately — upstream request will fail with context.Canceled
+	// Cancel context immediately; upstream request will fail with context.Canceled.
 	ctx, cancel := context.WithCancel(req.Context())
 	cancel()
 	req = req.WithContext(ctx)
@@ -1308,6 +1472,33 @@ func TestHandleMetrics_PublicEndpoint(t *testing.T) {
 	}
 	if strings.Contains(body, `path="/metrics"`) {
 		t.Fatal("/metrics should not be included in route metrics to avoid scrape self-noise")
+	}
+}
+
+func TestHandleMetricsNormalizesUnknownPaths(t *testing.T) {
+	p := newTestProxy()
+	mux := newTestMux(t, p, "*")
+
+	for _, path := range []string{"/not-found-a", "/not-found-b", "/v1/responses/resp_123", "/v1/responses/resp_456/input_items"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+	}
+
+	metricsReq := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+	metricsRec := httptest.NewRecorder()
+	mux.ServeHTTP(metricsRec, metricsReq)
+
+	body := metricsRec.Body.String()
+	for _, unexpected := range []string{"/not-found-a", "/not-found-b", "resp_123", "resp_456"} {
+		if strings.Contains(body, unexpected) {
+			t.Fatalf("metrics body contains unnormalized path fragment %q:\n%s", unexpected, body)
+		}
+	}
+	for _, expected := range []string{`path="__other__"`, `path="/v1/responses/{response_id}"`, `path="/v1/responses/{response_id}/input_items"`} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("metrics body missing normalized path %q:\n%s", expected, body)
+		}
 	}
 }
 

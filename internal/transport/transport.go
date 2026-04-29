@@ -38,6 +38,8 @@ const (
 	defaultSecChUAPlatform = `"macOS"`
 	transportReadBuffer    = 32 * 1024
 	transportWriteBuffer   = 16 * 1024
+	maxNonOKDrainBytes     = 64 * 1024
+	maxRetryDelay          = 30 * time.Second
 )
 
 // chromeUAVersionRE extracts the Chrome major version from a User-Agent string.
@@ -225,7 +227,7 @@ func (t *FireworksTransport) streamPostOnce(ctx context.Context, url string, bod
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	// ── Full Chrome browser header set ──
+	// Full Chrome browser header set.
 	// Core headers
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
@@ -245,7 +247,7 @@ func (t *FireworksTransport) streamPostOnce(ctx context.Context, url string, bod
 	req.Header.Set("Origin", originFireworks)
 	req.Header.Set("Referer", refererFireworks)
 
-	// Chrome Client Hints (sec-ch-ua headers) — derived from ChromeUserAgent
+	// Chrome Client Hints (sec-ch-ua headers) derived from ChromeUserAgent.
 	derivedChUA, derivedChUAPlatform := secChUADerived()
 	req.Header.Set("sec-ch-ua", derivedChUA)
 	req.Header.Set("sec-ch-ua-mobile", secChUAMobile)
@@ -266,6 +268,7 @@ func (t *FireworksTransport) streamPostOnce(ctx context.Context, url string, bod
 
 	if resp.StatusCode != http.StatusOK {
 		retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
+		_, _ = io.CopyN(io.Discard, resp.Body, maxNonOKDrainBytes)
 		_ = resp.Body.Close()
 		return nil, transientUpstreamError{statusCode: resp.StatusCode, retryAfter: retryAfter}
 	}
@@ -315,15 +318,33 @@ func (t *FireworksTransport) shouldRetryStreamPost(attempt int, err error) bool 
 }
 
 func (t *FireworksTransport) retryDelayForError(attempt int, err error) time.Duration {
-	delay := t.upstreamRetryBackoff
-	if delay <= 0 {
-		delay = 0
-	} else {
-		delay = delay * time.Duration(1<<attempt)
-	}
+	delay := boundedExponentialDelay(t.upstreamRetryBackoff, attempt)
 	var statusErr transientUpstreamError
 	if errors.As(err, &statusErr) && statusErr.retryAfter > delay {
 		delay = statusErr.retryAfter
+	}
+	if delay > maxRetryDelay {
+		delay = maxRetryDelay
+	}
+	return delay
+}
+
+func boundedExponentialDelay(base time.Duration, attempt int) time.Duration {
+	if base < 0 {
+		return 0
+	}
+	if base <= 0 || attempt <= 0 {
+		return base
+	}
+	delay := base
+	for i := 0; i < attempt; i++ {
+		if delay >= maxRetryDelay/2 {
+			return maxRetryDelay
+		}
+		delay *= 2
+	}
+	if delay > maxRetryDelay {
+		return maxRetryDelay
 	}
 	return delay
 }

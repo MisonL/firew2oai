@@ -902,6 +902,8 @@ func collectExecutionHistorySignals(historyItems []json.RawMessage) executionHis
 			}
 		case "web_search_call", "web_search":
 			signals.ToolCalls++
+		case "todo_list":
+			signals.ToolCalls++
 		case "mcp_tool_call":
 			name := observedToolNameFromHistoryItem(item, nil)
 			if name == "" {
@@ -2711,6 +2713,17 @@ func collectSatisfiedToolNames(historyItems []json.RawMessage, toolCatalog map[s
 			}
 			seen[key] = struct{}{}
 			names = append(names, name)
+		case "todo_list":
+			name := observedToolNameFromHistoryItem(item, toolCatalog)
+			if name == "" {
+				continue
+			}
+			key := typ + "|" + name
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			names = append(names, name)
 		case "collab_tool_call":
 			name := observedToolNameFromHistoryItem(item, toolCatalog)
 			if name == "" || !historyCollabToolCallSucceeded(item) {
@@ -2955,6 +2968,11 @@ func observedToolHistoryDedupeKey(item map[string]any, toolCatalog map[string]re
 func observedToolNameFromHistoryItem(item map[string]any, toolCatalog map[string]responseToolDescriptor) string {
 	typ, _ := item["type"].(string)
 	switch typ {
+	case "todo_list":
+		if _, ok := toolCatalog["update_plan"]; !ok && len(toolCatalog) > 0 {
+			return ""
+		}
+		return "update_plan"
 	case "function_call", "custom_tool_call":
 		rawName, _ := item["name"].(string)
 		rawName = strings.TrimSpace(rawName)
@@ -3042,7 +3060,7 @@ var syntheticUpdatePlanStepsPattern = regexp.MustCompile(`(?m)plan\s*里只写�
 
 func buildSyntheticExplicitToolCall(nextRequiredTool, task string, historyItems []json.RawMessage, toolCatalog map[string]responseToolDescriptor, nextCommand string) *parsedToolCall {
 	switch shortToolName(nextRequiredTool) {
-	case "take_snapshot", "js_repl_reset", "list_mcp_resource_templates":
+	case "take_snapshot", "js_repl_reset", "list_mcp_resources", "list_mcp_resource_templates":
 		return buildSyntheticNoArgToolCall(nextRequiredTool, toolCatalog)
 	case "update_plan":
 		return buildSyntheticUpdatePlanCall(nextRequiredTool, task, toolCatalog)

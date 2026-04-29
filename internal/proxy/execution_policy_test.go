@@ -33,6 +33,20 @@ func TestBuildExecutionPolicy_StrictLoopModelEnablesSingleStep(t *testing.T) {
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitNoToolDirectiveDoesNotRequireTool(t *testing.T) {
+	task := "TOOL_DISCOVERY_PROBE_123\n" +
+		"你是测试代理。不要调用任何工具，也不要修改任何文件。\n" +
+		"最后只输出四行：RESULT: PASS；FILES: none；TEST: N/A；NOTE: tool discovery probe。"
+	policy := buildExecutionPolicy("qwen3-vl-30b-a3b-thinking", task, nil, true, false, false)
+
+	if policy.RequireTool {
+		t.Fatalf("policy.RequireTool = true, want false: %+v", policy)
+	}
+	if policy.Enabled {
+		t.Fatalf("policy.Enabled = true, want false: %+v", policy)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceForcesSingleStepEvenForNonStrictModel(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"mcp__chrome_devtools__new_page":      {Name: "mcp__chrome_devtools__new_page", Type: "function", Structured: true, Namespace: "mcp__chrome_devtools__"},
@@ -1051,6 +1065,24 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesMCPResourceTemplate
 	}
 }
 
+func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesMCPResourcesFirst(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"list_mcp_resources":          {Name: "list_mcp_resources", Type: "function", Structured: true},
+		"list_mcp_resource_templates": {Name: "list_mcp_resource_templates", Type: "function", Structured: true},
+	}
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-8b", "必须调用 list_mcp_resources。必须调用 list_mcp_resource_templates。", nil, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "list_mcp_resources" {
+		t.Fatalf("policy.NextRequiredTool = %q, want list_mcp_resources", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic list_mcp_resources call")
+	}
+	if got := parsedCallName(t, *policy.SyntheticToolCall); got != "list_mcp_resources" {
+		t.Fatalf("synthetic tool name = %q, want list_mcp_resources", got)
+	}
+}
+
 func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesJSReplReset(t *testing.T) {
 	toolCatalog := map[string]responseToolDescriptor{
 		"js_repl":       {Name: "js_repl", Type: "custom", Structured: false},
@@ -1325,6 +1357,42 @@ func TestBuildExecutionPolicy_ExplicitToolSequenceSynthesizesExecCommand(t *test
 	}
 	if got := parsedCallCommand(t, *policy.SyntheticToolCall); got != "sed -n '1,5p' README.md" {
 		t.Fatalf("synthetic exec_command = %q", got)
+	}
+}
+
+func TestBuildExecutionPolicy_ExplicitToolSequenceTreatsTodoListAsUpdatePlan(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"update_plan":  {Name: "update_plan", Type: "function", Structured: true},
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"todo_list","items":[{"text":"Inspect README.md","completed":false},{"text":"Reply with summary","completed":false}]}`),
+	}
+	task := "1) 必须先调用 update_plan。\n2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n3) 然后必须使用 exec_command 执行 `head -n 3 README.md`。"
+
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.NextRequiredTool != "exec_command" {
+		t.Fatalf("policy.NextRequiredTool = %q, want exec_command", policy.NextRequiredTool)
+	}
+	if policy.SyntheticToolCall == nil {
+		t.Fatal("policy.SyntheticToolCall = nil, want synthetic exec_command call")
+	}
+	if got := parsedCallCommand(t, *policy.SyntheticToolCall); got != "head -n 3 README.md" {
+		t.Fatalf("synthetic exec_command = %q", got)
+	}
+}
+
+func TestCollectSatisfiedToolNames_DedupesTodoListAsUpdatePlan(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"update_plan": {Name: "update_plan", Type: "function", Structured: true},
+	}
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"todo_list","items":[{"text":"Inspect README.md","completed":false}]}`),
+		json.RawMessage(`{"type":"todo_list","items":[{"text":"Inspect README.md","completed":true}]}`),
+	}
+
+	if got := collectSatisfiedToolNames(history, toolCatalog); !reflect.DeepEqual(got, []string{"update_plan"}) {
+		t.Fatalf("satisfied tools = %#v, want one update_plan", got)
 	}
 }
 
@@ -3051,6 +3119,41 @@ func TestBuildExecutionPolicy_ReadOnlyTaskFinalizesAfterAllRequiredCommands(t *t
 	}
 	if policy.NextCommand != "" {
 		t.Fatalf("next command = %q, want empty", policy.NextCommand)
+	}
+}
+
+func TestBuildExecutionPolicy_PlanThenReadFinalizesAfterPlanAndCommand(t *testing.T) {
+	toolCatalog := map[string]responseToolDescriptor{
+		"exec_command": {Name: "exec_command", Type: "function", Structured: true},
+		"update_plan":  {Name: "update_plan", Type: "function", Structured: true},
+	}
+	task := "你是测试代理。请在当前仓库完成一个计划驱动的只读任务：\n" +
+		"1) 必须先调用 update_plan。\n" +
+		"2) update_plan 的 arguments 顶层字段必须叫 plan，不允许使用 steps。\n" +
+		"3) plan 里只写两个步骤：Inspect README.md、Reply with summary。\n" +
+		"4) 然后必须使用 exec_command 执行 `head -n 3 README.md`。\n" +
+		"5) 不要修改任何文件。\n" +
+		"最后只输出四行，不要有任何额外内容：\n" +
+		"RESULT: PASS 或 FAIL\n" +
+		"FILES: 你读取的文件\n" +
+		"TEST: N/A\n" +
+		"NOTE: 你是否先成功调用了 update_plan"
+	history := []json.RawMessage{
+		json.RawMessage(`{"type":"function_call","name":"update_plan","call_id":"call_plan","arguments":"{\"plan\":[{\"step\":\"Inspect README.md\",\"status\":\"in_progress\"},{\"step\":\"Reply with summary\",\"status\":\"pending\"}]}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_plan","output":"Plan updated"}`),
+		json.RawMessage(`{"type":"function_call","name":"exec_command","call_id":"call_head","arguments":"{\"cmd\":\"head -n 3 README.md\"}"}`),
+		json.RawMessage(`{"type":"function_call_output","call_id":"call_head","output":"Chunk ID: 1\nProcess exited with code 0\nOutput:\n# firew2oai"}`),
+	}
+
+	if got := extractExplicitToolMentions(task, toolCatalog); !reflect.DeepEqual(got, []string{"update_plan", "exec_command"}) {
+		t.Fatalf("explicit tools = %#v, want update_plan then exec_command", got)
+	}
+	policy := buildExecutionPolicyWithCatalog("qwen3-vl-30b-a3b-thinking", task, history, toolCatalog, true, false, true)
+	if policy.RequireTool || policy.NextRequiredTool != "" {
+		t.Fatalf("policy should finalize after plan and read command: %+v", policy)
+	}
+	if policy.Stage != "finalize" {
+		t.Fatalf("stage = %q, want finalize", policy.Stage)
 	}
 }
 

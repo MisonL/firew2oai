@@ -249,6 +249,31 @@ func TestStreamPost_ContextCanceledDuringRetryBackoffReturnsContextError(t *test
 	}
 }
 
+func TestRetryDelayForErrorCapsExponentialBackoff(t *testing.T) {
+	tp := NewWithRetry(5*time.Second, 10, 10*time.Second)
+	delay := tp.retryDelayForError(4, transientSendRequestError{cause: errors.New("temporary")})
+	if delay != maxRetryDelay {
+		t.Fatalf("delay = %v, want capped %v", delay, maxRetryDelay)
+	}
+}
+
+func TestRetryDelayForErrorCapsRetryAfter(t *testing.T) {
+	tp := NewWithRetry(5*time.Second, 1, time.Second)
+	err := transientUpstreamError{statusCode: http.StatusTooManyRequests, retryAfter: time.Hour}
+	delay := tp.retryDelayForError(0, err)
+	if delay != maxRetryDelay {
+		t.Fatalf("delay = %v, want capped %v", delay, maxRetryDelay)
+	}
+}
+
+func TestRetryDelayForErrorNormalizesNegativeBackoff(t *testing.T) {
+	tp := NewWithRetry(5*time.Second, 1, -time.Second)
+	delay := tp.retryDelayForError(1, transientSendRequestError{cause: errors.New("temporary")})
+	if delay != 0 {
+		t.Fatalf("delay = %v, want 0", delay)
+	}
+}
+
 func TestStreamPost_ContextCanceled(t *testing.T) {
 	// Use httptest.Server instead of relying on external network
 	stall := make(chan struct{})

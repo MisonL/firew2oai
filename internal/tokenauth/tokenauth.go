@@ -174,7 +174,7 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 			return nil, fmt.Errorf("token config file exists but cannot be opened: %w", err)
 		}
 	} else if strings.HasPrefix(configStr, "/") || strings.HasPrefix(configStr, "./") || strings.HasPrefix(configStr, "../") {
-		// Looks like a path but doesn't exist — report as error
+		// Looks like a path but doesn't exist - report as error
 		return nil, fmt.Errorf("token config looks like a file path but file does not exist: %s", configStr)
 	} else if strings.HasPrefix(configStr, "[") {
 		// Inline JSON array
@@ -202,10 +202,15 @@ func New(configStr string, globalRateLimit int) (*Manager, error) {
 		return nil, fmt.Errorf("no valid tokens found in configuration")
 	}
 
+	seen := make(map[string]struct{}, len(tokenConfigs))
 	for _, tc := range tokenConfigs {
 		if tc.Key == "" {
 			return nil, fmt.Errorf("token config contains empty key")
 		}
+		if _, exists := seen[tc.Key]; exists {
+			return nil, fmt.Errorf("duplicate token key %q", tc.Key)
+		}
+		seen[tc.Key] = struct{}{}
 		// Reject negative values: treat as configuration errors rather than
 		// silently disabling the limit (which a typo could cause).
 		if tc.Quota < 0 {
@@ -330,8 +335,7 @@ func (m *Manager) TokenCount() int {
 	return len(m.tokens)
 }
 
-// authResult holds the combined result of Authenticate + CheckQuota + CheckRateLimit
-// obtained in a single lock acquisition.
+// authResult holds the combined result of Authenticate + CheckQuota + CheckRateLimit.
 type authResult struct {
 	authenticated bool
 	authReason    string
@@ -346,20 +350,19 @@ type authResult struct {
 	rateResetTime int64
 }
 
-// checkAll performs Authenticate + CheckQuota + CheckRateLimit in a single
-// read-lock acquisition, then upgrades to a write-lock only for RecordUsage.
-// This reduces per-request lock operations from 4 (RLock+RLock+RLock+Lock)
-// to 2 (RLock+Lock), cutting lock contention by ~50%.
-func (m *Manager) checkAll(token string) authResult {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+// checkAndReserve validates a token, applies rate limiting, and reserves one
+// quota unit in the same critical section. This avoids check-then-record races
+// where concurrent requests can all pass quota before usage is incremented.
+func (m *Manager) checkAndReserve(token string) authResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	ts, ok := m.tokens[token]
 	if !ok {
 		return authResult{authenticated: false, authReason: "invalid_api_key"}
 	}
 
-	result := authResult{authenticated: true}
+	result := authResult{authenticated: true, quotaRemaining: -1}
 
 	// Check quota
 	if quota := ts.cfg.Quota; quota > 0 {
@@ -369,7 +372,7 @@ func (m *Manager) checkAll(token string) authResult {
 			result.quotaLimit = int(quota)
 			return result
 		}
-		result.quotaRemaining = remaining
+		result.quotaRemaining = remaining - 1
 		result.quotaLimit = int(quota)
 	}
 
@@ -388,6 +391,7 @@ func (m *Manager) checkAll(token string) authResult {
 		result.rateResetTime = resetTime
 	}
 
+	ts.used++
 	return result
 }
 
@@ -407,8 +411,7 @@ func (m *Manager) Middleware() func(http.HandlerFunc) http.HandlerFunc {
 			}
 			token := auth[7:]
 
-			// Step 1-3: Combined auth + quota + rate limit check (single RLock)
-			result := m.checkAll(token)
+			result := m.checkAndReserve(token)
 
 			if !result.authenticated {
 				writeAuthError(w, result.authReason, "invalid API key")
@@ -423,7 +426,7 @@ func (m *Manager) Middleware() func(http.HandlerFunc) http.HandlerFunc {
 				return
 			} else if result.quotaRemaining >= 0 {
 				w.Header().Set("X-Quota-Limit", strconv.Itoa(result.quotaLimit))
-				w.Header().Set("X-Quota-Remaining", strconv.Itoa(result.quotaRemaining-1))
+				w.Header().Set("X-Quota-Remaining", strconv.Itoa(result.quotaRemaining))
 			}
 
 			if result.rateLimited {
@@ -443,8 +446,6 @@ func (m *Manager) Middleware() func(http.HandlerFunc) http.HandlerFunc {
 				w.Header().Set("X-RateLimit-Reset", strconv.Itoa(int(result.rateResetTime)))
 			}
 
-			// Step 4: All checks passed — record usage (single write-lock)
-			m.RecordUsage(token)
 			next(w, r)
 		}
 	}

@@ -39,7 +39,7 @@ const (
 	maxPort                            = 65535
 )
 
-var AvailableModels = []string{
+var availableModels = []string{
 	"qwen3-vl-30b-a3b-thinking",
 	"qwen3-vl-30b-a3b-instruct",
 	"qwen3-8b",
@@ -62,14 +62,21 @@ var AvailableModels = []string{
 var availableModelSet map[string]bool
 
 func init() {
-	availableModelSet = make(map[string]bool, len(AvailableModels))
-	for _, m := range AvailableModels {
+	availableModelSet = make(map[string]bool, len(availableModels))
+	for _, m := range availableModels {
 		availableModelSet[m] = true
 	}
 }
 
+// AvailableModels returns a copy of the supported model list.
+func AvailableModels() []string {
+	models := make([]string, len(availableModels))
+	copy(models, availableModels)
+	return models
+}
+
 // thinkingModels is the set of models that produce a thinking block
-// before the actual response, separated by the 💯 emoji.
+// before the actual response, separated by the encoded thinking marker.
 var thinkingModels = map[string]bool{
 	"qwen3-vl-30b-a3b-thinking": true,
 	"qwen3-8b":                  true,
@@ -93,7 +100,7 @@ func Load() *Config {
 	// Defaults
 	cfg.Port = defaultPort
 	cfg.Host = ""
-	cfg.APIKey = "sk-admin"
+	cfg.APIKey = ""
 	cfg.Timeout = defaultTimeout
 	cfg.UpstreamRetryCount = defaultUpstreamRetryCount
 	cfg.UpstreamRetryBackoffMS = defaultUpstreamRetryBackoffMS
@@ -125,12 +132,12 @@ func Load() *Config {
 		cfg.APIKey = v
 	}
 	if v := os.Getenv("TIMEOUT"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			cfg.Timeout = n
+		if n, err := strconv.Atoi(v); err != nil {
+			slog.Warn("invalid TIMEOUT value, using default", "value", v)
 		} else if n <= 0 {
 			slog.Warn("TIMEOUT must be positive, using default", "value", v)
 		} else {
-			slog.Warn("invalid TIMEOUT value, using default", "value", v)
+			cfg.Timeout = n
 		}
 	}
 	if v := os.Getenv("UPSTREAM_RETRY_COUNT"); v != "" {

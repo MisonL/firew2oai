@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mison/firew2oai/internal/tokenauth"
 	"github.com/mison/firew2oai/internal/transport"
 )
 
@@ -772,6 +773,38 @@ func TestHandleResponses_MethodNotAllowed(t *testing.T) {
 	}
 }
 
+func TestHandleResponses_RequiresBearerOwner(t *testing.T) {
+	var upstreamHits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"ok\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	for _, auth := range []string{"", "Basic dGVzdA=="} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"deepseek-v3p2","input":"hello"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		p.handleResponses(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("auth %q status = %d, want 401, body=%s", auth, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid_api_key") {
+			t.Fatalf("auth %q body = %s, want invalid_api_key", auth, rec.Body.String())
+		}
+	}
+	if got := atomic.LoadInt32(&upstreamHits); got != 0 {
+		t.Fatalf("upstream hits = %d, want 0", got)
+	}
+}
+
 func TestHandleResponses_PreviousResponseID(t *testing.T) {
 	requests := make([]FireworksRequest, 0, 2)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -883,6 +916,124 @@ func TestHandleResponseByIDAndInputItems(t *testing.T) {
 	}
 	if !strings.Contains(itemsRec.Body.String(), `"text":"say ok"`) {
 		t.Fatalf("input_items body missing input text: %s", itemsRec.Body.String())
+	}
+}
+
+func TestHandleResponseByID_RequiresBearerOwner(t *testing.T) {
+	p := newTestProxy()
+	for _, path := range []string{
+		"/v1/responses/resp_test",
+		"/v1/responses/resp_test/input_items",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		p.handleResponseByID(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("%s status = %d, want 401, body=%s", path, rec.Code, rec.Body.String())
+		}
+		if !strings.Contains(rec.Body.String(), "invalid_api_key") {
+			t.Fatalf("%s body = %s, want invalid_api_key", path, rec.Body.String())
+		}
+	}
+}
+
+func TestResponsesStoreRejectsCrossTokenAccess(t *testing.T) {
+	var upstreamHits int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&upstreamHits, 1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"owner-secret\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"done\",\"content\":\"\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	tm, err := tokenauth.New("sk-owner,sk-other", 0)
+	if err != nil {
+		t.Fatalf("tokenauth.New error: %v", err)
+	}
+	t.Cleanup(tm.Stop)
+	mux := NewMux(p, "*", tm)
+
+	body := `{"model":"deepseek-v3p2","input":"say secret"}`
+	createReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body))
+	createReq.Header.Set("Authorization", "Bearer sk-owner")
+	createReq.Header.Set("Content-Type", "application/json")
+	createRec := httptest.NewRecorder()
+	mux.ServeHTTP(createRec, createReq)
+	if createRec.Code != http.StatusOK {
+		t.Fatalf("create status = %d, body=%s", createRec.Code, createRec.Body.String())
+	}
+
+	var created ResponsesResponse
+	if err := json.Unmarshal(createRec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created response: %v", err)
+	}
+
+	for _, path := range []string{
+		"/v1/responses/" + created.ID,
+		"/v1/responses/" + created.ID + "/input_items",
+	} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer sk-other")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404, body=%s", path, rec.Code, rec.Body.String())
+		}
+	}
+
+	followBody := `{"model":"deepseek-v3p2","previous_response_id":"` + created.ID + `","input":"repeat secret"}`
+	followReq := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(followBody))
+	followReq.Header.Set("Authorization", "Bearer sk-other")
+	followReq.Header.Set("Content-Type", "application/json")
+	followRec := httptest.NewRecorder()
+	mux.ServeHTTP(followRec, followReq)
+	if followRec.Code != http.StatusBadRequest {
+		t.Fatalf("follow status = %d, want 400, body=%s", followRec.Code, followRec.Body.String())
+	}
+	if !strings.Contains(followRec.Body.String(), "previous_response_not_found") {
+		t.Fatalf("follow body = %s, want previous_response_not_found", followRec.Body.String())
+	}
+	if got := atomic.LoadInt32(&upstreamHits); got != 1 {
+		t.Fatalf("upstream hits = %d, want only initial create request", got)
+	}
+}
+
+func TestResponseStoreRejectsCrossOwnerOverwrite(t *testing.T) {
+	store := newResponseStore(4)
+	ownerA := responseOwnerFromToken("sk-owner-a")
+	ownerB := responseOwnerFromToken("sk-owner-b")
+	first := ResponsesResponse{ID: "resp_collision", Status: "completed", Model: "model-a"}
+	second := ResponsesResponse{ID: "resp_collision", Status: "completed", Model: "model-b"}
+
+	store.put(ownerA, first, nil, nil)
+	store.put(ownerB, second, nil, nil)
+
+	got, ok := store.get(ownerA, first.ID)
+	if !ok {
+		t.Fatal("owner A response missing after cross-owner overwrite attempt")
+	}
+	if got.response.Model != "model-a" {
+		t.Fatalf("owner A response model = %q, want model-a", got.response.Model)
+	}
+	if _, ok := store.get(ownerB, second.ID); ok {
+		t.Fatal("owner B should not read response with same id owned by owner A")
+	}
+}
+
+func TestCloneRawItemsPreservesEmptyRawMessageSlot(t *testing.T) {
+	items := []json.RawMessage{json.RawMessage{}, json.RawMessage(`{"ok":true}`)}
+	cloned := cloneRawItems(items)
+	if len(cloned) != len(items) {
+		t.Fatalf("len(cloned) = %d, want %d", len(cloned), len(items))
+	}
+	if cloned[0] == nil {
+		t.Fatal("empty RawMessage slot became nil")
+	}
+	if string(cloned[1]) != `{"ok":true}` {
+		t.Fatalf("cloned[1] = %s", cloned[1])
 	}
 }
 
@@ -3446,7 +3597,7 @@ func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocfor
 			"result": map[string]any{
 				"content": []map[string]any{{
 					"type": "text",
-					"text": "Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\n\nUse fetch_doc on any URL above for full content.",
+					"text": "Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\n\nUse fetch_doc on any URL above for full content.",
 				}},
 				"structured_content": nil,
 			},
@@ -3471,7 +3622,7 @@ func TestConstrainFinalText_PrefersFetchDocHeadingOverSearchSummaryForRealDocfor
 		}),
 	}
 	evidence := buildExecutionEvidence(history)
-	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javasc..."
 
 	got := constrainFinalText(task, text, evidence, true)
 	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
@@ -3501,7 +3652,7 @@ func TestConstrainFinalText_PrefersFetchDocFromStringifiedToolOutputWrapper(t *t
 			"type":    "function_call_output",
 			"call_id": "call_docfork_search",
 			"output": map[string]any{
-				"content": `[{"type":"text","text":"Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}]`,
+				"content": `[{"type":"text","text":"Searched: react | 4 results\n\n[1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javascript example\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189"}]`,
 			},
 		}),
 		mustMarshalRawJSON(map[string]any{
@@ -3520,7 +3671,7 @@ func TestConstrainFinalText_PrefersFetchDocFromStringifiedToolOutputWrapper(t *t
 		}),
 	}
 	evidence := buildExecutionEvidence(history)
-	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javasc..."
 
 	got := constrainFinalText(task, text, evidence, true)
 	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
@@ -3549,7 +3700,7 @@ func TestConstrainFinalText_PrefersFetchDocFromRealWrappedFunctionCallOutput(t *
 		mustMarshalRawJSON(map[string]any{
 			"type":    "function_call_output",
 			"call_id": "call_55cdee4026c4493d4e0e3370",
-			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
+			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
 		}),
 		mustMarshalRawJSON(map[string]any{
 			"type":      "function_call",
@@ -3565,7 +3716,7 @@ func TestConstrainFinalText_PrefersFetchDocFromRealWrappedFunctionCallOutput(t *
 		}),
 	}
 	evidence := buildExecutionEvidence(history)
-	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javasc..."
+	text := "RESULT: PASS\nFILES: none\nTEST: N/A\nNOTE: Searched: react | 4 results [1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javasc..."
 
 	got := constrainFinalText(task, text, evidence, true)
 	if strings.Contains(got, "NOTE: Searched: react | 4 results") {
@@ -3597,7 +3748,7 @@ func TestConstrainFinalText_ReadOnlyProbeWithRealWrappedFetchDocStillPasses(t *t
 		mustMarshalRawJSON(map[string]any{
 			"type":    "function_call_output",
 			"call_id": "call_55cdee4026c4493d4e0e3370",
-			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies — useEffectEvent in Dependencies (Error) — javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
+			"output":  "Wall time: 1.7139 seconds\nOutput:\n[{\"type\":\"text\",\"text\":\"Searched: react | 4 results\\n\\n[1] 51-validateExhaustiveDependencies - useEffectEvent in Dependencies (Error) - javascript example; Error, effectEvent, useEffectEvent, log, useEffect, returns, should, not\\n    https://github.com/facebook/react/blob/main/compiler/packages/babel-plugin-react-compiler/docs/passes/51-validateExhaustiveDependencies.md#L183-L189\\n\\nUse fetch_doc on any URL above for full content.\"}]",
 		}),
 		mustMarshalRawJSON(map[string]any{
 			"type":      "function_call",

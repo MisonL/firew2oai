@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -228,8 +228,7 @@ func parseInlineAIActionsShorthand(text string, allowedTools map[string]response
 	if trimmed == "" {
 		return parsedToolCallBatchResult{}, false
 	}
-	lower := strings.ToLower(trimmed)
-	idx := strings.Index(lower, "ai_actions:")
+	idx := indexCaseInsensitiveASCII(trimmed, "ai_actions:")
 	if idx < 0 {
 		return parsedToolCallBatchResult{}, false
 	}
@@ -283,6 +282,21 @@ func parseInlineAIActionsShorthand(text string, allowedTools map[string]response
 	}
 	result.calls = []parsedToolCall{*call}
 	return applyToolProtocolConstraints(result, constraints), true
+}
+
+func indexCaseInsensitiveASCII(text, needle string) int {
+	if needle == "" {
+		return 0
+	}
+	if len(text) < len(needle) {
+		return -1
+	}
+	for i := 0; i <= len(text)-len(needle); i++ {
+		if strings.EqualFold(text[i:i+len(needle)], needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 func recoverToolCallsFromAIActionsBlocks(text string, allowedTools map[string]responseToolDescriptor, constraints toolProtocolConstraints) (parsedToolCallBatchResult, bool) {
@@ -367,7 +381,7 @@ func extractSequentialAIActionsBlocks(text string) []aiActionsBlock {
 		payload := strings.TrimSpace(text[payloadStart:end])
 		if payload != "" {
 			blocks = append(blocks, aiActionsBlock{
-				VisibleText: strings.TrimSpace(text[:start]),
+				VisibleText: strings.TrimSpace(text[cursor:start]),
 				JSONText:    payload,
 			})
 		}
@@ -911,7 +925,6 @@ func isLikelyCommandContinuationLine(line string) bool {
 		"&&",
 		"||",
 		"|",
-		";",
 		"\\",
 		"then",
 		"do",
@@ -957,6 +970,9 @@ func shellQuoteSingle(text string) string {
 }
 
 func buildReadFileCommand(path string) string {
+	if strings.HasPrefix(path, "-") {
+		return "sed -n '1,200p' -- " + shellQuoteSingle(path)
+	}
 	return "sed -n '1,200p' " + shellQuoteSingle(path)
 }
 
@@ -969,7 +985,7 @@ func buildCreateMissingFileCommand(filePath string) string {
 	if filePath == "" {
 		return ""
 	}
-	dir := strings.TrimSpace(path.Dir(filePath))
+	dir := strings.TrimSpace(filepath.Dir(filePath))
 	if dir == "" || dir == "." {
 		return "touch " + shellQuoteSingle(filePath)
 	}
@@ -1376,8 +1392,15 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 		}
 	}
 
-	callID := "call_" + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
-	itemID := generateToolProtocolItemID(callType)
+	generatedID, err := generateRequestID()
+	if err != nil {
+		return nil, err
+	}
+	callID := "call_" + strings.Replace(generatedID, "chatcmpl-", "", 1)
+	itemID, err := generateToolProtocolItemID(callType)
+	if err != nil {
+		return nil, err
+	}
 	switch callType {
 	case "web_search_call":
 		if hasInput {
@@ -1467,9 +1490,18 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 		if !hasInput {
 			return nil, fmt.Errorf("custom_tool_call for %q must include input", name)
 		}
-		input := ""
-		if value, ok := raw["input"].(string); ok {
+		var input string
+		switch value := raw["input"].(type) {
+		case nil:
+			return nil, fmt.Errorf("custom_tool_call input for %q must not be null", name)
+		case string:
 			input = value
+		default:
+			inputData, err := json.Marshal(value)
+			if err != nil {
+				return nil, fmt.Errorf("custom_tool_call input for %q is not valid JSON: %w", name, err)
+			}
+			input = string(inputData)
 		}
 		if ok && toolDesc.Structured {
 			return nil, fmt.Errorf("tool %q is declared as structured but model emitted custom_tool_call", name)
@@ -1491,7 +1523,7 @@ func buildParsedToolCall(raw map[string]any, allowedTools map[string]responseToo
 	}
 }
 
-func generateToolProtocolItemID(callType string) string {
+func generateToolProtocolItemID(callType string) (string, error) {
 	prefix := "item_"
 	switch callType {
 	case "web_search_call":
@@ -1501,7 +1533,11 @@ func generateToolProtocolItemID(callType string) string {
 	case "custom_tool_call":
 		prefix = "ctc_"
 	}
-	return prefix + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
+	generatedID, err := generateRequestID()
+	if err != nil {
+		return "", err
+	}
+	return prefix + strings.Replace(generatedID, "chatcmpl-", "", 1), nil
 }
 
 func extractWebSearchQuery(args any) (string, error) {

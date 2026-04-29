@@ -9,6 +9,7 @@ import (
 const (
 	defaultUpstreamEmptyRetryCount   = 4
 	defaultUpstreamEmptyRetryBackoff = 500 * time.Millisecond
+	maxUpstreamEmptyRetryDelay       = 30 * time.Second
 )
 
 type upstreamEmptyRetryPolicy struct {
@@ -50,7 +51,17 @@ func (p upstreamEmptyRetryPolicy) delay(attempt int) time.Duration {
 	if p.backoff <= 0 {
 		return 0
 	}
-	return p.backoff * time.Duration(1<<attempt)
+	delay := p.backoff
+	for i := 0; i < attempt; i++ {
+		if delay >= maxUpstreamEmptyRetryDelay/2 {
+			return maxUpstreamEmptyRetryDelay
+		}
+		delay *= 2
+	}
+	if delay > maxUpstreamEmptyRetryDelay {
+		return maxUpstreamEmptyRetryDelay
+	}
+	return delay
 }
 
 func sleepWithContext(ctx context.Context, delay time.Duration) error {

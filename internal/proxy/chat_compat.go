@@ -54,7 +54,7 @@ func parseChatMessageContent(raw json.RawMessage) (string, error) {
 		if typ == "" {
 			typ = "text"
 		}
-		if typ == "text" || typ == "input_text" || strings.Contains(typ, "text") {
+		if typ == "text" || typ == "input_text" {
 			if value, ok := part["text"].(string); ok {
 				texts = append(texts, value)
 			}
@@ -216,10 +216,17 @@ func parseChatToolCallOutput(text string, allowedTools map[string]responseToolDe
 			return nil, result.visibleText, errors.New("OpenAI chat tool_calls only support structured function calls")
 		}
 		name, _ := item["name"].(string)
-		args, _ := item["arguments"].(string)
+		args, err := chatToolCallArgumentsString(item["arguments"])
+		if err != nil {
+			return nil, result.visibleText, err
+		}
 		callID, _ := item["call_id"].(string)
 		if callID == "" {
-			callID = "call_" + strings.Replace(generateRequestID(), "chatcmpl-", "", 1)
+			generatedID, err := generateRequestID()
+			if err != nil {
+				return nil, result.visibleText, err
+			}
+			callID = "call_" + strings.Replace(generatedID, "chatcmpl-", "", 1)
 		}
 		toolCalls = append(toolCalls, ChatToolCall{
 			ID:   callID,
@@ -231,4 +238,24 @@ func parseChatToolCallOutput(text string, allowedTools map[string]responseToolDe
 		})
 	}
 	return toolCalls, result.visibleText, nil
+}
+
+func chatToolCallArgumentsString(value any) (string, error) {
+	switch typed := value.(type) {
+	case nil:
+		return "{}", nil
+	case string:
+		if typed == "" {
+			return "{}", nil
+		}
+		return typed, nil
+	case map[string]any, []any:
+		data, err := json.Marshal(typed)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	default:
+		return "", fmt.Errorf("chat tool call arguments must be string or JSON object")
+	}
 }

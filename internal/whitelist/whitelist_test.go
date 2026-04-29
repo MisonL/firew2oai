@@ -3,6 +3,8 @@ package whitelist
 import (
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -312,5 +314,45 @@ func TestExtractClientIP_EmptyXFFMultiProxy(t *testing.T) {
 	}
 	if !ip.Equal(net.ParseIP("10.0.0.5")) {
 		t.Errorf("expected 10.0.0.5 (RemoteAddr fallback for empty XFF), got %v", ip)
+	}
+}
+
+func TestExtractClientIP_InvalidTrustedXFFHopDoesNotScanLeft(t *testing.T) {
+	r := &http.Request{
+		RemoteAddr: "10.0.0.5:12345",
+		Header: map[string][]string{
+			"X-Forwarded-For": {"127.0.0.1, not-an-ip, 10.0.0.2"},
+		},
+	}
+	ip, err := ExtractClientIP(r, 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ip.Equal(net.ParseIP("10.0.0.5")) {
+		t.Errorf("expected RemoteAddr fallback, got %v", ip)
+	}
+}
+
+func TestMiddlewareForbiddenDoesNotEchoClientIP(t *testing.T) {
+	c, err := New("127.0.0.1")
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.RemoteAddr = "203.0.113.10:12345"
+	rec := httptest.NewRecorder()
+
+	c.Middleware(0)(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want application/json; charset=utf-8", got)
+	}
+	if strings.Contains(rec.Body.String(), "203.0.113.10") {
+		t.Fatalf("forbidden response leaked client IP: %s", rec.Body.String())
 	}
 }

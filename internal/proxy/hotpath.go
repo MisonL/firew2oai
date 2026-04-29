@@ -249,6 +249,7 @@ func scanSSEEvents(reader io.Reader, isThinking, showThinking bool, onEvent func
 				if !emitVisibleSSEContent(state.hiddenBuffer.String(), &state, onEvent) {
 					return hasContent, nil
 				}
+				hasContent = hasContent || state.visibleEmitted
 			}
 			if !onEvent(sseContentEvent{Type: "done"}) {
 				return hasContent, nil

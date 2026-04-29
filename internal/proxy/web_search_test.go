@@ -661,3 +661,42 @@ func TestRunWebSearch_DoesNotRetryParseFailure(t *testing.T) {
 		t.Fatalf("error does not report actual attempt count: %v", err)
 	}
 }
+
+func TestSanitizeWebSearchError(t *testing.T) {
+	cases := []struct {
+		err  error
+		want string
+	}{
+		{webSearchChallengeError{Provider: "DuckDuckGo"}, "web search backend blocked request with DuckDuckGo challenge"},
+		{fmt.Errorf("web search failed after 1 attempt(s): parse web search html: no results found"), "web search returned no results"},
+		{webSearchStatusError{StatusCode: http.StatusTooManyRequests}, "web search backend returned HTTP 429"},
+		{fmt.Errorf("execute web search request: dial tcp 127.0.0.1:1: connect: connection refused"), "web search backend unavailable"},
+	}
+	for _, tt := range cases {
+		if got := sanitizeWebSearchError(tt.err); got != tt.want {
+			t.Fatalf("sanitizeWebSearchError(%v) = %q, want %q", tt.err, got, tt.want)
+		}
+	}
+}
+
+func TestCollectResponseTextReturnsErrorForPartialErrorEvent(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"content\",\"content\":\"partial\"}\n\n"))
+		_, _ = w.Write([]byte("data: {\"type\":\"error\",\"error\":\"upstream failed\"}\n\n"))
+	}))
+	defer upstream.Close()
+
+	p := NewWithUpstream(transport.New(30*time.Second), "test", false, upstream.URL)
+	body, err := buildFireworksRequestBody("deepseek-v3p2", "prompt", nil, nil)
+	if err != nil {
+		t.Fatalf("buildFireworksRequestBody: %v", err)
+	}
+	got, err := p.collectResponseText(context.Background(), "test-key", "deepseek-v3p2", body, false)
+	if err == nil {
+		t.Fatalf("collectResponseText error = nil, got text %q", got)
+	}
+	if got != "" {
+		t.Fatalf("collectResponseText returned partial text %q despite error", got)
+	}
+}

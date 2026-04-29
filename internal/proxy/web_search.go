@@ -144,13 +144,13 @@ func (p *Proxy) completeResponsesViaServerWebSearch(
 		summary, searchErr := p.runWebSearch(ctx, call.Query)
 		success := searchErr == nil
 		if searchErr != nil {
-			summary = "web_search failed: " + searchErr.Error()
+			summary = sanitizeWebSearchError(searchErr)
 		}
 		resultItem := buildInputMessageItem("user", formatToolOutputSummary(call.ID, &success, summary, ""))
 		followupRequestItems = append(followupRequestItems, resultItem)
 		historyRequestItems = append(historyRequestItems, resultItem)
 		if searchErr != nil {
-			return buildToolProtocolErrorMessage(searchErr, ""), callOutputItems, historyRequestItems, true, nil
+			return buildToolProtocolErrorMessage(errors.New(summary), ""), callOutputItems, historyRequestItems, true, nil
 		}
 		searchSummaries = append(searchSummaries, summary)
 	}
@@ -339,6 +339,7 @@ func (p *Proxy) collectResponseText(ctx context.Context, authToken, model string
 	var scanErr error
 	attempt := 0
 	for {
+		result.Reset()
 		doneReceived = false
 		contentEmitted, scanErr = scanSSEEvents(reader, isThinking, showThinking, func(evt sseContentEvent) bool {
 			switch evt.Type {
@@ -370,13 +371,31 @@ func (p *Proxy) collectResponseText(ctx context.Context, authToken, model string
 		break
 	}
 
-	if scanErr != nil && !contentEmitted && result.Len() == 0 {
+	if scanErr != nil {
 		return "", fmt.Errorf("follow-up upstream stream failed: %w", scanErr)
 	}
 	if !doneReceived && !contentEmitted && result.Len() == 0 {
 		return "", fmt.Errorf("follow-up upstream response ended without a completion signal")
 	}
 	return result.String(), nil
+}
+
+func sanitizeWebSearchError(err error) string {
+	if err == nil {
+		return "web_search failed"
+	}
+	var challengeErr webSearchChallengeError
+	if errors.As(err, &challengeErr) {
+		return challengeErr.Error()
+	}
+	if strings.Contains(err.Error(), "no results found") || strings.Contains(err.Error(), "no usable results found") {
+		return "web search returned no results"
+	}
+	var statusErr webSearchStatusError
+	if errors.As(err, &statusErr) {
+		return fmt.Sprintf("web search backend returned HTTP %d", statusErr.StatusCode)
+	}
+	return "web search backend unavailable"
 }
 
 func (p *Proxy) runWebSearch(ctx context.Context, query string) (string, error) {
